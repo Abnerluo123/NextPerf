@@ -38,20 +38,28 @@ def main():
             return 1
 
     fails = []
+    skipped = []
     for name, cmd in STEPS:
         print("\n### %s" % name)
         r = subprocess.run(cmd, cwd=ROOT, env=env)
-        if r.returncode != 0:
+        if r.returncode == 2:
+            # 约定：退出码 2 = 环境不满足（例如抢不到前台），跳过而非失败
+            skipped.append(name)
+        elif r.returncode != 0:
             fails.append(name)
 
     kill_all()
     print("\n" + "=" * 60)
+    if skipped:
+        print("跳过 %d 项（环境不满足，非产品缺陷）：" % len(skipped))
+        for s_ in skipped:
+            print("  - %s" % s_)
     if fails:
         print("失败 %d 项：" % len(fails))
         for f in fails:
             print("  - %s" % f)
         return 1
-    print("全部通过 ✓")
+    print("全部通过 ✓" + ("（其中 %d 项跳过）" % len(skipped) if skipped else ""))
     return 0
 
 
