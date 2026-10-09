@@ -479,7 +479,12 @@ void Log(const char* fmt, ...) {
                            OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h == INVALID_HANDLE_VALUE) return;
     DWORD size = GetFileSize(h, nullptr);
-    if (size > 64 * 1024) SetFilePointer(h, 0, nullptr, FILE_BEGIN);
+    // ⚠ 超过上限就回到**文件开头**覆盖重写 —— 也就是说写满之后，
+    //   **最新的行在文件开头，结尾反而是旧内容**。排查时请用 Ctrl+F 搜关键字，
+    //   或者看文件开头，不要只看末尾（我们就因为只看末尾而误判过"日志里没有这一行"）。
+    //   上限从 64KB 提到 512KB：present diag / frame dist 每 5 秒各一条，
+    //   64KB 只能存几分钟，加上其它日志很快就把关键行冲掉。
+    if (size > 512 * 1024) SetFilePointer(h, 0, nullptr, FILE_BEGIN);
     else SetFilePointer(h, 0, nullptr, FILE_END);
 
     char buf[768];
