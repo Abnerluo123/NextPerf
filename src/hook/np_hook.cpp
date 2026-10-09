@@ -1,4 +1,5 @@
 #include "np_hook.h"
+#include "np_reflex.h"   // Reflex 延迟标记读取（权威 CPU 帧时间拆分）
 
 #include <dxgi1_6.h>
 #include <d3d11.h>
@@ -297,6 +298,13 @@ uint64_t gLastPresentQpc = 0;
 // 见 PresentCommon 里的合并逻辑：实测游戏会在一帧内调用多次真实 Present
 // （min 间隔只有 2.17ms，而帧周期是 16.7ms），不合并就会造出假的短帧+长帧。
 bool     gAbsorbThisPresent = false;
+
+// ---- Reflex 延迟标记
+//  游戏若启用 Reflex，会自己打 sim/submit/present 的标记，我们直接读它，
+//  这才是权威的 CPU 帧时间拆分（我们原来的公式只能算 Present 之间的残差）。
+np::ReflexReader gReflex;
+void*            gReflexDev = nullptr;   // D3D 设备（AddRef 后长期持有，不释放）
+bool             gReflexTried = false;
 uint64_t gCpuStartQpc = 0;
 // 上一帧卡在原始 Present 调用里的时长（主要是等垂直同步）
 float    gLastInPresentMs = 0.0f;
@@ -1221,6 +1229,49 @@ HRESULT PresentCommon(IDXGISwapChain* sc, UINT sync, UINT flags,
         static np::Ema waitEma(0.10f);
         gTel->cpuBusyAvg = busyEma.update(gTel->cpuBusyMs);
         gTel->cpuWaitAvg = waitEma.update(gTel->cpuWaitMs);
+    }
+
+    // ---- Reflex 延迟标记：能读到就用它覆盖上面的启发式结果
+    //
+    // 我们的启发式 sim/submit 只是"猜"（用钩子时刻近似），而 Reflex 的标记是
+    // **游戏自己报的**：模拟起止、渲染提交起止，都是权威值。
+    // 接口 ID 0x1a587f9c 来自 Intel PresentMon 的 nvapi_interface_table.h。
+    if (realPresent && sc) {
+        if (!gReflexDev && !gReflexTried) {
+            gReflexTried = true;
+            void* dev = nullptr;
+            if (SUCCEEDED(sc->GetDevice(__uuidof(ID3D12Device), &dev)) && dev) {
+                gReflexDev = dev;
+            } else if (SUCCEEDED(sc->GetDevice(__uuidof(ID3D11Device), &dev)) && dev) {
+                gReflexDev = dev;
+            }
+            if (gReflexDev) {
+                bool inited = gReflex.Init();
+                Log("reflex: device=%p init=%d ok=%d", gReflexDev, inited ? 1 : 0,
+                    gReflex.ok() ? 1 : 0);
+            }
+        }
+        if (gReflex.ok() && gReflexDev) {
+            np::NVFrameReport fr{};
+            if (gReflex.Poll(gReflexDev, &fr)) {
+                float sim = (float)QpcMs(fr.simEndTime - fr.simStartTime);
+                float sub = (fr.renderSubmitEndTime > fr.renderSubmitStartTime)
+                                ? (float)QpcMs(fr.renderSubmitEndTime - fr.renderSubmitStartTime)
+                                : 0.0f;
+                if (sim > 0.0f && sim < 1000.0f) gTel->simMs = sim;
+                if (sub > 0.0f && sub < 1000.0f) gTel->submitMs = sub;
+                gTel->hookFlags |= NP_HOOK_REFLEX;
+                // 低频打印，方便实机确认到底有没有读到
+                static uint32_t sLastReflexLog = 0;
+                uint32_t tk = GetTickCount();
+                if (tk - sLastReflexLog > 10000) {
+                    sLastReflexLog = tk;
+                    Log("reflex frame: id=%llu sim=%.2f submit=%.2f gpuActiveUs=%u",
+                        (unsigned long long)fr.frameID, (double)sim, (double)sub,
+                        (unsigned)fr.gpuActiveRenderTimeUs);
+                }
+            }
+        }
     }
     // 被合并的帧内呈现**不推进**这个时间戳 —— 否则下一帧的间隔会从
     // 这个中间时刻算起，又会得到一段偏短的假帧时间。

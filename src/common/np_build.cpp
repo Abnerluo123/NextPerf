@@ -273,8 +273,12 @@ void BuildPanelData(PanelData& out, const NPConfig& c, const NPSensors& s, const
         // 数值明显变大。所以「CPUBusy 偏大」就是低延迟技术生效的旁证。
         // 阈值 2ms 是按实测定的（关 Reflex ~0.x ms、开 Reflex 大 1~2ms），偏低或
         // 偏高都可以直接调这个数。
+        //  判据有两条，优先用**直证**：
+        //    1) 钩子读到了 Reflex 的延迟标记（NP_HOOK_REFLEX）—— 游戏自己在用低延迟技术
+        //    2) 读不到时的旁证：CPUBusy 偏大（等待被移出 Present）
         float busyRef = t.cpuBusyAvg > 0.0001f ? t.cpuBusyAvg : t.cpuBusyMs;
-        if (active && busyRef > 2.0f) acc.pending.back().hint = L" 低延迟";
+        bool lowLatency = (t.hookFlags & NP_HOOK_REFLEX) != 0 || busyRef > 2.0f;
+        if (active && lowLatency) acc.pending.back().hint = L" 低延迟";
 
         // ---- CPU Busy / CPU Wait（PresentMon 口径的两个半边，二者之和 = 帧周期）
         // 颜色与 CPU 其他参数一致（PL_CPU）；各挂一条折线图。

@@ -367,6 +367,9 @@ enum NP_HOOK_FLAG : uint32_t {
     NP_HOOK_CMDLIST    = 1u << 2,
     NP_HOOK_TIMESTAMP  = 1u << 3,
     NP_HOOK_OVERLAY    = 1u << 4,
+    // 游戏自己在上报 Reflex 延迟标记（说明低延迟技术已启用）。
+    // 这条比「用 CPUBusy 猜」可靠得多 —— 那是旁证，这是直证。
+    NP_HOOK_REFLEX     = 1u << 5,
 };
 
 // ---------------------------------------------------------------- 便捷函数
