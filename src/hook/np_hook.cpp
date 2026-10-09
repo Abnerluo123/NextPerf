@@ -1201,13 +1201,26 @@ HRESULT PresentCommon(IDXGISwapChain* sc, UINT sync, UINT flags,
     if (gPresentRetQpc && now > gPresentRetQpc) {
         float busy = (float)QpcMs(now - gPresentRetQpc);
         // 超过 1 秒的不是「一帧」，是切出去/加载留下的空档
-        if (busy > 0.0f && busy < 1000.0f) gTel->cpuFrameMs = busy;
+        if (busy > 0.0f && busy < 1000.0f) {
+            gTel->cpuFrameMs = busy;
+            // 同值同时写进 cpuBusyMs：这是 PresentMon 的 CPUBusy 口径，
+            // 面板上单列一行，并用于「低延迟」提示的判据。
+            gTel->cpuBusyMs = busy;
+        }
     } else {
         gTel->cpuFrameMs = gTel->frameMs;
     }
     {
         static np::Ema cpuEma(0.10f);
         gTel->cpuFrameMsAvg = cpuEma.update(gTel->cpuFrameMs);
+    }
+    // CPUWait = 本帧在 Present 内部停留的时长（等垂直同步），复用已有的 msInPresent
+    gTel->cpuWaitMs = gLastInPresentMs;
+    {
+        static np::Ema busyEma(0.10f);
+        static np::Ema waitEma(0.10f);
+        gTel->cpuBusyAvg = busyEma.update(gTel->cpuBusyMs);
+        gTel->cpuWaitAvg = waitEma.update(gTel->cpuWaitMs);
     }
     // 被合并的帧内呈现**不推进**这个时间戳 —— 否则下一帧的间隔会从
     // 这个中间时刻算起，又会得到一段偏短的假帧时间。
@@ -1261,6 +1274,7 @@ HRESULT PresentCommon(IDXGISwapChain* sc, UINT sync, UINT flags,
         //   这里改成优先用 PDH 的每帧 GPU 时间，钩子那个字段只作兜底。
         float gpuSeries = (ss.gpuBusyMs >= 0.0f) ? ss.gpuBusyMs : gTel->gpuFrameMs;
         NPHistoryPush(&gHist, gTel->fps, gTel->fpsAvg, gTel->fpsLow1, gTel->fpsLow01,
+                      gTel->cpuBusyAvg, gTel->cpuWaitAvg,
                       ss.cpuUsage, ss.gpuUsage, gTel->frameMsAvg, gTel->cpuFrameMsAvg,
                       gpuSeries);
     }

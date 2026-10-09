@@ -265,6 +265,25 @@ void BuildPanelData(PanelData& out, const NPConfig& c, const NPSensors& s, const
         acc.rowRange(L"CPU 帧时间", active ? Msv(t.cpuFrameMs) : L"—", PL_CPU, active,
                      h ? h->latCpu : nullptr, h, 1, -1e30f, 33.34f);
         if (showCharts && (c.counters & NP_C_CHART_LATENCY)) attach(acc.pending.back(), h->latCpu, 0);
+
+        // ---- 「低延迟」提示
+        // CPUBusy 是「上一帧 Present 返回 → 本帧 Present 开始」的间隙。
+        // 流水线渲染下它本来接近 0；开了 Reflex 这类低延迟技术后，等待被从
+        // Present 内部挪到 Present 之前（NvAPI_D3D_Sleep），那段睡眠落进间隙，
+        // 数值明显变大。所以「CPUBusy 偏大」就是低延迟技术生效的旁证。
+        // 阈值 2ms 是按实测定的（关 Reflex ~0.x ms、开 Reflex 大 1~2ms），偏低或
+        // 偏高都可以直接调这个数。
+        float busyRef = t.cpuBusyAvg > 0.0001f ? t.cpuBusyAvg : t.cpuBusyMs;
+        if (active && busyRef > 2.0f) acc.pending.back().hint = L" 低延迟";
+
+        // ---- CPU Busy / CPU Wait（PresentMon 口径的两个半边，二者之和 = 帧周期）
+        // 颜色与 CPU 其他参数一致（PL_CPU）；各挂一条折线图。
+        acc.row(L"CPU Busy", active && t.cpuBusyAvg > 0.0001f ? Msv(t.cpuBusyAvg) : L"—",
+                PL_CPU);
+        if (showCharts && (c.counters & NP_C_CHART_LATENCY)) attach(acc.pending.back(), h->latBusy, 0);
+        acc.row(L"CPU Wait", active && t.cpuWaitAvg > 0.0001f ? Msv(t.cpuWaitAvg) : L"—",
+                PL_CPU);
+        if (showCharts && (c.counters & NP_C_CHART_LATENCY)) attach(acc.pending.back(), h->latWait, 0);
     }
     acc.flush(L"CPU", false, 9.0f);      // FPS 组 -> CPU 组：9px
 

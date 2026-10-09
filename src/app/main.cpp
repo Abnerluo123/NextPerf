@@ -730,14 +730,19 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdLine, int cmdShow) {
                     tm.cpuFrameMs = ft * (0.52f + 0.10f * sinf(ph / 4.4f));
                     tm.gpuFrameMs = ft * (0.82f + 0.08f * sinf(ph / 3.1f));
                     gApp.hist.sampleMs = 125;
+                    // 演示模式：CPUBusy/CPUWait 也造出合理数值，否则这两条曲线恒为 0
+                    tm.cpuBusyMs = tm.frameMs * (0.30f + 0.06f * sinf(ph / 5.2f));
+                    tm.cpuWaitMs = tm.frameMs - tm.cpuBusyMs;
                     NPHistoryPush(&gApp.hist, fps, avg, low1, low01, cpu, gpu, tm.frameMs,
-                                  tm.cpuFrameMs, tm.gpuFrameMs);
+                                  tm.cpuFrameMs, tm.gpuFrameMs,
+                                  tm.cpuBusyMs, tm.cpuWaitMs);
                 } else {
                     NPHistoryPush(&gApp.hist, gApp.telemetry.fps, gApp.telemetry.fpsAvg,
                                   gApp.telemetry.fpsLow1, gApp.telemetry.fpsLow01,
                                   gApp.sensors.cpuUsage, gApp.sensors.gpuUsage,
                                   gApp.telemetry.frameMs, gApp.telemetry.cpuFrameMs,
-                                  gApp.telemetry.gpuFrameMs);
+                                  gApp.telemetry.gpuFrameMs,
+                                  gApp.telemetry.cpuBusyMs, gApp.telemetry.cpuWaitMs);
                 }
                 InjectorTick();
 

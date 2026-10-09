@@ -75,6 +75,8 @@ class NPTelemetry(ctypes.Structure):
         ("simMs", ctypes.c_float), ("submitMs", ctypes.c_float),
         ("gpuFrameMs", ctypes.c_float),
         ("msInPresent", ctypes.c_float),
+        ("cpuBusyMs", ctypes.c_float), ("cpuBusyAvg", ctypes.c_float),
+        ("cpuWaitMs", ctypes.c_float), ("cpuWaitAvg", ctypes.c_float),
         ("p99Ms", ctypes.c_float), ("p999Ms", ctypes.c_float),
         ("drawCalls", ctypes.c_uint32), ("dispatches", ctypes.c_uint32),
         ("rtDispatches", ctypes.c_uint32), ("asBuilds", ctypes.c_uint32),

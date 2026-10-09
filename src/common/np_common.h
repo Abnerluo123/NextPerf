@@ -191,14 +191,18 @@ struct NPHistory {
     float latFrame[NP_HIST_CAP];  // 帧生成时间 ms
     float latCpu[NP_HIST_CAP];    // CPU 帧延迟 ms
     float latGpu[NP_HIST_CAP];    // GPU 帧延迟 ms
+    float latBusy[NP_HIST_CAP];   // CPU Busy ms（PresentMon 口径）
+    float latWait[NP_HIST_CAP];   // CPU Wait ms（在 Present 内部等待）
 };
 
 inline void NPHistoryPush(NPHistory* h, float fps, float avg, float low1, float low01,
-                          float ucpu, float ugpu, float lf, float lc, float lg) {
+                          float ucpu, float ugpu, float lf, float lc, float lg,
+                          float lbusy, float lwait) {
     uint32_t i = h->write;
     h->fps[i] = fps; h->avg[i] = avg; h->low1[i] = low1; h->low01[i] = low01;
     h->usageCpu[i] = ucpu; h->usageGpu[i] = ugpu;
     h->latFrame[i] = lf; h->latCpu[i] = lc; h->latGpu[i] = lg;
+    h->latBusy[i] = lbusy; h->latWait[i] = lwait;
     h->write = (i + 1) % NP_HIST_CAP;
     if (h->count < NP_HIST_CAP) ++h->count;
 }
@@ -318,6 +322,18 @@ struct NPTelemetry {
     // 60fps 下 GPU 有余量时就是 10ms 甚至更低。
     float    gpuFrameMs;
     float    msInPresent;   // 本帧卡在 Present 调用里的时长（主要就是等垂直同步）
+
+    // ---- CPU 侧的两个半边（PresentMon 口径，见 MetricsCalculator.cpp:299）
+    //   CPUBusy = 本帧 Present 开始 − 上一帧 Present 返回
+    //   CPUWait = 本帧在 Present 内部停留（= msInPresent）
+    //   CPUBusy + CPUWait = 帧周期
+    // 注意：CPUBusy 本质是「Present 之间的残差」。流水线渲染的游戏里它本来就接近 0
+    // （渲染线程在上一帧还阻塞于 Present 时已准备下一帧）；开 Reflex 后等待被移到
+    // Present 之前，那段睡眠落进间隙，这个值会明显变大 —— 正是「低延迟」提示的依据。
+    float    cpuBusyMs;
+    float    cpuBusyAvg;    // 平滑后（图表用）
+    float    cpuWaitMs;
+    float    cpuWaitAvg;
     float    p99Ms, p999Ms; // 帧时间百分位
 
     // ---- 引擎级推断
@@ -438,6 +454,7 @@ inline void NPClearTelemetry(NPTelemetry* t) {
     t->simMs = t->submitMs = 0;
     t->frameMs = t->frameMsAvg = t->cpuFrameMs = t->cpuFrameMsAvg = t->gpuFrameMs =
         t->msInPresent = t->p99Ms = t->p999Ms = 0;
+    t->cpuBusyMs = t->cpuBusyAvg = t->cpuWaitMs = t->cpuWaitAvg = 0;
     t->drawCalls = t->dispatches = t->rtDispatches = t->asBuilds = 0;
     t->rtGpuMs = t->aiGpuMs = t->rtLoad = t->tensorLoad = 0;
     t->aiModules = 0;

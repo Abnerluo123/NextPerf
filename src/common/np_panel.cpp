@@ -210,7 +210,9 @@ static Grid ComputeGrid(IDWriteFactory* f, IDWriteTextFormat* fmtText,
     bool anyRange = false;
     for (auto& r : d.rows) {
         if (r.header) continue;
-        maxLabel = std::max(maxLabel, MeasureW(f, fmtText, r.label));
+        // 标签列宽度要把**异色提示**（如「低延迟」）也算进去，
+        // 否则提示会压到右侧的范围列上。
+        maxLabel = std::max(maxLabel, MeasureW(f, fmtText, r.label + r.hint));
         // ⚠ 必须用**与绘制相同的字体**去量宽度！
         //   数值已改为等宽字体（fmtSmall_ / fmtSmallL_）绘制，若仍用标签字体
         //   （fmt_，NSimSun）去量，量出来会偏小，长值就被裁掉
@@ -394,6 +396,18 @@ void PanelRenderer::Render(ID2D1RenderTarget* rt, float x, float y, const PanelD
         rt->DrawText(r.label.c_str(), (UINT32)r.label.size(), fmt_,
                      D2D1::RectF(labelX, cy, labelX + G.labelW, cy + M.lh), brLabel,
                      D2D1_DRAW_TEXT_OPTIONS_CLIP);
+        // 标签后的**亮黄色**提示（如「低延迟」）。单独绘制是为了异色，
+        // 也是为什么标签列宽度要按 label + hint 来量。
+        if (!r.hint.empty()) {
+            float lw = MeasureW(dwrite_, fmt_, r.label);
+            ID2D1SolidColorBrush* bHint = nullptr;
+            if (mk({1.00f, 0.85f, 0.15f}, 1.0f, &bHint)) {
+                rt->DrawText(r.hint.c_str(), (UINT32)r.hint.size(), fmt_,
+                             D2D1::RectF(labelX + lw, cy, labelX + G.labelW, cy + M.lh), bHint,
+                             D2D1_DRAW_TEXT_OPTIONS_CLIP);
+                bHint->Release();
+            }
+        }
 
         // ---- 数值（等宽、右对齐）
         ID2D1SolidColorBrush* bv = nullptr;
