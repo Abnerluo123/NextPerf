@@ -122,12 +122,13 @@ struct RowAcc {
     }
     // 一组收齐：有内容才输出分组标题，避免空标题
     // hideTitle=true：保留分组（行序不变）但不画小标题，只留半行高的分隔
-    void flush(const wchar_t* group, bool hideTitle = false) {
+    void flush(const wchar_t* group, bool hideTitle = false, float gapBefore = 0.0f) {
         if (pending.empty()) return;
         PanelRow hd;
         hd.label = group;
         hd.header = true;
         hd.hideTitle = hideTitle;
+        hd.gapBefore = gapBefore;
         d.rows.push_back(std::move(hd));
         for (auto& r : pending) d.rows.push_back(std::move(r));
         pending.clear();
@@ -247,7 +248,7 @@ void BuildPanelData(PanelData& out, const NPConfig& c, const NPSensors& s, const
     if (c.counters & NP_C_LOW01) {
         acc.row(L"0.1% Low", active ? WF(t.fpsLow01, 0) + L" FPS" : L"—");
     }
-    acc.flush(L"帧率与延迟", true);
+    acc.flush(L"帧率与延迟", true, 0.0f);    // 首组：顶端不留
 
     // ---------------- CPU ----------------
     if (c.counters & NP_C_CPU_USAGE) {
@@ -265,7 +266,7 @@ void BuildPanelData(PanelData& out, const NPConfig& c, const NPSensors& s, const
                      h ? h->latCpu : nullptr, h, 1, -1e30f, 33.34f);
         if (showCharts && (c.counters & NP_C_CHART_LATENCY)) attach(acc.pending.back(), h->latCpu, 0);
     }
-    acc.flush(L"CPU");
+    acc.flush(L"CPU", false, 9.0f);      // FPS 组 -> CPU 组：9px
 
     // ---------------- GPU ----------------
     // 分辨率的值先算好，等进入「系统」分组时再入行（用户要求归到系统组）
@@ -394,7 +395,7 @@ void BuildPanelData(PanelData& out, const NPConfig& c, const NPSensors& s, const
     if (c.counters & NP_C_AI_MODULES && hooked) {
         acc.row(L"AI 模块", AiModuleText(t.aiModules), t.aiModules ? PL_ACCENT : PL_DIM);
     }
-    acc.flush(L"GPU");
+    acc.flush(L"GPU", false, 3.0f);      // CPU 组 -> GPU 组：3px
 
     // ---------------- 系统 ----------------
     if (!resText.empty()) acc.row(L"分辨率", resText);   // 用户要求：归到系统分组
@@ -412,7 +413,7 @@ void BuildPanelData(PanelData& out, const NPConfig& c, const NPSensors& s, const
         std::wstring st = FitCols(Utf8ToWide(s.sourceText), 14);
         acc.row(L"数据源", st, PL_DIM);
     }
-    acc.flush(L"系统", true);
+    acc.flush(L"系统", true, 9.0f);      // GPU 组 -> 系统组：9px
 }
 
 }  // namespace np

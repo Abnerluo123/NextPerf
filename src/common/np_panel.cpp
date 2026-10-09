@@ -143,9 +143,8 @@ Metrics Layout(const NPConfig& c, float lineH) {
     // 金属 HUD 的行距非常紧：约 1.18 倍字号。普通界面用 1.34 会显得松散。
     // 行高 = max(紧凑值, 字体自身行距)。取字体行距才能保证字形不被 CLIP 裁掉。
     m.lh = std::max((float)c.fontHeight * 1.14f * c.scale, lineH);
-    // 四周留一圈黑：厚度 = 组间分隔的 1/3。
-    // 组间分隔 = 半行高（m.lh * 0.5），故留黑 = m.lh * 0.5 / 3 = m.lh / 6。
-    m.pad += m.lh / 6.0f;
+    // 四周留一圈黑：固定 3px（用户指定；原为 行高/6 ≈ 2.85）
+    m.pad += 3.0f;
     m.headH = m.lh;   // 与正文行同高（字号已改为与正文同号）
     // 金属 HUD 的曲线区比文字区矮得多；原来 0.42 显得又高又空（用户要求缩短）
     m.chartH = std::max(11.0f, (float)c.graphHeight * 0.26f) * c.scale;
@@ -282,7 +281,7 @@ void PanelRenderer::Measure(const PanelData& d, const NPConfig& c, float* w, flo
     diag.charW = G.charW;
     diag.contentW = contentW;
     diag.rowH = M.lh;
-    diag.sepH = M.lh * 0.5f;
+    diag.sepH = 9.0f;   // GPU 组 -> 系统 组的间距（用户指定）
     // 金属 HUD 偏窄：不再额外撑宽。
     // 量化到 4 个字符格（等宽栅格，天然单位）后**只增不减**地锁定 ——
     // 行随数据陆续出现时面板最多长大一次，绝不会来回伸缩。
@@ -299,9 +298,10 @@ void PanelRenderer::Measure(const PanelData& d, const NPConfig& c, float* w, flo
     bool firstRow = true;
     for (auto& r : d.rows) {
         if (r.header) {
-            // 隐藏标题：只留半行高的分隔。
-            // ⚠ 首行的隐藏分隔**不占高度** —— 否则 HUD 顶端会多出一条空行。
-            if (!firstRow) rowsH += r.hideTitle ? (M.lh * 0.5f) : M.headH;
+            // 分组高度 = 该组的 gapBefore + 标题高（隐藏标题则为 0）。
+            // ⚠ 首行的间距不计入 —— 否则 HUD 顶端会多出一条空行。
+            if (!firstRow) rowsH += r.gapBefore;
+            if (!r.hideTitle) rowsH += M.headH;
         } else {
             rowsH += M.lh;
             if (r.chart) rowsH += M.chartGap + M.chartH;
@@ -369,9 +369,8 @@ void PanelRenderer::Render(ID2D1RenderTarget* rt, float x, float y, const PanelD
 
     for (auto& r : d.rows) {
         if (r.header) {
+            if (!firstRow) cy += r.gapBefore;   // 分组间距（首行不留）
             if (r.hideTitle) {
-                // 不画标题，只推进半行高当分隔；**首行不推进**（否则顶端多一条空行）
-                if (!firstRow) cy += M.lh * 0.5f;
                 firstRow = false;
                 continue;
             }
