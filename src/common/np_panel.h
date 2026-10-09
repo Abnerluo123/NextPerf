@@ -42,6 +42,9 @@ struct PanelRow {
     std::wstring value;
     int          level = PL_NORMAL;
     bool         header = false; // 分组标题行（CPU / GPU / …），无数值
+    // 是分组但**不显示标题**：只留半行高的空白当分隔
+    // （用户要求：`帧率与延迟` / `系统` 这两个小标题不要出现）
+    bool         hideTitle = false;
 
     // ---- Metal HUD 风格的右侧方括号区间：`[ min  max ]`
     // 空字符串 = 本行不显示方括号。数值由 np_build 从**图表窗口**里统计出来，
@@ -82,6 +85,16 @@ public:
     ID2D1Factory*   factory() const { return d2d_; }
     IDWriteFactory* dwrite() const { return dwrite_; }
 
+    // 诊断用：Measure() 算出的各列宽度（定位「面板宽度随数值变化」是谁在变）
+    struct Diag {
+        float labelW = 0, valueW = 0, rngW = 0, headW = 0, charW = 0, contentW = 0;
+    };
+    mutable Diag diag;
+
+    // 面板宽度锁定值：只增不减。行是随数据陆续出现的，
+    // 允许回落的话面板会随行的有无反复伸缩。字号变化时重置。
+    mutable float latchedW_ = 0.0f;
+
 private:
     void EnsureFormats(float fontSize);
     void ReleaseFormats();
@@ -94,6 +107,9 @@ private:
     IDWriteTextFormat* fmtSmallL_ = nullptr; // 左对齐小字（左括号，等宽）
     IDWriteTextFormat* fmtHead_ = nullptr;   // 分组标题
     float fontSize_ = 0.0f;
+    // 字体自身的行距（由 DWrite 实测）。行高不能小于它，否则 DWRITE 的 CLIP
+    // 会把字形上下裁掉，各行的视觉高低也会不齐。
+    float lineHeight_ = 0.0f;
 };
 
 inline D2D1_COLOR_F ToColorF(uint32_t aarrggbb) {

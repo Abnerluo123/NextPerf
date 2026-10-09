@@ -798,6 +798,20 @@ bool RenderPanel(const NPConfig& cfg) {
     gPanel.Measure(gPd, cfg, &pw, &ph);
     int w = (int)(pw + 3.0f), h = (int)(ph + 3.0f);
     if (w < 8 || h < 8) return false;
+    // 诊断：面板逻辑尺寸一变就记一条。
+    // 「HUD 宽度随数值一直变化」这个问题就靠它客观判定 ——
+    // 理想情况整局只出现一次（首帧建立缓存），之后不该再变。
+    {
+        static int lastW = 0, lastH = 0;
+        if (w != lastW || h != lastH) {
+            lastW = w; lastH = h;
+            Log("panel logical size %dx%d | label=%.1f value=%.1f rng=%.1f head=%.1f "
+                "char=%.2f content=%.1f",
+                w, h, (double)gPanel.diag.labelW, (double)gPanel.diag.valueW,
+                (double)gPanel.diag.rngW, (double)gPanel.diag.headW,
+                (double)gPanel.diag.charW, (double)gPanel.diag.contentW);
+        }
+    }
     DrawCtx dc{&gPanel, &gPd, cfg};
     if (!gBmp.Render(w, h, DrawCb, &dc)) return false;
     gBw = gBmp.width();     // 物理像素（含光栅倍率）

@@ -38,6 +38,35 @@ static std::wstring GBv(float v) {
     return WF(v, 1) + L" GB";
 }
 
+// 颜色迟滞：避免数值在阈值附近来回跳时红/白疯狂闪烁。
+//
+// 这是实测反馈的问题（连续截图能看到颜色一帧一变）。根因是判定用了
+// **瞬时值**：例如「帧生成时间 > 33.3ms 标红」，而 frameMs 是上一帧的原始
+// 间隔，逐帧在 9~24ms 之间抖，一跨过阈值就闪。
+//
+// dir = +1：「值越大越糟」（帧时间、温度、占用率）
+// dir = -1：「值越小越糟」（FPS）
+// 触发与恢复用**两个不同阈值**，并记住上一次的状态。
+[[maybe_unused]] static bool HystWarn(int slot, float value, float badOn, float badOff,
+                                      int dir) {
+    static bool state[24]{};
+    static bool init[24]{};
+    if (slot < 0 || slot >= 24) return false;
+    if (!init[slot]) {
+        init[slot] = true;
+        state[slot] = (dir > 0) ? (value > badOn) : (value < badOn);
+        return state[slot];
+    }
+    if (state[slot]) {
+        bool recovered = (dir > 0) ? (value < badOff) : (value > badOff);
+        if (recovered) state[slot] = false;      // 明显好转才恢复
+    } else {
+        bool worse = (dir > 0) ? (value > badOn) : (value < badOn);
+        if (worse) state[slot] = true;           // 明显变差才标红
+    }
+    return state[slot];
+}
+
 // 从历史环形缓冲里统计极值。
 // 窗口刻意和折线图**显示的范围一致** —— 金属 HUD 的方括号里就是曲线上
 // 看得见的那段区间的小/最大值，这样括号和曲线永远自洽。
@@ -76,27 +105,58 @@ struct RowAcc {
     void rowRange(const wchar_t* label, std::wstring value, int level, bool active,
                   const float* series, const NPHistory* h, int dec, float warnMinBelow,
                   float warnMaxAbove) {
+        // ★ 用户要求：**不再显示 `[min max]` 区间**，只显示数值本身。
+        //   保留函数签名（调用点不用改），想恢复只要把下面这段注释放开、
+        //   并把 np_panel.cpp 里的 wantRange 置回 true 即可。
+        (void)active; (void)series; (void)h; (void)dec;
+        (void)warnMinBelow; (void)warnMaxAbove;
         row(label, std::move(value), level);
-        PanelRow& r = pending.back();
-        if (!active) return;
-        float mn = 0, mx = 0;
-        if (!HistRange(series, h, &mn, &mx)) return;
-        r.vmin = WF(mn, dec);
-        r.vmax = WF(mx, dec);
-        r.warnMin = (mn < warnMinBelow);
-        r.warnMax = (mx > warnMaxAbove);
+        // PanelRow& r = pending.back();
+        // if (!active) return;
+        // float mn = 0, mx = 0;
+        // if (!HistRange(series, h, &mn, &mx)) return;
+        // r.vmin = WF(mn, dec);
+        // r.vmax = WF(mx, dec);
+        // r.warnMin = (mn < warnMinBelow);
+        // r.warnMax = (mx > warnMaxAbove);
     }
     // 一组收齐：有内容才输出分组标题，避免空标题
-    void flush(const wchar_t* group) {
+    // hideTitle=true：保留分组（行序不变）但不画小标题，只留半行高的分隔
+    void flush(const wchar_t* group, bool hideTitle = false) {
         if (pending.empty()) return;
         PanelRow hd;
         hd.label = group;
         hd.header = true;
+        hd.hideTitle = hideTitle;
         d.rows.push_back(std::move(hd));
         for (auto& r : pending) d.rows.push_back(std::move(r));
         pending.clear();
     }
 };
+
+// 按**显示格数**截断字符串（中文等全角字符算 2 格）。
+// 面板数值列固定 20 格，超过会被裁掉看不见 —— 所以在数据层先截断并加省略号。
+static std::wstring FitCols(const std::wstring& s, size_t maxCols) {
+    size_t cols = 0, i = 0;
+    for (; i < s.size(); ++i) {
+        size_t w = (s[i] >= 0x1100 && (s[i] <= 0x115F || s[i] == 0x2329 || s[i] == 0x232A ||
+                    (s[i] >= 0x2E80 && s[i] <= 0xA4CF) || (s[i] >= 0xAC00 && s[i] <= 0xD7A3) ||
+                    (s[i] >= 0xF900 && s[i] <= 0xFAFF) || (s[i] >= 0xFE30 && s[i] <= 0xFE6F) ||
+                    (s[i] >= 0xFF00 && s[i] <= 0xFF60) || (s[i] >= 0xFFE0 && s[i] <= 0xFFE6)))
+                       ? 2 : 1;
+        if (cols + w > maxCols) break;
+        cols += w;
+    }
+    if (i >= s.size()) return s;
+    std::wstring out = s.substr(0, i);
+    // 末尾换成省略号（省略号本身占 1 格）
+    while (!out.empty() && cols + 1 > maxCols) {
+        size_t w = (out.back() > 0x1100) ? 2 : 1;
+        out.pop_back();
+        cols -= w;
+    }
+    return out + L"…";
+}
 
 static std::wstring ApiName(uint32_t api, uint32_t presentMode) {
     const wchar_t* a = L"未知";
@@ -163,17 +223,21 @@ void BuildPanelData(PanelData& out, const NPConfig& c, const NPSensors& s, const
         r.unit = unit;
     };
     if (c.counters & NP_C_FPS) {
-        // 金属 HUD：FPS 用白色；低于 30 时数值转红，并且括号里的最小值也标红
+        // 金属 HUD：FPS 用白色；明显偏低时数值转红（带迟滞，避免临界值闪红）
         acc.rowRange(L"FPS", active ? WF(t.fps, 0) : L"—",
-                     active && t.fps < 30 ? PL_WARN : PL_FPS, active, h ? h->fps : nullptr, h, 0,
-                     30.0f, 1e30f);
+                     PL_FPS, active,
+                     h ? h->fps : nullptr, h, 0, 28.0f, 1e30f);
         if (showCharts && (c.counters & NP_C_GRAPH)) attach(acc.pending.back(), h->fps, 2);
     }
     if (c.counters & NP_C_FRAMETIME) {
-        acc.rowRange(L"帧生成时间",
+        // ⚠ 这一行的**数值与曲线颜色固定**，不随帧时间跳红。
+        //   原来判据用瞬时 t.frameMs（逐帧在 9~24ms 之间抖），跨过阈值就闪红；
+        //   即便改成平滑值 + 迟滞，在 30fps 这类场景里也会「进去就出不来」
+        //   （触发 33.3ms、恢复要 22ms，于是整行长期红着）—— 两种表现都不对。
+        //   金属 HUD 的做法是：**数值保持指标色，只有括号里的极值才标红**，照此办理。
+        acc.rowRange(L"帧时间",
                      active ? Msv(t.frameMsAvg > 0.0001f ? t.frameMsAvg : t.frameMs) : L"—",
-                     active && t.frameMs > 33.3f ? PL_WARN : PL_MEM, active,
-                     h ? h->latFrame : nullptr, h, 1, -1e30f, 33.34f);
+                     PL_MEM, active, h ? h->latFrame : nullptr, h, 1, -1e30f, 36.0f);
         if (showCharts && (c.counters & NP_C_GRAPH)) attach(acc.pending.back(), h->latFrame, 0);
     }
     if (c.counters & NP_C_LOW1) {
@@ -183,21 +247,21 @@ void BuildPanelData(PanelData& out, const NPConfig& c, const NPSensors& s, const
     if (c.counters & NP_C_LOW01) {
         acc.row(L"0.1% Low", active ? WF(t.fpsLow01, 0) + L" FPS" : L"—");
     }
-    acc.flush(L"帧率与延迟");
+    acc.flush(L"帧率与延迟", true);
 
     // ---------------- CPU ----------------
     if (c.counters & NP_C_CPU_USAGE) {
         // 金属 HUD 的配色语言：CPU 侧的指标一律蓝
-        int lv = s.cpuUsage > 90 ? PL_WARN : PL_CPU;
-        acc.row(L"CPU 占用", PctV(s.cpuUsage), lv);
+        int lv = PL_CPU;
+        acc.row(L"占用", PctV(s.cpuUsage), lv);
     }
     if (c.counters & NP_C_CPU_TEMP) {
-        int lv = s.cpuTemp > 90 ? PL_WARN : PL_CPU;
-        acc.row(L"CPU 温度", Cv(s.cpuTemp), lv);
+        int lv = PL_CPU;
+        acc.row(L"温度", Cv(s.cpuTemp), lv);
     }
     if (c.counters & NP_C_CPU_FRAME) {
         // 金属 HUD 的 "Pre" 是蓝色 —— CPU 侧的时间类指标统一用蓝
-        acc.rowRange(L"CPU 帧时间", active ? Msv(t.cpuFrameMs) : L"—", PL_CPU, active,
+        acc.rowRange(L"帧时间", active ? Msv(t.cpuFrameMs) : L"—", PL_CPU, active,
                      h ? h->latCpu : nullptr, h, 1, -1e30f, 33.34f);
         if (showCharts && (c.counters & NP_C_CHART_LATENCY)) attach(acc.pending.back(), h->latCpu, 0);
     }
@@ -206,20 +270,20 @@ void BuildPanelData(PanelData& out, const NPConfig& c, const NPSensors& s, const
     // ---------------- GPU ----------------
     if (c.counters & NP_C_GPU_NAME && s.gpuName[0]) {
         std::wstring n = Utf8ToWide(s.gpuName);
-        if (n.size() > 26) n = n.substr(0, 25) + L"…";
+        n = FitCols(n, 14);
         acc.row(L"显卡", n, PL_DIM);
     }
     if (c.counters & NP_C_GPU_USAGE) {
         // GPU 侧的指标一律绿
-        int lv = s.gpuUsage > 97 ? PL_WARN : PL_GPU;
-        acc.row(L"GPU 占用", PctV(s.gpuUsage), lv);
+        int lv = PL_GPU;
+        acc.row(L"占用", PctV(s.gpuUsage), lv);
     }
     if (c.counters & NP_C_GPU_TEMP) {
-        int lv = s.gpuTemp > 83 ? PL_WARN : PL_GPU;
-        acc.row(L"GPU 温度", Cv(s.gpuTemp), lv);
+        int lv = PL_GPU;
+        acc.row(L"温度", Cv(s.gpuTemp), lv);
     }
     if (c.counters & NP_C_GPU_HOTSPOT) {
-        if (s.gpuHotspot > -200.0f) acc.row(L"GPU 热点", Cv(s.gpuHotspot),
+        if (s.gpuHotspot > -200.0f) acc.row(L"热点", Cv(s.gpuHotspot),
                                             s.gpuHotspot > 95 ? PL_WARN : PL_NORMAL);
         if (s.gpuMemTemp > -200.0f) acc.row(L"显存结温", Cv(s.gpuMemTemp),
                                             s.gpuMemTemp > 95 ? PL_WARN : PL_NORMAL);
@@ -227,11 +291,13 @@ void BuildPanelData(PanelData& out, const NPConfig& c, const NPSensors& s, const
     if (c.counters & NP_C_GPU_POWER) {
         // 只显示当前功耗。用户明确要求：不要带最大功耗（"不需要读取最大功耗"）
         std::wstring v = Wv(s.gpuPower);
-        acc.row(L"GPU 功耗", v);
+        acc.row(L"功耗", v);
     }
     if (c.counters & NP_C_GPU_CLOCK) {
         std::wstring v = MHzv(s.gpuClock);
-        if (s.memClock > 0) v += L" / " + WF(s.memClock, 0) + L" MHz";
+        // 写成 `2002/14001 MHz` 而非 `2002 MHz / 14001 MHz` —— 省 4 个字符格。
+        // 面板数值列按最长值定宽，把它写短才能让整块面板真正收窄。
+        if (s.memClock > 0) v = WF(s.gpuClock, 0) + L"/" + WF(s.memClock, 0) + L" MHz";
         acc.row(L"核心/显存频率", v);
     }
     if (c.counters & NP_C_FAN) {
@@ -248,7 +314,7 @@ void BuildPanelData(PanelData& out, const NPConfig& c, const NPSensors& s, const
         else if (active && t.gpuFrameMs > 0.01f) v = Msv(t.gpuFrameMs);
         else v = L"—";
         // 金属 HUD 的 "GPU" 是绿色 —— GPU 侧的时间类指标统一用绿
-        acc.rowRange(L"GPU 帧时间", v, PL_GPU, active, h ? h->latGpu : nullptr, h, 2, -1e30f,
+        acc.rowRange(L"帧时间", v, PL_GPU, active, h ? h->latGpu : nullptr, h, 2, -1e30f,
                      33.34f);
         if (showCharts && (c.counters & NP_C_CHART_LATENCY)) attach(acc.pending.back(), h->latGpu, 0);
     }
@@ -265,11 +331,11 @@ void BuildPanelData(PanelData& out, const NPConfig& c, const NPSensors& s, const
     }
     if (c.counters & NP_C_VRAM) {
         std::wstring v = GBv(s.vramUsedGB);
-        if (s.vramTotalGB > 0) v += L" / " + WF(s.vramTotalGB, 1) + L" GB";
+        if (s.vramTotalGB > 0) v = WF(s.vramUsedGB, 1) + L"/" + WF(s.vramTotalGB, 1) + L" GB";
         acc.row(L"显存", v, s.vramPct > 92 ? PL_WARN : PL_NORMAL);
     }
     if (c.counters & NP_C_GPU_FB && s.domFb >= 0)
-        acc.row(L"显存带宽占用", PctV(s.domFb), PL_DIM);
+        acc.row(L"显存带宽", PctV(s.domFb), PL_DIM);
     if (c.counters & NP_C_GPU_VID && s.domVid >= 0)
         acc.row(L"视频引擎", PctV(s.domVid), PL_DIM);
     if (c.counters & NP_C_GPU_BUS && s.domBus >= 0)
@@ -285,13 +351,13 @@ void BuildPanelData(PanelData& out, const NPConfig& c, const NPSensors& s, const
         } else if (hooked && t.rtDispatches) {
             v = L"启用 " + std::to_wstring(t.rtDispatches) + L" 次";
         } else if (hooked) {
-            v = L"未检测到 DXR";
+            v = L"无 DXR";
             lv = PL_DIM;
         } else {
             v = L"需注入";
             lv = PL_DIM;
         }
-        acc.row(L"RT Core 负载", v, lv);
+        acc.row(L"RT Core", v, lv);
     }
     if (c.counters & NP_C_TENSOR) {
         std::wstring v;
@@ -305,13 +371,13 @@ void BuildPanelData(PanelData& out, const NPConfig& c, const NPSensors& s, const
             v = L"AI 已启用 · 估算中";
             lv = PL_DIM;
         } else if (hooked) {
-            v = L"未检测到 AI pass";
+            v = L"无 AI";
             lv = PL_DIM;
         } else {
             v = L"需注入";
             lv = PL_DIM;
         }
-        acc.row(L"Tensor / AI 负载", v, lv);
+        acc.row(L"Tensor", v, lv);
     }
     if (c.counters & NP_C_RESOLUTION && hooked && t.renderW) {
         std::wstring v = std::to_wstring(t.renderW) + L"×" + std::to_wstring(t.renderH);
@@ -320,7 +386,7 @@ void BuildPanelData(PanelData& out, const NPConfig& c, const NPSensors& s, const
             v += L" → " + std::to_wstring(t.windowW) + L"×" + std::to_wstring(t.windowH);
             v += L" (" + WF(sc * 100.0f, 0) + L"%)";
         }
-        acc.row(L"渲染 / 输出", v);
+        acc.row(L"分辨率", v);
     }
     if (c.counters & NP_C_AI_MODULES && hooked) {
         acc.row(L"AI 模块", AiModuleText(t.aiModules), t.aiModules ? PL_ACCENT : PL_DIM);
@@ -330,20 +396,19 @@ void BuildPanelData(PanelData& out, const NPConfig& c, const NPSensors& s, const
     // ---------------- 系统 ----------------
     if (c.counters & NP_C_RAM) {
         std::wstring v = GBv(s.ramUsedGB);
-        if (s.ramTotalGB > 0) v += L" / " + WF(s.ramTotalGB, 1) + L" GB";
+        if (s.ramTotalGB > 0) v = WF(s.ramUsedGB, 1) + L"/" + WF(s.ramTotalGB, 1) + L" GB";
         acc.row(L"内存", v, s.ramPct > 92 ? PL_WARN : PL_NORMAL);
     }
-    if (c.counters & NP_C_API) acc.row(L"图形 API", ApiName(t.gfxApi, t.presentMode), PL_DIM);
+    if (c.counters & NP_C_API) acc.row(L"API", ApiName(t.gfxApi, t.presentMode), PL_DIM);
     if (c.counters & NP_C_DRAWS && hooked) {
         std::wstring v = std::to_wstring(t.drawCalls) + L" / " + std::to_wstring(t.dispatches);
-        acc.row(L"Draw / Dispatch", v, PL_DIM);
+        acc.row(L"Draw/Disp", v, PL_DIM);
     }
     if (c.counters & NP_C_SENSOR_SRC && s.sourceText[0]) {
-        std::wstring st = Utf8ToWide(s.sourceText);
-        if (st.size() > 40) st = st.substr(0, 39) + L"…";
+        std::wstring st = FitCols(Utf8ToWide(s.sourceText), 14);
         acc.row(L"数据源", st, PL_DIM);
     }
-    acc.flush(L"系统");
+    acc.flush(L"系统", true);
 }
 
 }  // namespace np

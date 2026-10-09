@@ -66,11 +66,14 @@ static IDWriteTextFormat* MakeFmtFrom(IDWriteFactory* f, const wchar_t* const* f
     return nullptr;
 }
 
-// 中文标签：UI 字体（等宽字体没有中文字形）
+// 中文标签：也要**等宽** —— 否则中英混排时左侧栅格是歪的（用户反馈"左侧字体也没改"）。
+// NSimSun（新宋体）是 Windows 自带的**等宽中文**字体，中英文字符宽度一致，
+// 能和右侧的等宽数字共用同一套栅格。
 static IDWriteTextFormat* MakeFmtUI(IDWriteFactory* f, float size, DWRITE_FONT_WEIGHT w,
                                     DWRITE_TEXT_ALIGNMENT align) {
-    static const wchar_t* faces[] = {L"Microsoft YaHei UI", L"Microsoft YaHei", L"Segoe UI"};
-    return MakeFmtFrom(f, faces, 3, size, w, align);
+    static const wchar_t* faces[] = {L"NSimSun", L"SimSun", L"MS Gothic",
+                                     L"Microsoft YaHei UI"};
+    return MakeFmtFrom(f, faces, 4, size, w, align);
 }
 
 // 数值 / 括号：**等宽字体**。这是 Metal HUD 观感的关键 ——
@@ -86,13 +89,33 @@ void PanelRenderer::EnsureFormats(float fs) {
     if (fmt_ && fabs(fs - fontSize_) < 0.01f) return;
     ReleaseFormats();
     fontSize_ = fs;
+    latchedW_ = 0.0f;   // 字号变了，宽度锁重建
     fmt_ = MakeFmtUI(dwrite_, fs, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_LEADING);
     fmtR_ = MakeFmtMono(dwrite_, fs, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_TRAILING);
     fmtSmall_ = MakeFmtMono(dwrite_, fs, DWRITE_FONT_WEIGHT_NORMAL,
                             DWRITE_TEXT_ALIGNMENT_TRAILING);
     fmtSmallL_ = MakeFmtMono(dwrite_, fs, DWRITE_FONT_WEIGHT_NORMAL,
                              DWRITE_TEXT_ALIGNMENT_LEADING);
-    fmtHead_ = MakeFmtUI(dwrite_, fs * 0.92f, DWRITE_FONT_WEIGHT_SEMI_BOLD,
+    // 分组标题（帧率与延迟 / CPU / GPU / 系统）用**与正文同号**的字号。
+    // 原来给的是 0.92×，实机看起来明显偏小（用户反馈）。
+    // 用一行中英混排的样本文本实测字体行距（GetLineMetrics）。
+    // 行高若小于它，D2D1_DRAW_TEXT_OPTIONS_CLIP 就会裁掉字形上下。
+    lineHeight_ = 0.0f;
+    if (fmt_ && dwrite_) {
+        IDWriteTextLayout* probe = nullptr;
+        const wchar_t* sample = L"Ag0.帧\u00b0%";
+        if (SUCCEEDED(dwrite_->CreateTextLayout(sample, 8, fmt_, 2048.0f, 2048.0f,
+                                                &probe)) && probe) {
+            DWRITE_LINE_METRICS lm{};
+            UINT32 cnt = 0;
+            if (SUCCEEDED(probe->GetLineMetrics(&lm, 1, &cnt)) && cnt > 0)
+                lineHeight_ = lm.height;
+            probe->Release();
+        }
+    }
+    if (lineHeight_ <= 0.0f) lineHeight_ = fs * 1.30f;   // 兜底
+    // CPU / GPU 标题：与正文同号同间距，但**加粗**（用户要求）
+    fmtHead_ = MakeFmtUI(dwrite_, fs, DWRITE_FONT_WEIGHT_BOLD,
                          DWRITE_TEXT_ALIGNMENT_LEADING);
 }
 
@@ -113,16 +136,18 @@ namespace {
 struct Metrics {
     float pad, lh, headH, chartH, rowGap, chartGap, colGap;
 };
-Metrics Layout(const NPConfig& c) {
+Metrics Layout(const NPConfig& c, float lineH) {
     Metrics m{};
-    m.pad = 7.0f * c.scale;
+    m.pad = 4.0f * c.scale;
     // 金属 HUD 的行距非常紧：约 1.18 倍字号。普通界面用 1.34 会显得松散。
-    m.lh = (float)c.fontHeight * 1.18f * c.scale;
-    m.headH = m.lh * 0.92f;
-    m.chartH = std::max(16.0f, (float)c.graphHeight * 0.42f) * c.scale;
+    // 行高 = max(紧凑值, 字体自身行距)。取字体行距才能保证字形不被 CLIP 裁掉。
+    m.lh = std::max((float)c.fontHeight * 1.14f * c.scale, lineH);
+    m.headH = m.lh;   // 与正文行同高（字号已改为与正文同号）
+    // 金属 HUD 的曲线区比文字区矮得多；原来 0.42 显得又高又空（用户要求缩短）
+    m.chartH = std::max(11.0f, (float)c.graphHeight * 0.26f) * c.scale;
     m.rowGap = 1.0f * c.scale;
     m.chartGap = 2.0f * c.scale;
-    m.colGap = 6.0f * c.scale;
+    m.colGap = 2.0f * c.scale;
     return m;
 }
 }  // namespace
@@ -149,57 +174,128 @@ static inline bool HasRange(const PanelRow& r) { return !r.vmin.empty() || !r.vm
 // 把「各列的最大宽度」算一次，**测量与绘制共用同一套数字**。
 // 之前测量和绘制各算各的，结果是括号和数值列对不齐（截图里一眼能看出来）。
 struct Grid {
+    float charW = 8.0f;           // 一个等宽字符的宽度（栅格单位）
     float labelW = 0, valueW = 0;
-    float wMin = 0, wMax = 0;     // 括号里两个数字的字段宽（取全表最大，保证纵向对齐）
+    float wMin = 0, wMax = 0;     // 括号里两个数字的固定字段宽（各 6 格）
     float openW = 0, gapW = 0, closeW = 0;
     float rngW = 0;               // 整个方括号组的总宽
 };
 
-static Grid ComputeGrid(IDWriteFactory* f, IDWriteTextFormat* fmtLabel,
-                        IDWriteTextFormat* fmtVal, IDWriteTextFormat* fmtSmall,
-                        const PanelData& d) {
+// ⚠ 量宽度必须用**同一个左对齐格式**，不要用右对齐的 fmtR_ 去量。
+//   右对齐（DWRITE_TEXT_ALIGNMENT_TRAILING）的 layout 被给一个很宽的盒子时，
+//   GetMetrics().width 可能返回**整个盒子宽度**而不是文本自身宽度，
+//   于是 valueW 变成几千像素，面板被撑得极宽、字也像被横向拉开。
+//   （重写这一版时我把量宽用的格式从 fmt_ 换成了 fmtR_，属于自己引入的回归。）
+static Grid ComputeGrid(IDWriteFactory* f, IDWriteTextFormat* fmtText,
+                        IDWriteTextFormat* fmtSmall, const PanelData& d,
+                        bool wantRange) {
     Grid g;
     // ⚠ 不要用 MeasureW(L"  ") 去量空格：**DWrite 会把行尾空格裁掉**，量出来接近 0，
     //   结果是括号里的最小值与最大值直接黏在一起（实测显示成 `0.4426.23`）。
     //   等宽字体里每个字符（含空格）宽度相同，用「一个字符宽」推算即可。
     float chW = MeasureW(f, fmtSmall, L"0");
     if (chW <= 0.0f) chW = fmtSmall->GetFontSize() * 0.6f;
+    g.charW = chW;
     g.openW = chW;
     g.closeW = chW;
-    g.gapW = chW * 1.6f;          // 约 1.6 个字符宽的间隙
+    g.gapW = chW;                 // 一格的间隙
+
+    // ★ 所有列宽都量化到**字符格整数倍**，并且不依赖当前数值的瞬时长度。
+    auto cols = [&](float px) { return std::ceil(px / chW - 0.0001f) * chW; };
+
+    float maxLabel = 0, maxValue = 0;
+    bool anyRange = false;
     for (auto& r : d.rows) {
         if (r.header) continue;
-        g.labelW = std::max(g.labelW, MeasureW(f, fmtLabel, r.label));
-        g.valueW = std::max(g.valueW, MeasureW(f, fmtVal, r.value));
-        if (HasRange(r)) {
-            g.wMin = std::max(g.wMin, MeasureW(f, fmtSmall, r.vmin));
-            g.wMax = std::max(g.wMax, MeasureW(f, fmtSmall, r.vmax));
-        }
+        maxLabel = std::max(maxLabel, MeasureW(f, fmtText, r.label));
+        // ⚠ 必须用**与绘制相同的字体**去量宽度！
+        //   数值已改为等宽字体（fmtSmall_ / fmtSmallL_）绘制，若仍用标签字体
+        //   （fmt_，NSimSun）去量，量出来会偏小，长值就被裁掉
+        //   —— 实测 `1125/9001 MHz` 被裁成 `1125/9001 MH`。
+        maxValue = std::max(maxValue, MeasureW(f, fmtSmall, r.value));
+        if (HasRange(r)) anyRange = true;
     }
-    if (g.wMin > 0.0f || g.wMax > 0.0f)
-        g.rngW = g.openW + g.gapW + g.wMin + g.gapW + g.wMax + g.gapW + g.closeW;
+    // 标签集合是固定的，量化后完全稳定
+    g.labelW = cols(maxLabel);
+    // 数值列：按实际最长值向上取整到 **4 格** 的整数倍。
+    //
+    // 为什么不硬占 20 格：实测那样面板明显偏宽、数据显得很散（用户反馈）。
+    // 为什么量化到 4 格而不是用精确宽度：这样「9% ↔ 100%」这种 1~3 格的
+    // 变化不会改变面板宽度，对固定的指标集合完全稳定。
+    // 过长的值已在数据层截断（np_build.cpp 的 FitCols），不会撑破列宽。
+    {
+        // 固定 14 格。数值在数据层被 FitCols 截到 14 格，所以既不会截断显示，
+        // 也不会因为某个值变长而撑宽面板 —— 宽度恒定（用户要求 3）。
+        (void)maxValue;
+        g.valueW = 14.0f * chW;
+    }
+    // 范围列：min / max 各固定 6 格 —— 数值再长也不会变宽。
+    //
+    // ★ 必须**无条件预留**，不能写成「有行带范围才预留」。
+    //   实测：那样写的话，启动时无数据 → 没有范围 → 面板 266 宽；
+    //   一旦拿到数据、范围列出现 → 面板立刻变 421 宽。数据有无之间来回切换，
+    //   面板宽度就反复抖 —— 这就是「HUD 宽度随数值一直变化」的真正来源。
+    //   代价是：所有范围类指标都关掉时右侧会留一块空位。宁可留白，也不能抖。
+    // 范围列：按**实际最长括号宽度**取宽，再向上取整到整字符。
+    // 原来固定预留 13 格（min/max 各 5 格），而括号实际只用 7~12 格 ——
+    // 多出来的格子全变成了「标签与数值之间那条大空隙」（实机反馈）。
+    {
+        float natural = 0.0f;
+        for (auto& r : d.rows) {
+            if (r.header || !HasRange(r)) continue;
+            natural = std::max(natural, g.openW + MeasureW(f, fmtSmall, r.vmin) +
+                                            g.gapW + MeasureW(f, fmtSmall, r.vmax) +
+                                            g.closeW);
+        }
+        // ★ 宽度必须**纯由配置决定**，绝不能看当前数据：
+        //   按「实际最长括号」取宽时，行随数据陆续出现会让它一路长
+        //   （诊断日志实测 87.7 -> 96.5 -> 105.3），面板开局几秒持续变宽。
+        //   固定 12 格足够容纳最宽的 `[ 0.36 128.68]`。
+        g.rngW = wantRange ? 12.0f * chW : 0.0f;
+        (void)natural;
+    }
+    (void)anyRange;
     return g;
 }
 
 void PanelRenderer::Measure(const PanelData& d, const NPConfig& c, float* w, float* h) const {
-    Metrics M = Layout(c);
+    Metrics M = Layout(c, lineHeight_);
     if (!fmt_ || !fmtR_ || !fmtSmall_) { *w = 240.0f; *h = 110.0f; return; }
 
-    Grid G = ComputeGrid(dwrite_, fmt_, fmtR_, fmtSmall_, d);
+    // 用户要求：不再显示 `[min max]` 区间 -> 范围列宽归零，面板整体收窄。
+    const bool wantRange = false;
+    Grid G = ComputeGrid(dwrite_, fmt_, fmtSmall_, d, wantRange);
     float headW = 0;
     for (auto& r : d.rows)
         if (r.header) headW = std::max(headW, MeasureW(dwrite_, fmtHead_, r.label));
 
     float contentW = G.labelW + M.colGap + G.valueW + (G.rngW > 0 ? M.colGap + G.rngW : 0.0f);
     contentW = std::max(contentW, headW);
-    // 金属 HUD 偏窄：不再额外撑宽
-    *w = std::max(170.0f * c.scale, contentW + M.pad * 2.0f);
+    diag.labelW = G.labelW;
+    diag.valueW = G.valueW;
+    diag.rngW = G.rngW;
+    diag.headW = headW;
+    diag.charW = G.charW;
+    diag.contentW = contentW;
+    // 金属 HUD 偏窄：不再额外撑宽。
+    // 量化到 4 个字符格（等宽栅格，天然单位）后**只增不减**地锁定 ——
+    // 行随数据陆续出现时面板最多长大一次，绝不会来回伸缩。
+    {
+        // 总宽**不再额外量化**：标签列已量化到整字符、数值列已量化到 4 格、
+        // 范围列是固定宽度，各列都已落在字符栅格上；再对总宽做 4 格量化
+        // （一档 35px）只会把 290 向上取整成 318，白白宽一圈。
+        float want = std::max(170.0f * c.scale, contentW + M.pad * 2.0f);
+        if (want > latchedW_) latchedW_ = want;   // 只增不减：行陆续出现时最多长一次
+        *w = latchedW_;
+    }
 
     float rowsH = 0;
     bool firstRow = true;
     for (auto& r : d.rows) {
-        if (r.header) rowsH += (firstRow ? 0.0f : M.rowGap * 3.0f) + M.headH;
-        else {
+        if (r.header) {
+            // 隐藏标题：只留半行高的分隔（用户要求「留半行高度分割」）
+            rowsH += r.hideTitle ? (M.lh * 0.5f) : M.headH;
+        } else {
             rowsH += M.lh;
             if (r.chart) rowsH += M.chartGap + M.chartH;
         }
@@ -214,7 +310,7 @@ void PanelRenderer::Render(ID2D1RenderTarget* rt, float x, float y, const PanelD
     EnsureFormats((float)c.fontHeight * c.scale);
     if (!fmt_ || !fmtR_) return;
 
-    Metrics M = Layout(c);
+    Metrics M = Layout(c, lineHeight_);
     float w, h;
     Measure(d, c, &w, &h);
 
@@ -225,7 +321,12 @@ void PanelRenderer::Render(ID2D1RenderTarget* rt, float x, float y, const PanelD
     bg.a = std::clamp(bg.a * c.bgOpacity, 0.0f, 1.0f);
     ID2D1SolidColorBrush* brBg = nullptr;
     if (FAILED(rt->CreateSolidColorBrush(bg, &brBg)) || !brBg) return;
-    rt->FillRectangle(D2D1::RectF(x, y, x + w, y + h), brBg);
+    // 金属 HUD 的底板是**带轻微圆角**的矩形（不是纯直角）
+    {
+        float rad = 7.0f * c.scale;
+        rt->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(x, y, x + w, y + h), rad, rad),
+                                 brBg);
+    }
 
     // 标签色：白 × 0.70（金属 HUD 的标签比数值暗一档）
     auto mk = [&](RGB col, float a, ID2D1SolidColorBrush** out) {
@@ -234,7 +335,8 @@ void PanelRenderer::Render(ID2D1RenderTarget* rt, float x, float y, const PanelD
     };
     ID2D1SolidColorBrush* brLabel = nullptr;
     ID2D1SolidColorBrush* brGrid = nullptr;
-    if (!mk({0.88f, 0.88f, 0.88f}, 0.70f, &brLabel) || !mk({1, 1, 1}, 0.10f, &brGrid)) {
+    // 标签亮度与数值一致（1.0），颜色取同一个近白 —— 用户要求视觉统一
+    if (!mk({0.95f, 0.95f, 0.95f}, 1.0f, &brLabel) || !mk({1, 1, 1}, 0.10f, &brGrid)) {
         if (brLabel) brLabel->Release();
         if (brGrid) brGrid->Release();
         brBg->Release();
@@ -245,24 +347,31 @@ void PanelRenderer::Render(ID2D1RenderTarget* rt, float x, float y, const PanelD
     float labelX = x + M.pad;
     float rightX = x + w - M.pad;
 
-    Grid G = ComputeGrid(dwrite_, fmt_, fmtR_, fmtSmall_, d);
-    float rngX = rightX - G.rngW;                       // 方括号组左边界
-    float valueRight = (G.rngW > 0.0f) ? rngX - M.colGap : rightX;
-    // 括号内部：min / max 各占一个**固定宽度**的格子，保证每行纵向对齐。
-    // （之前把两者画在同一条竖线附近 → 直接重叠，截图里有一个数字整个消失。）
-    float minRight = rngX + G.openW + G.gapW + G.wMin;
-    float maxRight = minRight + G.gapW + G.wMax;
-    float closeX = maxRight + G.gapW;
+    const bool wantRange = false;   // 同 Measure：区间显示已关闭
+    Grid G = ComputeGrid(dwrite_, fmt_, fmtSmall_, d, wantRange);
+    // ★ 布局（按用户实机反馈）：标签左对齐，**范围与数值都右对齐**，
+    //   而且**范围列右缘紧贴数值列左缘** —— 括号要偏向右侧的数值/单位那边，
+    //   而不是夹在标签后面偏左。
+    //      [标签] ······ [范围][数值]
+    float valueRightEdge = rightX;                            // 数值右缘
+    float rngRight = rightX - G.valueW - M.colGap;            // 范围列右缘：贴住数值列
+    float rngX = rngRight - G.rngW;
 
     float cy = y + M.pad;
     bool firstRow = true;
 
     for (auto& r : d.rows) {
         if (r.header) {
-            if (!firstRow) cy += M.rowGap * 3.0f;
-            RGB hc{0.80f, 0.80f, 0.80f};
+            if (r.hideTitle) {
+                // 不画标题，只推进半行高当分隔
+                cy += M.lh * 0.5f;
+                firstRow = false;
+                continue;
+            }
+            // 标题与正文同亮同色，只靠**加粗**区分（用户要求视觉统一）
+            RGB hc{0.95f, 0.95f, 0.95f};
             ID2D1SolidColorBrush* bh = nullptr;
-            if (mk(hc, 0.60f, &bh)) {
+            if (mk(hc, 1.0f, &bh)) {
                 rt->DrawText(r.label.c_str(), (UINT32)r.label.size(), fmtHead_,
                              D2D1::RectF(labelX, cy, rightX, cy + M.headH), bh,
                              D2D1_DRAW_TEXT_OPTIONS_CLIP);
@@ -277,14 +386,15 @@ void PanelRenderer::Render(ID2D1RenderTarget* rt, float x, float y, const PanelD
 
         // ---- 标签
         rt->DrawText(r.label.c_str(), (UINT32)r.label.size(), fmt_,
-                     D2D1::RectF(labelX, cy, valueRight - M.colGap, cy + M.lh), brLabel,
+                     D2D1::RectF(labelX, cy, labelX + G.labelW, cy + M.lh), brLabel,
                      D2D1_DRAW_TEXT_OPTIONS_CLIP);
 
         // ---- 数值（等宽、右对齐）
         ID2D1SolidColorBrush* bv = nullptr;
         if (mk(vc, 1.0f, &bv)) {
+            // 右对齐贴面板右缘（用户要求 1）。等宽字体保证数字仍纵向成列。
             rt->DrawText(r.value.c_str(), (UINT32)r.value.size(), fmtR_,
-                         D2D1::RectF(labelX, cy, valueRight, cy + M.lh), bv,
+                         D2D1::RectF(rngRight + M.colGap, cy, valueRightEdge, cy + M.lh), bv,
                          D2D1_DRAW_TEXT_OPTIONS_CLIP);
         }
 
@@ -299,17 +409,32 @@ void PanelRenderer::Render(ID2D1RenderTarget* rt, float x, float y, const PanelD
                              D2D1_DRAW_TEXT_OPTIONS_CLIP);
             };
             ID2D1SolidColorBrush* bbrk = nullptr;
-            mk(vc, 0.70f, &bbrk);
+            mk(vc, 1.0f, &bbrk);
+            // 括号里的数字与**数值同色**，不做红色预警（用户要求：数值什么色就是什么色）
             ID2D1SolidColorBrush* bmin = nullptr;
             ID2D1SolidColorBrush* bmax = nullptr;
-            mk(r.warnMin ? RGB{1.0f, 0.42f, 0.42f} : vc, r.warnMin ? 1.0f : 0.62f, &bmin);
-            mk(r.warnMax ? RGB{1.0f, 0.42f, 0.42f} : vc, r.warnMax ? 1.0f : 0.62f, &bmax);
+            mk(vc, 1.0f, &bmin);
+            mk(vc, 1.0f, &bmax);
 
-            drawAt(L"[", fmtSmallL_, bbrk, rngX, minRight);
-            // 两个数各自在自己的格子里**右对齐**
-            drawAt(r.vmin, fmtSmall_, bmin, rngX, minRight);
-            drawAt(r.vmax, fmtSmall_, bmax, minRight, maxRight);
-            drawAt(L"]", fmtSmallL_, bbrk, closeX, rightX);
+            // 右对齐收在范围列右缘（用户要求）：  [min max]
+            // 从右往左定位，`]` 固定贴住列右缘，短括号不会参差。
+            // ⚠ `[` 必须**紧贴**最小值 —— 原来在前面多留了一个 gapW，
+            //   实机看起来就是 `[ 0.40 22.57]`（`[` 后多一个空格），用户已指出。
+            float wmax = MeasureW(dwrite_, fmtSmall_, r.vmax);
+            float wmin = MeasureW(dwrite_, fmtSmall_, r.vmin);
+            float rEdge = rngX + G.rngW;
+            float closeL = rEdge - G.closeW;
+            float maxL = closeL - wmax;
+            float minR = maxL - G.gapW;
+            float minL = minR - wmin;
+            float openL = minL - G.openW;
+            // ⚠ `[` 用**右对齐**格式绘制，让字形紧贴最小值。
+            //   若用左对齐，等宽字体里 `[` 的右侧留白（side bearing）会变成一个
+            //   肉眼可见的空格 —— 实机看起来就是 `[ 0.40 22.57]`。
+            drawAt(L"[", fmtSmall_, bbrk, openL, minL);
+            drawAt(r.vmin, fmtSmall_, bmin, minL, minR);
+            drawAt(r.vmax, fmtSmall_, bmax, maxL, closeL);
+            drawAt(L"]", fmtSmallL_, bbrk, closeL, rEdge);
 
             if (bbrk) bbrk->Release();
             if (bmin) bmin->Release();
@@ -353,8 +478,8 @@ void PanelRenderer::Render(ID2D1RenderTarget* rt, float x, float y, const PanelD
                 float yRange = yMax - yMin;
 
                 // 极淡的竖向网格（金属 HUD 的网格感就来自这几条线）
-                for (int g = 1; g < 8; ++g) {
-                    float gx = plotX + plotW * (float)g / 8.0f;
+                for (int g = 1; g < 6; ++g) {
+                    float gx = plotX + plotW * (float)g / 6.0f;
                     rt->DrawLine(D2D1::Point2F(gx, plotY), D2D1::Point2F(gx, plotY + plotH),
                                  brGrid, 1.0f * c.scale);
                 }
