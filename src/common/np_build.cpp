@@ -1,0 +1,302 @@
+#include "np_build.h"
+
+#include <cstdio>
+#include <cstring>
+#include <string>
+#include <vector>
+#include <algorithm>
+
+namespace np {
+
+static std::wstring WF(float v, int dec) {
+    wchar_t b[48];
+    if (dec <= 0) swprintf(b, 48, L"%.0f", v);
+    else swprintf(b, 48, L"%.*f", dec, v);
+    return std::wstring(b);
+}
+
+static std::wstring Num(float v, int dec, const wchar_t* unit) {
+    if (v < -1000.0f) return L"—";
+    return WF(v, dec) + unit;
+}
+static std::wstring PctV(float v) { return Num(v, 0, L"%"); }
+static std::wstring Msv(float v) { return Num(v, 2, L" ms"); }
+static std::wstring Cv(float v) {
+    if (v < -200.0f) return L"—";
+    return WF(v, 0) + L" ℃";
+}
+static std::wstring Wv(float v) {
+    if (v < 0) return L"—";
+    return WF(v, 0) + L" W";
+}
+static std::wstring MHzv(float v) {
+    if (v < 0) return L"—";
+    return WF(v, 0) + L" MHz";
+}
+static std::wstring GBv(float v) {
+    if (v < 0) return L"—";
+    return WF(v, 1) + L" GB";
+}
+
+struct RowAcc {
+    PanelData& d;
+    std::vector<PanelRow> pending;
+    void row(const wchar_t* label, std::wstring value, int level = PL_NORMAL) {
+        PanelRow r;
+        r.label = label;
+        r.value = std::move(value);
+        r.level = level;
+        pending.push_back(std::move(r));
+    }
+    // 一组收齐：有内容才输出分组标题，避免空标题
+    void flush(const wchar_t* group) {
+        if (pending.empty()) return;
+        PanelRow hd;
+        hd.label = group;
+        hd.header = true;
+        d.rows.push_back(std::move(hd));
+        for (auto& r : pending) d.rows.push_back(std::move(r));
+        pending.clear();
+    }
+};
+
+static std::wstring ApiName(uint32_t api, uint32_t presentMode) {
+    const wchar_t* a = L"未知";
+    switch (api) {
+        case NP_API_D3D9: a = L"D3D9"; break;
+        case NP_API_D3D11: a = L"D3D11"; break;
+        case NP_API_D3D12: a = L"D3D12"; break;
+        case NP_API_VULKAN: a = L"Vulkan"; break;
+        case NP_API_OPENGL: a = L"OpenGL"; break;
+        default: a = L"未接入"; break;
+    }
+    const wchar_t* m = L"";
+    switch (presentMode) {
+        case NP_PM_EXCLUSIVE: m = L" 独占全屏"; break;
+        case NP_PM_BORDERLESS: m = L" 无边框"; break;
+        case NP_PM_WINDOWED: m = L" 窗口"; break;
+    }
+    return std::wstring(a) + m;
+}
+
+static std::wstring AiModuleText(uint32_t m) {
+    if (!m) return L"无";
+    std::wstring s;
+    auto add = [&](const wchar_t* t) {
+        if (!s.empty()) s += L",";
+        s += t;
+    };
+    if (m & NP_AI_DLSS_SR) add(L"DLSS-SR");
+    if (m & NP_AI_DLSS_RR) add(L"DLSS-RR");
+    if (m & NP_AI_DLSS_FG) add(L"DLSS-FG");
+    if (m & NP_AI_FSR) add(L"FSR");
+    if (m & NP_AI_XESS) add(L"XeSS");
+    if (m & NP_AI_DIRECTML) add(L"DirectML");
+    if (m & NP_AI_ORT) add(L"ONNX");
+    if (m & NP_AI_OTHER) add(L"其他");
+    return s;
+}
+
+void BuildPanelData(PanelData& out, const NPConfig& c, const NPSensors& s, const NPTelemetry& t,
+                    const NPHistory* h) {
+    out.rows.clear();
+    out.title.clear();   // 不显示任何 Logo / 标题，保持极简
+
+    const bool hooked = t.attached != 0;
+    const bool active = hooked || (c.simulate != 0);   // 模拟模式下帧数据视为可用
+    const bool showCharts = h != nullptr;
+    // ⚠ 不能在这里 return。
+    //   原来写的是「if (h == nullptr) return;  无历史数据时帧率行也没有图可画」——
+    //   但那样 CPU / GPU / 内存这些**根本不需要历史数据**的行也会一起消失，
+    //   把「画不了曲线」错误地当成了「什么都别显示」。
+    //   实际调用点目前都传了非空指针，所以它是一颗埋着的雷，拆掉。
+    //   没有历史数据时下面每处 attach() 都已经被 showCharts 挡住了。
+    RowAcc acc{out};
+
+    // ---------------- 帧率与延迟 ----------------
+    // 小图开关：NP_C_GRAPH=FPS/帧时间，NP_C_CHART_FPS=Low 帧，NP_C_CHART_LATENCY=帧延迟
+    auto attach = [&](PanelRow& r, const float* series, int unit) {
+        r.chart = true;
+        r.series = series;
+        r.chartCap = NP_HIST_CAP;
+        r.chartWrite = h->write;
+        r.chartCount = h->count;
+        r.sampleMs = h->sampleMs;
+        r.unit = unit;
+    };
+    if (c.counters & NP_C_FPS) {
+        acc.row(L"FPS", active ? WF(t.fps, 0) : L"—",
+                active && t.fps < 30 ? PL_WARN : PL_ACCENT);
+        if (showCharts && (c.counters & NP_C_GRAPH)) attach(acc.pending.back(), h->fps, 2);
+    }
+    if (c.counters & NP_C_FRAMETIME) {
+        acc.row(L"帧生成时间",
+                active ? Msv(t.frameMsAvg > 0.0001f ? t.frameMsAvg : t.frameMs) : L"—",
+                active && t.frameMs > 33.3f ? PL_WARN : PL_NORMAL);
+        if (showCharts && (c.counters & NP_C_GRAPH)) attach(acc.pending.back(), h->latFrame, 0);
+    }
+    if (c.counters & NP_C_LOW1) {
+        acc.row(L"1% Low", active ? WF(t.fpsLow1, 0) + L" FPS" : L"—");
+        // 不画曲线：用户明确要求「low 帧不需要画曲线，显示出数值就好」
+    }
+    if (c.counters & NP_C_LOW01) {
+        acc.row(L"0.1% Low", active ? WF(t.fpsLow01, 0) + L" FPS" : L"—");
+    }
+    acc.flush(L"帧率与延迟");
+
+    // ---------------- CPU ----------------
+    if (c.counters & NP_C_CPU_USAGE) {
+        int lv = s.cpuUsage > 90 ? PL_WARN : PL_NORMAL;
+        acc.row(L"CPU 占用", PctV(s.cpuUsage), lv);
+    }
+    if (c.counters & NP_C_CPU_TEMP) {
+        int lv = s.cpuTemp > 90 ? PL_WARN : PL_NORMAL;
+        acc.row(L"CPU 温度", Cv(s.cpuTemp), lv);
+    }
+    if (c.counters & NP_C_CPU_FRAME) {
+        acc.row(L"CPU 帧时间", active ? Msv(t.cpuFrameMs) : L"—");
+        if (showCharts && (c.counters & NP_C_CHART_LATENCY)) attach(acc.pending.back(), h->latCpu, 0);
+    }
+    acc.flush(L"CPU");
+
+    // ---------------- GPU ----------------
+    if (c.counters & NP_C_GPU_NAME && s.gpuName[0]) {
+        std::wstring n = Utf8ToWide(s.gpuName);
+        if (n.size() > 26) n = n.substr(0, 25) + L"…";
+        acc.row(L"显卡", n, PL_DIM);
+    }
+    if (c.counters & NP_C_GPU_USAGE) {
+        int lv = s.gpuUsage > 97 ? PL_WARN : PL_NORMAL;
+        acc.row(L"GPU 占用", PctV(s.gpuUsage), lv);
+    }
+    if (c.counters & NP_C_GPU_TEMP) {
+        int lv = s.gpuTemp > 83 ? PL_WARN : PL_NORMAL;
+        acc.row(L"GPU 温度", Cv(s.gpuTemp), lv);
+    }
+    if (c.counters & NP_C_GPU_HOTSPOT) {
+        if (s.gpuHotspot > -200.0f) acc.row(L"GPU 热点", Cv(s.gpuHotspot),
+                                            s.gpuHotspot > 95 ? PL_WARN : PL_NORMAL);
+        if (s.gpuMemTemp > -200.0f) acc.row(L"显存结温", Cv(s.gpuMemTemp),
+                                            s.gpuMemTemp > 95 ? PL_WARN : PL_NORMAL);
+    }
+    if (c.counters & NP_C_GPU_POWER) {
+        // 只显示当前功耗。用户明确要求：不要带最大功耗（"不需要读取最大功耗"）
+        std::wstring v = Wv(s.gpuPower);
+        acc.row(L"GPU 功耗", v);
+    }
+    if (c.counters & NP_C_GPU_CLOCK) {
+        std::wstring v = MHzv(s.gpuClock);
+        if (s.memClock > 0) v += L" / " + WF(s.memClock, 0) + L" MHz";
+        acc.row(L"核心/显存频率", v);
+    }
+    if (c.counters & NP_C_FAN) {
+        if (s.gpuFanPct > -1.0f) acc.row(L"风扇转速", PctV(s.gpuFanPct));
+        else if (s.gpuFanRpm > -1.0f) acc.row(L"风扇转速", WF(s.gpuFanRpm, 0) + L" RPM");
+    }
+    if (c.counters & NP_C_GPU_FRAME) {
+        // 优先用系统 PDH 按游戏进程算出来的「每帧 GPU 执行时间」——驱动报的数，
+        // 与锁帧 / Reflex / 多线程提交无关。钩子推算的值只作为兜底。
+        std::wstring v;
+        if (s.gpuBusyMs >= 0.0f && active) v = Msv(s.gpuBusyMs);
+        // 钩子的兜底值必须是**有效正数**才显示。原来是 0 也照显示，
+        // 于是「注入没成功」时面板上会出现一个假的 0.00 ms。
+        else if (active && t.gpuFrameMs > 0.01f) v = Msv(t.gpuFrameMs);
+        else v = L"—";
+        acc.row(L"GPU 帧时间", v, PL_NORMAL);
+        if (showCharts && (c.counters & NP_C_CHART_LATENCY)) attach(acc.pending.back(), h->latGpu, 0);
+    }
+    // 光流加速器（OFA）：N 卡上 DLSS **帧生成**专用的硬件单元。
+    // 系统计数器直接给，不用估算 —— 只要它在动，帧生成就在工作。
+    if (s.engOfa >= 0.0f || s.engCompute >= 0.0f) {
+        std::wstring v;
+        if (s.engOfa > 0.0f) v += L"光流 " + PctV(s.engOfa);
+        if (s.engCompute >= 0.0f) {
+            if (!v.empty()) v += L" · ";
+            v += L"Compute " + PctV(s.engCompute);
+        }
+        if (!v.empty()) acc.row(L"AI 引擎", v, PL_NORMAL);
+    }
+    if (c.counters & NP_C_VRAM) {
+        std::wstring v = GBv(s.vramUsedGB);
+        if (s.vramTotalGB > 0) v += L" / " + WF(s.vramTotalGB, 1) + L" GB";
+        acc.row(L"显存", v, s.vramPct > 92 ? PL_WARN : PL_NORMAL);
+    }
+    if (c.counters & NP_C_GPU_FB && s.domFb >= 0)
+        acc.row(L"显存带宽占用", PctV(s.domFb), PL_DIM);
+    if (c.counters & NP_C_GPU_VID && s.domVid >= 0)
+        acc.row(L"视频引擎", PctV(s.domVid), PL_DIM);
+    if (c.counters & NP_C_GPU_BUS && s.domBus >= 0)
+        acc.row(L"PCIe 总线", PctV(s.domBus), PL_DIM);
+    if (c.counters & NP_C_RT) {
+        std::wstring v;
+        int lv = PL_ACCENT;
+        if (s.hwRtPct >= 0) {
+            v = PctV(s.hwRtPct) + L" (硬件)";
+        } else if (hooked && t.rtMeasured) {
+            v = PctV(t.rtLoad) + L" (实测)";
+            if (t.rtGpuMs > 0) v += L" " + Msv(t.rtGpuMs);
+        } else if (hooked && t.rtDispatches) {
+            v = L"启用 " + std::to_wstring(t.rtDispatches) + L" 次";
+        } else if (hooked) {
+            v = L"未检测到 DXR";
+            lv = PL_DIM;
+        } else {
+            v = L"需注入";
+            lv = PL_DIM;
+        }
+        acc.row(L"RT Core 负载", v, lv);
+    }
+    if (c.counters & NP_C_TENSOR) {
+        std::wstring v;
+        int lv = PL_ACCENT;
+        if (s.hwTensorPct >= 0) {
+            v = PctV(s.hwTensorPct) + L" (硬件)";
+        } else if (hooked && t.tensorMeasured) {
+            v = PctV(t.tensorLoad) + L" (实测)";
+            if (t.aiGpuMs > 0) v += L" " + Msv(t.aiGpuMs);
+        } else if (hooked && t.aiModules) {
+            v = L"AI 已启用 · 估算中";
+            lv = PL_DIM;
+        } else if (hooked) {
+            v = L"未检测到 AI pass";
+            lv = PL_DIM;
+        } else {
+            v = L"需注入";
+            lv = PL_DIM;
+        }
+        acc.row(L"Tensor / AI 负载", v, lv);
+    }
+    if (c.counters & NP_C_RESOLUTION && hooked && t.renderW) {
+        std::wstring v = std::to_wstring(t.renderW) + L"×" + std::to_wstring(t.renderH);
+        if (t.windowW && (t.windowW != t.renderW || t.windowH != t.renderH)) {
+            float sc = (float)t.renderW / (float)t.windowW;
+            v += L" → " + std::to_wstring(t.windowW) + L"×" + std::to_wstring(t.windowH);
+            v += L" (" + WF(sc * 100.0f, 0) + L"%)";
+        }
+        acc.row(L"渲染 / 输出", v);
+    }
+    if (c.counters & NP_C_AI_MODULES && hooked) {
+        acc.row(L"AI 模块", AiModuleText(t.aiModules), t.aiModules ? PL_ACCENT : PL_DIM);
+    }
+    acc.flush(L"GPU");
+
+    // ---------------- 系统 ----------------
+    if (c.counters & NP_C_RAM) {
+        std::wstring v = GBv(s.ramUsedGB);
+        if (s.ramTotalGB > 0) v += L" / " + WF(s.ramTotalGB, 1) + L" GB";
+        acc.row(L"内存", v, s.ramPct > 92 ? PL_WARN : PL_NORMAL);
+    }
+    if (c.counters & NP_C_API) acc.row(L"图形 API", ApiName(t.gfxApi, t.presentMode), PL_DIM);
+    if (c.counters & NP_C_DRAWS && hooked) {
+        std::wstring v = std::to_wstring(t.drawCalls) + L" / " + std::to_wstring(t.dispatches);
+        acc.row(L"Draw / Dispatch", v, PL_DIM);
+    }
+    if (c.counters & NP_C_SENSOR_SRC && s.sourceText[0]) {
+        std::wstring st = Utf8ToWide(s.sourceText);
+        if (st.size() > 40) st = st.substr(0, 39) + L"…";
+        acc.row(L"数据源", st, PL_DIM);
+    }
+    acc.flush(L"系统");
+}
+
+}  // namespace np

@@ -1,0 +1,13 @@
+# 本项目源码一律用 LF（Windows 上的编辑器/git 默认会把 LF 转成 CRLF，
+# 那会破坏行级补丁与审查工具的一致性）。
+* text=auto eol=lf
+
+# 批处理必须 CRLF，否则 cmd 解析续行会出问题
+*.bat text eol=crlf
+
+# 二进制不要做任何换行转换
+*.png binary
+*.jpg binary
+*.exe binary
+*.dll binary
+*.etl binary
