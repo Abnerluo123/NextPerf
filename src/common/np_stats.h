@@ -116,6 +116,17 @@ public:
         return avgMs > 0.0001 ? (float)(1000.0 / avgMs) : 0.0f;
     }
 
+    // 诊断用：窗口内超过阈值（毫秒）的帧数占比
+    float overRatio(float ms, uint32_t window = kCap) const {
+        uint32_t take = std::min<uint32_t>(count_, std::min<uint32_t>(window, kCap));
+        if (!take) return 0.0f;
+        thread_local float tmp[kCap];
+        take = recent(tmp, take);
+        uint32_t n = 0;
+        for (uint32_t i = 0; i < take; ++i) if (tmp[i] > ms) ++n;
+        return (float)n / (float)take;
+    }
+
     // Low 帧（**口径 3：百分位**，与 NVIDIA 驱动面板 / FrameView 一致）
     //
     // pct 传 99 表示 1% Low，99.9 表示 0.1% Low。

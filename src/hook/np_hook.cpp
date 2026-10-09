@@ -894,6 +894,31 @@ void UpdateTelemetryCommon(const NPConfig& cfg, uint64_t nowQpc, bool realPresen
     //     按时间(累加) : 33.3ms 的 spike 消耗预算的速度是正常帧两倍，
     //                    6 帧正好用满 1% 预算 -> 恰好停在 spike 上 -> 30（刀刃效应）
     //   驱动面板显示的是前者，所以按前者来。
+    // 诊断：帧时间分布（每 5 秒一条）。用来判定 Low 帧偏低是「真有 spike」
+    // 还是「口径/自伤」—— 帧时间曲线只是每 8 帧采一点的抽样视图，不能作为依据。
+    if (gStats.count() >= 120) {
+        static uint32_t sLastDist = 0;
+        static uint32_t sLastN = 0;
+        static uint32_t sLastTick = 0;
+        uint32_t nowTick = GetTickCount();
+        if (nowTick - sLastDist > 5000) {
+            // ★ 采样率 = 本区间新增样本数 / 经过秒数。
+            //   如果它明显高于面板显示的 FPS，说明 gStats 收到的样本比真实帧多
+            //   —— 那就是「采样率过高」，帧时间里混进了不是帧的间隔。
+            double dt = (sLastTick && nowTick > sLastTick) ? (nowTick - sLastTick) / 1000.0 : 0.0;
+            double rate = (dt > 0.5) ? (gStats.count() - sLastN) / dt : 0.0;
+            sLastDist = nowTick;
+            sLastN = gStats.count();
+            sLastTick = nowTick;
+            Log("frame dist: n=%u rate=%.1f/s fps=%.1f p50=%.2f p90=%.2f p99=%.2f "
+                "p999=%.2f over20ms=%.2f%% over30ms=%.2f%%",
+                (unsigned)gStats.count(), rate, (double)t.fpsAvg,
+                (double)gStats.percentileMs(50.0f), (double)gStats.percentileMs(90.0f),
+                (double)gStats.percentileMs(99.0f), (double)gStats.percentileMs(99.9f),
+                (double)(gStats.overRatio(20.0f) * 100.0f),
+                (double)(gStats.overRatio(30.0f) * 100.0f));
+        }
+    }
     t.fpsLow1 = gStats.lowPercentileFps(99.0f, 1200);
     t.fpsLow01 = gStats.lowPercentileFps(99.9f, 1200);
     t.p99Ms = gStats.percentileMs(99.0f);
