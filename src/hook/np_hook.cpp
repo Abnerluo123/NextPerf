@@ -919,8 +919,17 @@ void UpdateTelemetryCommon(const NPConfig& cfg, uint64_t nowQpc, bool realPresen
                 (double)(gStats.overRatio(30.0f) * 100.0f));
         }
     }
-    t.fpsLow1 = gStats.lowPercentileFps(99.0f, 1200);
-    t.fpsLow01 = gStats.lowPercentileFps(99.9f, 1200);
+    //
+    // ★ 窗口大小对齐 Intel PresentMon 的默认值：1000ms
+    //   （IntelPresentMon/SampleClient/CliOptions.h:49，--window-size 默认 1000.）
+    //   我们原来用 1200 帧 = 60fps 下 20 秒，大了 20 倍 —— 窗口越长，历史里的
+    //   偶发 spike 越容易被算进「最差 1%」，数值被压低。
+    //   这里按当前平均 FPS 把 1 秒换算成帧数（并夹在合理范围内）。
+    uint32_t lowWin = (uint32_t)(t.fpsAvg > 1.0f ? t.fpsAvg : 60.0f);
+    if (lowWin < 30) lowWin = 30;
+    if (lowWin > 480) lowWin = 480;
+    t.fpsLow1 = gStats.lowPercentileFps(99.0f, lowWin);
+    t.fpsLow01 = gStats.lowPercentileFps(99.9f, lowWin);
     t.p99Ms = gStats.percentileMs(99.0f);
     t.p999Ms = gStats.percentileMs(99.9f);
 
@@ -1103,13 +1112,32 @@ HRESULT PresentCommon(IDXGISwapChain* sc, UINT sync, UINT flags,
     //   渲染提交 = 第一次提交 → 调 Present
     //
     // 时刻都来自我们自己的钩子点，不需要 Reflex 的 NvAPI 接口。
+    //
+    // ★ 按 PresentMon 源码的公式（IntelPresentMon/MetricsCalculatorCpuGpu.cpp:155
+    //   + 单元测试 MetricsCore.cpp 的用例）：
+    //       CPUBusy = 本帧 Present 开始 − **上一帧 Present 返回**
+    //       CPUWait = 本帧 Present 内部停留
+    //       CPUTime = CPUBusy + CPUWait  = 帧周期
+    //
+    //   原文用例：presentStartTime=1'100'000, 上一帧返回=1'000'000
+    //             -> msCPUBusy = 100'000 ticks = 10ms；timeInPresent = 200'000
+    //             -> msCPUWait = 20ms；msCPUTime = 30ms = 帧周期。
+    //
+    //   我们原来的三条分支都不对：
+    //     * 用「本帧开始 − 上帧**开始**」= 帧周期，没减掉 Present 内的等待；
+    //     * 兜底直接 cpuFrameMs = frameMs —— 那正是 PresentMon issue #222
+    //       「CPUBusy always shows up as equal to FrameTime」的现象。
+    //
+    //   现在统一按上式算；sim/submit 仍单独记录供对照，但不再拿 simMs 当 CPU 帧时间
+    //   （那只是「模拟阶段」，不是 CPU 一帧的总工作量）。
     if (gRenderTid == GetCurrentThreadId() && gPresentRetQpc && gSimEndQpc > gPresentRetQpc) {
         gTel->simMs = (float)QpcMs(gSimEndQpc - gPresentRetQpc);
         gTel->submitMs = (float)QpcMs(now - gSimEndQpc);
-        gTel->cpuFrameMs = gTel->simMs;
-    } else if (gApi == NP_API_D3D12 && gTel->frameMs > 0.0001f) {
-        float cpu = gTel->frameMs - gLastInPresentMs;
-        gTel->cpuFrameMs = cpu > 0.0f ? cpu : 0.0f;
+    }
+    if (gPresentRetQpc && now > gPresentRetQpc) {
+        float busy = (float)QpcMs(now - gPresentRetQpc);
+        // 超过 1 秒的不是「一帧」，是切出去/加载留下的空档
+        if (busy > 0.0f && busy < 1000.0f) gTel->cpuFrameMs = busy;
     } else {
         gTel->cpuFrameMs = gTel->frameMs;
     }
