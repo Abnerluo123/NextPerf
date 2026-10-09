@@ -293,6 +293,10 @@ uint64_t gPresentRetQpc = 0;   // 上一帧 Present 返回的时刻（= 下一�
 uint64_t gSimEndQpc = 0;       // 本帧渲染线程第一次提交的时刻
 
 uint64_t gLastPresentQpc = 0;
+// 本次 Present 是否被判定为「同一帧内的重复呈现」而被并入上一帧。
+// 见 PresentCommon 里的合并逻辑：实测游戏会在一帧内调用多次真实 Present
+// （min 间隔只有 2.17ms，而帧周期是 16.7ms），不合并就会造出假的短帧+长帧。
+bool     gAbsorbThisPresent = false;
 uint64_t gCpuStartQpc = 0;
 // 上一帧卡在原始 Present 调用里的时长（主要是等垂直同步）
 float    gLastInPresentMs = 0.0f;
@@ -940,6 +944,25 @@ void UpdateTelemetryCommon(const NPConfig& cfg, uint64_t nowQpc, bool realPresen
                 (double)gStats.percentileMs(99.0f),
                 (double)(gStats.overRatio(20.0f) * 100.0f),
                 (double)(gStats.overRatio(30.0f) * 100.0f));
+
+            // ★ 原始序列：最近 40 帧的连续帧时间。
+            //   汇总数字分不清「伪影」和「真抖动」，但连续序列一眼就能看出来：
+            //     17 17 17 25 17 17 25   -> 慢帧均匀散布 = 真抖动
+            //     17 17 17 3 3 28 28 17  -> 密集的短+长配对 = 帧内多次 Present 的伪影
+            //   这也是让用户亲眼确认「Low 帧修好了」的最直接手段。
+            {
+                float seq[40];
+                uint32_t got = gStats.recent(seq, 40);
+                char line[640];
+                int off = 0;
+                for (uint32_t k = 0; k < got; ++k) {
+                    int w = snprintf(line + off, sizeof(line) - (size_t)off, "%.1f ", (double)seq[k]);
+                    if (w <= 0 || off + w >= (int)sizeof(line) - 2) break;
+                    off += w;
+                }
+                line[off] = 0;
+                Log("recent ft(%u): %s", (unsigned)got, line);
+            }
         }
     }
     //
@@ -1101,12 +1124,30 @@ HRESULT PresentCommon(IDXGISwapChain* sc, UINT sync, UINT flags,
     // 不产生新帧；把它算进去会让帧数虚高、帧时间忽上忽下 —— 正是「游戏稳稳 60、
     // 我们却在 60~70 之间波动」的一个来源。
     bool realPresent = (flags & DXGI_PRESENT_TEST) == 0;
+    gAbsorbThisPresent = false;
     if (realPresent && gLastPresentQpc && now > gLastPresentQpc) {
         float fm = (float)QpcMs(now - gLastPresentQpc);
+        // ★ 帧内重复呈现的合并（本轮修复 Low 帧偏低的关键）。
+        //
+        //   实测证据：真实 Present 之间的**最小**间隔只有 2.17ms，而帧周期是 16.7ms
+        //   —— 说明游戏在**一帧内调用了多次真实 Present**。若每次都记账，就会把
+        //   一个 16.7ms 的帧劈成「~5ms 的假快帧 + ~25ms 的假慢帧」，于是
+        //   24% 的帧落进 20~30ms 区间、却在 30ms 处被硬生生切断（over30≈0%）。
+        //   真抖动会有长尾（掉垂直同步 33.3ms、加载几百 ms），不会这样齐刷刷截断。
+        //
+        //   阈值取**半个帧周期**（自适应）：合并后 gLastPresentQpc 不推进，
+        //   下一次的间隔自然覆盖整个帧，得到正确的 16.7ms。
+        //   夹在 2~40ms，保证 120fps（8.3ms 帧）与 30fps（33ms 帧）都不会被误合并。
+        float halfFrame = (gTel && gTel->fpsAvg > 1.0f) ? (1000.0f / gTel->fpsAvg) * 0.5f : 8.0f;
+        if (halfFrame < 2.0f) halfFrame = 2.0f;
+        if (halfFrame > 40.0f) halfFrame = 40.0f;
+        if (gStats.count() > 0 && fm < halfFrame) {
+            gAbsorbThisPresent = true;   // 并入同一帧：不记账、不推进时间戳
+        }
         // 超过 1 秒的间隔不是「一帧」，是切出去/加载/挂起留下的空档。
         // 把它塞进统计会把 1% Low / 0.1% Low 直接拖到个位数 ——
         // 用户看到「稳定 60fps 却显示 1% Low = 10」就是这么来的。
-        if (fm > 0.02f && fm < 1000.0f) {
+        if (!gAbsorbThisPresent && fm > 0.02f && fm < 1000.0f) {
             gTel->frameMs = fm;
             gStats.push(fm);
             gTel->frameTotal++;
@@ -1168,7 +1209,9 @@ HRESULT PresentCommon(IDXGISwapChain* sc, UINT sync, UINT flags,
         static np::Ema cpuEma(0.10f);
         gTel->cpuFrameMsAvg = cpuEma.update(gTel->cpuFrameMs);
     }
-    if (realPresent) gLastPresentQpc = now;
+    // 被合并的帧内呈现**不推进**这个时间戳 —— 否则下一帧的间隔会从
+    // 这个中间时刻算起，又会得到一段偏短的假帧时间。
+    if (realPresent && !gAbsorbThisPresent) gLastPresentQpc = now;
 
     // 诊断：每 5 秒把 Present 的节奏记一条。
     // 「我们的帧率为什么和游戏 OSD 对不上」这种问题，只能靠这个定位：
