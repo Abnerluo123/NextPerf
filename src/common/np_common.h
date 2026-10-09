@@ -88,6 +88,8 @@ enum NP_COUNTER : uint64_t {
     NP_C_CHART_USAGE  = 1ull << 28,  // 图表：CPU/GPU 占用率曲线
     NP_C_CHART_FPS    = 1ull << 29,  // 图表：FPS / 平均 / 1% Low 曲线
     NP_C_CHART_LATENCY= 1ull << 30,  // 图表：帧生成 / CPU / GPU 延迟曲线
+    NP_C_CPU_CLOCK    = 1ull << 31,  // CPU 当前频率（CallNtPowerInformation）
+    NP_C_CPU_POWER    = 1ull << 32,  // CPU 包功耗（EMI / HWiNFO）
 };
 
 #define NP_ALL_COUNTERS                                                        \
@@ -95,7 +97,8 @@ enum NP_COUNTER : uint64_t {
      NP_C_GPU_FRAME | NP_C_CPU_USAGE | NP_C_CPU_TEMP | NP_C_GPU_USAGE |        \
      NP_C_GPU_TEMP | NP_C_GPU_POWER | NP_C_GPU_CLOCK | NP_C_VRAM | NP_C_RAM |  \
      NP_C_RT | NP_C_TENSOR | NP_C_RESOLUTION | NP_C_API | NP_C_GRAPH |         \
-     NP_C_CHART_USAGE | NP_C_CHART_FPS | NP_C_CHART_LATENCY)
+     NP_C_CHART_USAGE | NP_C_CHART_FPS | NP_C_CHART_LATENCY |               \
+     NP_C_CPU_CLOCK | NP_C_CPU_POWER)
 
 // ---------------------------------------------------------------- 图形 API
 enum NP_GFXAPI : uint32_t {

@@ -56,6 +56,8 @@ static const CounterDef kGFramerate[] = {
 static const CounterDef kGCpu[] = {
     {NP_C_CPU_USAGE, L"CPU 占用率"},
     {NP_C_CPU_TEMP, L"CPU 温度"},
+    {NP_C_CPU_CLOCK, L"CPU 频率"},
+    {NP_C_CPU_POWER, L"CPU 功耗"},
     {NP_C_CPU_FRAME, L"CPU 帧时间"},
 };
 static const CounterDef kGGpu[] = {

@@ -58,6 +58,9 @@ bool SettingsLoad() {
         if (auto* p = get("cfgVersion")) ver = (int)p->numOr(1);
         if (ver < 2) gApp.cfg.counters |= NP_C_CHART_USAGE | NP_C_CHART_FPS | NP_C_CHART_LATENCY;
         if (ver < 3) gApp.cfg.counters |= NP_C_GRAPH | NP_C_CHART_FPS | NP_C_CHART_LATENCY;
+        // v4 新增「CPU 频率」「CPU 功耗」——旧配置默认勾选一次，
+        // 否则新开关对老用户是关的，会让人以为功能没做出来。
+        if (ver < 4) gApp.cfg.counters |= NP_C_CPU_CLOCK | NP_C_CPU_POWER;
     }
     // 背景固定纯黑（用户明确要求），旧配置里的蓝黑色一律丢弃
     gApp.cfg.bgColor = 0xFF000000u;
@@ -97,7 +100,7 @@ bool SettingsLoad() {
 void SettingsSave() {
     using np::Json;
     Json::Value root = Json::mkObj();
-    root.obj["cfgVersion"] = Json::mkNum(3);
+    root.obj["cfgVersion"] = Json::mkNum(4);
     root.obj["counters"] = Json::mkNum((double)gApp.cfg.counters);
     root.obj["bgColor"] = Json::mkNum(gApp.cfg.bgColor);
     root.obj["textColor"] = Json::mkNum(gApp.cfg.textColor);

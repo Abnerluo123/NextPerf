@@ -503,6 +503,9 @@ bool SensorHub::Init() {
         //   （用户实测：先开游戏再开 NextPerf 有数据，反过来整场没数据）。
         if (pdh_.AddStarCounter(L"\\GPU Engine(*)\\Running Time")) gameGpuOk_ = true;
         pdh_.AddStarCounter(L"\\GPU Engine(*)\\Utilization Percentage");
+        // CPU 包功耗：Windows 的 EMI（Energy Meter Interface）以 PDH 对象
+        // `Energy Meter` 暴露 Intel RAPL 域。注意对象名不是 `Energy Meter Interface`。
+        pdh_.AddStarCounter(L"\\Energy Meter(*)\\Power");
         pdh_.AddWildcard(L"\\GPU Adapter Memory(*)\\Dedicated Usage");
         pdh_.AddWildcard(L"\\GPU Adapter Memory(*)\\Shared Usage");
         pdh_.AddWildcard(L"\\Processor Information(*)\\% Processor Performance");
@@ -615,6 +618,65 @@ std::string SensorHub::Describe() const {
 }
 
 // ================================================================== CPU / 内存
+// ---------------------------------------------------------------------------
+// CPU 当前频率：CallNtPowerInformation(ProcessorInformation)
+//
+// 为什么用它而不是 PDH 的「标称 × 性能百分比」：后者依赖一个猜测的标称频率。
+// 实测本机 PDH `Processor Frequency` 报 2300MHz、`% Processor Performance` 报 141%
+// （=> 3259MHz），而 CallNtPowerInformation 直接给出每核当前 MHz，没有这层误差。
+//
+// 用 GetProcAddress 动态取，避免给 build.bat 增加 -lpowrprof 依赖。
+// MinGW 头文件缺 PROCESSOR_POWER_INFORMATION，这里按 MSDN 定义补齐。
+// ---------------------------------------------------------------------------
+namespace {
+struct NpProcessorPowerInfo {
+    unsigned long Number;
+    unsigned long MaxMhz;
+    unsigned long CurrentMhz;
+    unsigned long MhzLimit;
+    unsigned long MaxIdleState;
+    unsigned long CurrentIdleState;
+};
+// POWER_INFORMATION_LEVEL 里的 ProcessorInformation = 11
+constexpr int kNpProcessorInformation = 11;
+
+bool CpuFreqFromPowerInfo(double* mhzOut) {
+    using Fn = long (*)(int, void*, unsigned long, void*, unsigned long);
+    static Fn fn = nullptr;
+    static bool tried = false;
+    if (!tried) {
+        tried = true;
+        HMODULE m = LoadLibraryW(L"powrprof.dll");
+        if (m) fn = reinterpret_cast<Fn>(GetProcAddress(m, "CallNtPowerInformation"));
+    }
+    if (!fn) return false;
+
+    SYSTEM_INFO si{};
+    GetSystemInfo(&si);
+    unsigned long n = si.dwNumberOfProcessors;
+    if (!n || n > 1024) return false;
+    unsigned long bytes = n * (unsigned long)sizeof(NpProcessorPowerInfo);
+    std::vector<NpProcessorPowerInfo> buf(n);
+    // 注意：失败时返回的是 NTSTATUS（如 0xC0000023），**不是所需长度**
+    long st = fn(kNpProcessorInformation, nullptr, 0, buf.data(), bytes);
+    if (st != 0) return false;
+
+    // 取所有核里最快的那个 —— 玩家关心的是"CPU 现在跑多快"，
+    // 而任务管理器/各家工具展示的也是最高核心频率。
+    unsigned long best = 0;
+    double sum = 0;
+    int cnt = 0;
+    for (unsigned long i = 0; i < n; ++i) {
+        if (buf[i].CurrentMhz > best) best = buf[i].CurrentMhz;
+        if (buf[i].CurrentMhz > 0) { sum += buf[i].CurrentMhz; ++cnt; }
+    }
+    if (!best || !cnt) return false;
+    // 同时给出平均值作参考（放日志里，面板只显示最高）
+    *mhzOut = (double)best;
+    return true;
+}
+}  // namespace
+
 void SensorHub::PollCpu(NPSensors& out) {
     FILETIME idle{}, kern{}, user{};
     if (GetSystemTimes(&idle, &kern, &user)) {
@@ -638,10 +700,18 @@ void SensorHub::PollCpu(NPSensors& out) {
     out.cpuCores = cpuCores_;
     out.cpuThreads = cpuThreads_;
 
-    // 频率：标称 × 性能百分比
-    double perf = -1;
-    if (pdh_.SumWhere(L"Processor Information", L"_Total", &perf) && cpuBaseMHz_ > 0 && perf > 0)
-        out.cpuClock = (float)(cpuBaseMHz_ * perf / 100.0);
+    double perfFreq = -1;
+    // 频率：优先 CallNtPowerInformation（直接给每核当前 MHz，无需猜标称频率）
+    double mhz = 0;
+    if (CpuFreqFromPowerInfo(&mhz)) {
+        out.cpuClock = (float)mhz;
+        cpuFreqFromNt_ = true;
+    } else if (pdh_.SumWhere(L"Processor Information", L"_Total", &perfFreq) &&
+               cpuBaseMHz_ > 0 && perfFreq > 0) {
+        // 回退：标称 × 性能百分比（依赖 cpuBaseMHz_，可能偏低）
+        out.cpuClock = (float)(cpuBaseMHz_ * perfFreq / 100.0);
+        cpuFreqFromNt_ = false;
+    }
 
     // 温度优先级：HWiNFO > LibreHardwareMonitor > ACPI 热区
     double t = 0;
@@ -676,11 +746,22 @@ void SensorHub::PollCpu(NPSensors& out) {
             out.cpuTemp = (float)(tk / 10.0 - 273.15);
         }
     }
-    // 功耗（只有 HWiNFO / LHM 能提供）
-    double p = 0;
-    if (hwinfo_.loaded && (hwinfo_.Find(L"CPU", L"Package Power", &p) ||
-                           hwinfo_.FindAny(L"CPU Package Power", &p)))
-        out.cpuPower = (float)p;
+    // 功耗：**EMI 优先**，HWiNFO 回退。
+    //
+    // 为什么优先 EMI：它是 Windows 自带的能量计量接口，走 Intel RAPL，免驱动、
+    // 免管理员、不依赖用户装 HWiNFO。实测本机可用。
+    //   * PDH 对象名是 `Energy Meter`（不是 `Energy Meter Interface`）
+    //   * 必须按实例过滤出 `PKG`（整包）；`_Total` 恒为 0，PP0 只是核心
+    //   * 单位实测推断为**毫瓦**（读数 12922 对应 12.9W），故 /1000
+    double mw = 0;
+    if (pdh_.MaxStarCounter(L"\\Energy Meter(*)\\Power", L"PKG", L"", &mw) && mw > 0) {
+        out.cpuPower = (float)(mw / 1000.0);
+    } else {
+        double p = 0;
+        if (hwinfo_.loaded && (hwinfo_.Find(L"CPU", L"Package Power", &p) ||
+                               hwinfo_.FindAny(L"CPU Package Power", &p)))
+            out.cpuPower = (float)p;
+    }
 }
 
 void SensorHub::PollRam(NPSensors& out) {

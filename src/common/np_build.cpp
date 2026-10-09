@@ -260,6 +260,14 @@ void BuildPanelData(PanelData& out, const NPConfig& c, const NPSensors& s, const
         int lv = PL_CPU;
         acc.row(L"温度", Cv(s.cpuTemp), lv);
     }
+    if (c.counters & NP_C_CPU_CLOCK) {
+        // CPU 当前频率：优先 CallNtPowerInformation（每核实测 MHz，取最高核心）。
+        // 回退路径是 PDH 的「标称 × 性能百分比」，会系统性偏低。
+        acc.row(L"CPU 频率", s.cpuClock > 0.0f ? MHzv(s.cpuClock) : L"—", PL_CPU);
+    }
+    if (c.counters & NP_C_CPU_POWER) {
+        acc.row(L"CPU 功耗", s.cpuPower > 0.0f ? Wv(s.cpuPower) : L"—", PL_CPU);
+    }
     if (c.counters & NP_C_CPU_FRAME) {
         // 金属 HUD 的 "Pre" 是蓝色 —— CPU 侧的时间类指标统一用蓝
         acc.rowRange(L"CPU 帧时间", active ? Msv(t.cpuFrameMs) : L"—", PL_CPU, active,

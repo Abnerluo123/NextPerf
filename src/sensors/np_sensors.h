@@ -150,6 +150,9 @@ private:
     // CPU 占用率差分
     uint64_t lastIdle_ = 0, lastKern_ = 0, lastUser_ = 0;
     bool     cpuBaseValid_ = false;
+    // CPU 频率是否来自 CallNtPowerInformation（比 PDH 的「标称×百分比」准）。
+    // 置 false 说明回退到了 PDH 路径，读数可能系统性偏低。
+    bool     cpuFreqFromNt_ = false;
     double   cpuBaseMHz_ = 0;
 
     int      nvmlIndex_ = -1;
