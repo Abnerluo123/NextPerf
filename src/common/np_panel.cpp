@@ -138,10 +138,14 @@ struct Metrics {
 };
 Metrics Layout(const NPConfig& c, float lineH) {
     Metrics m{};
+    // 基础内边距，稍后再加上「四周留黑」（见下方 m.lh 计算之后）
     m.pad = 4.0f * c.scale;
     // 金属 HUD 的行距非常紧：约 1.18 倍字号。普通界面用 1.34 会显得松散。
     // 行高 = max(紧凑值, 字体自身行距)。取字体行距才能保证字形不被 CLIP 裁掉。
     m.lh = std::max((float)c.fontHeight * 1.14f * c.scale, lineH);
+    // 四周留一圈黑：厚度 = 组间分隔的 1/3。
+    // 组间分隔 = 半行高（m.lh * 0.5），故留黑 = m.lh * 0.5 / 3 = m.lh / 6。
+    m.pad += m.lh / 6.0f;
     m.headH = m.lh;   // 与正文行同高（字号已改为与正文同号）
     // 金属 HUD 的曲线区比文字区矮得多；原来 0.42 显得又高又空（用户要求缩短）
     m.chartH = std::max(11.0f, (float)c.graphHeight * 0.26f) * c.scale;
@@ -326,7 +330,7 @@ void PanelRenderer::Render(ID2D1RenderTarget* rt, float x, float y, const PanelD
     if (FAILED(rt->CreateSolidColorBrush(bg, &brBg)) || !brBg) return;
     // 金属 HUD 的底板是**带轻微圆角**的矩形（不是纯直角）
     {
-        float rad = 7.0f * c.scale;
+        float rad = 11.0f * c.scale;
         rt->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(x, y, x + w, y + h), rad, rad),
                                  brBg);
     }

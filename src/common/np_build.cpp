@@ -300,7 +300,7 @@ void BuildPanelData(PanelData& out, const NPConfig& c, const NPSensors& s, const
         // 写成 `2002/14001 MHz` 而非 `2002 MHz / 14001 MHz` —— 省 4 个字符格。
         // 面板数值列按最长值定宽，把它写短才能让整块面板真正收窄。
         if (s.memClock > 0) v = WF(s.gpuClock, 0) + L"/" + WF(s.memClock, 0) + L" MHz";
-        acc.row(L"核心/显存频率", v);
+        acc.row(L"核心/显存", v);
     }
     if (c.counters & NP_C_FAN) {
         if (s.gpuFanPct > -1.0f) acc.row(L"风扇转速", PctV(s.gpuFanPct));
