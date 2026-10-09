@@ -898,23 +898,41 @@ void UpdateTelemetryCommon(const NPConfig& cfg, uint64_t nowQpc, bool realPresen
     // 还是「口径/自伤」—— 帧时间曲线只是每 8 帧采一点的抽样视图，不能作为依据。
     if (gStats.count() >= 120) {
         static uint32_t sLastDist = 0;
-        static uint32_t sLastN = 0;
+        static uint32_t sLastFrames = 0;
         static uint32_t sLastTick = 0;
         uint32_t nowTick = GetTickCount();
         if (nowTick - sLastDist > 5000) {
             // ★ 采样率 = 本区间新增样本数 / 经过秒数。
             //   如果它明显高于面板显示的 FPS，说明 gStats 收到的样本比真实帧多
             //   —— 那就是「采样率过高」，帧时间里混进了不是帧的间隔。
+            // ★ 采样率必须用**累计帧数** frameTotal 算 —— count() 满容量后不再增长
             double dt = (sLastTick && nowTick > sLastTick) ? (nowTick - sLastTick) / 1000.0 : 0.0;
-            double rate = (dt > 0.5) ? (gStats.count() - sLastN) / dt : 0.0;
+            uint32_t nowFrames = gTel->frameTotal;
+            double rate = (dt > 0.5) ? (nowFrames - sLastFrames) / dt : 0.0;
+
+            // ★ 同屏两套统计：**最近 1 秒** vs **整个缓冲区**。
+            //   1 秒窗口与 Low 帧实际用的窗口一致，两者才可比。
+            uint32_t win = (uint32_t)(t.fpsAvg > 1.0f ? t.fpsAvg : 60.0f);
+            if (win < 30) win = 30;
+            if (win > 480) win = 480;
+
             sLastDist = nowTick;
-            sLastN = gStats.count();
+            sLastFrames = nowFrames;
             sLastTick = nowTick;
-            Log("frame dist: n=%u rate=%.1f/s fps=%.1f p50=%.2f p90=%.2f p99=%.2f "
-                "p999=%.2f over20ms=%.2f%% over30ms=%.2f%%",
-                (unsigned)gStats.count(), rate, (double)t.fpsAvg,
-                (double)gStats.percentileMs(50.0f), (double)gStats.percentileMs(90.0f),
-                (double)gStats.percentileMs(99.0f), (double)gStats.percentileMs(99.9f),
+            Log("frame dist: rate=%.1f/s fps=%.1f frames=%u | "
+                "win1s[n=%u p50=%.2f p90=%.2f p99=%.2f over20=%.2f%% over30=%.2f%%] | "
+                "full[n=%u p50=%.2f p90=%.2f p99=%.2f over20=%.2f%% over30=%.2f%%]",
+                rate, (double)t.fpsAvg, (unsigned)nowFrames,
+                (unsigned)win,
+                (double)gStats.percentileMs(50.0f, win),
+                (double)gStats.percentileMs(90.0f, win),
+                (double)gStats.percentileMs(99.0f, win),
+                (double)(gStats.overRatio(20.0f, win) * 100.0f),
+                (double)(gStats.overRatio(30.0f, win) * 100.0f),
+                (unsigned)gStats.count(),
+                (double)gStats.percentileMs(50.0f),
+                (double)gStats.percentileMs(90.0f),
+                (double)gStats.percentileMs(99.0f),
                 (double)(gStats.overRatio(20.0f) * 100.0f),
                 (double)(gStats.overRatio(30.0f) * 100.0f));
         }
