@@ -60,7 +60,42 @@ public:
         return avgMs > 0.0001 ? (float)(1000.0 / avgMs) : 0.0f;
     }
 
-    // 1% Low / 0.1% Low（口径 1）
+    // 1% Low / 0.1% Low（**口径 2：x% low integral**，业界现行做法）
+    //
+    // 为什么换口径：口径 1（最差 x% 取平均）在锁帧场景下**天然偏低**。
+    // 实测 1200 帧、稳定 60fps 时，最差 1% 是 12 帧；只要其中约一半是掉垂直同步的
+    // 33.3ms、另一半是 16.7ms，平均就是 25ms -> 40 FPS，而玩家实际感受是满帧流畅。
+    // 这正是用户反馈「流畅 60 却显示 38~42」的来源 —— 口径本身的问题，不是算错。
+    //
+    // integral 口径（MSI Afterburner / CapFrameX >= 1.5.3 采用）：
+    //   1) 帧时间**降序**排列（最慢的在前）
+    //   2) 依次累加，直到累计时间 >= 窗口总时长的 pct%
+    //   3) 取**刚越过这个边界的那一帧**，换算成 FPS
+    // 它回答的是「你有 (100-pct)% 的**时间**在这个 FPS 之上」，比口径 1 更贴合体感，
+    // 而且在样本较少时也不会被单帧异常值带跑。
+    float lowIntegral(float pct, uint32_t window = kCap) const {
+        uint32_t take = std::min<uint32_t>(count_, std::min<uint32_t>(window, kCap));
+        if (take < 20) return 0.0f;
+        thread_local float tmp[kCap];
+        take = recent(tmp, take);
+        double total = 0;
+        for (uint32_t i = 0; i < take; ++i) total += tmp[i];
+        if (total <= 0.0) return 0.0f;
+        // 最慢的排前面
+        std::sort(tmp, tmp + take, std::greater<float>());
+        double target = total * pct / 100.0;
+        double acc = 0;
+        uint32_t i = 0;
+        for (; i < take; ++i) {
+            acc += tmp[i];
+            if (acc >= target) break;
+        }
+        if (i >= take) i = take - 1;
+        float ms = tmp[i];
+        return ms > 0.0001f ? (float)(1000.0 / ms) : 0.0f;
+    }
+
+    // 1% Low / 0.1% Low（口径 1：最差 x% 取平均 —— 保留供对照）
     //
     // window 是参与统计的**最近帧数**。默认取整个环形缓冲（4096 帧 ≈ 60fps 下 68 秒），
     // 但那样一来「进游戏那几秒的着色器编译卡顿」会在统计里赖着不走一分钟，
@@ -81,9 +116,22 @@ public:
         return avgMs > 0.0001 ? (float)(1000.0 / avgMs) : 0.0f;
     }
 
+    // Low 帧（**口径 3：百分位**，与 NVIDIA 驱动面板 / FrameView 一致）
+    //
+    // pct 传 99 表示 1% Low，99.9 表示 0.1% Low。
+    // 注意百分位是**按帧数**算的，不是按时间 —— 这就是它和 integral 口径的分歧点：
+    //   稳定 60fps、掉垂直同步的帧占 0.5% 时：
+    //     按帧数(本函数): P99 落在正常帧上          -> 60 FPS  ← 与驱动面板一致
+    //     按时间(integral): 6×33.3ms 正好用满 1% 预算 -> 30 FPS  ← 刀刃效应，极不稳定
+    // 驱动面板显示的是前者。实测驱动 59 / 本程序 30，就是这个差异造成的。
+    float lowPercentileFps(float pct, uint32_t window = kCap) const {
+        float ms = percentileMs(pct, window);
+        return ms > 0.0001f ? (float)(1000.0 / ms) : 0.0f;
+    }
+
     // 帧时间百分位（ms），p 为 0..100，返回「有 p% 的帧快于该值」的边界
-    float percentileMs(float p) const {
-        uint32_t take = std::min<uint32_t>(count_, kCap);
+    float percentileMs(float p, uint32_t window = kCap) const {
+        uint32_t take = std::min<uint32_t>(count_, std::min<uint32_t>(window, kCap));
         if (take < 20) return 0.0f;
         thread_local float tmp[kCap];
         take = recent(tmp, take);

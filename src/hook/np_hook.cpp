@@ -888,10 +888,14 @@ void UpdateTelemetryCommon(const NPConfig& cfg, uint64_t nowQpc, bool realPresen
         t.tensorLoad = t.aiGpuMs / t.frameMs * 100.0f;
     }
     t.fpsAvg = gStats.avgFps(600);
-    // Low 帧只取最近 1200 帧（60fps 下约 20 秒）—— 否则进游戏那几秒的
-    // 着色器编译卡顿会在统计里赖一分钟，稳定 60fps 也显示 1% Low = 10 FPS
-    t.fpsLow1 = gStats.lowPct(1.0f, 1200);
-    t.fpsLow01 = gStats.lowPct(0.1f, 1200);
+    // ★ Low 帧口径：**百分位**（与 NVIDIA 驱动面板 / FrameView 一致）
+    //   实测驱动面板 1% = 59、本程序 = 30，差异就来自口径：
+    //     按帧数(P99)  : 掉垂直同步的帧若不足 1%，P99 落在正常帧上 -> 60
+    //     按时间(累加) : 33.3ms 的 spike 消耗预算的速度是正常帧两倍，
+    //                    6 帧正好用满 1% 预算 -> 恰好停在 spike 上 -> 30（刀刃效应）
+    //   驱动面板显示的是前者，所以按前者来。
+    t.fpsLow1 = gStats.lowPercentileFps(99.0f, 1200);
+    t.fpsLow01 = gStats.lowPercentileFps(99.9f, 1200);
     t.p99Ms = gStats.percentileMs(99.0f);
     t.p999Ms = gStats.percentileMs(99.9f);
 
