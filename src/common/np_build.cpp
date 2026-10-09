@@ -38,6 +38,28 @@ static std::wstring GBv(float v) {
     return WF(v, 1) + L" GB";
 }
 
+// 从历史环形缓冲里统计极值。
+// 窗口刻意和折线图**显示的范围一致** —— 金属 HUD 的方括号里就是曲线上
+// 看得见的那段区间的小/最大值，这样括号和曲线永远自洽。
+static bool HistRange(const float* s, const NPHistory* h, float* mn, float* mx) {
+    if (!s || !h || h->count < 2) return false;
+    uint32_t n = h->count;
+    if (n > NP_HIST_CAP) n = NP_HIST_CAP;
+    float lo = 1e30f, hi = -1e30f;
+    int valid = 0;
+    for (uint32_t i = 0; i < n; ++i) {
+        float v = s[i];
+        if (!(v > 0.0f)) continue;      // 0 / 负数 = 还没填过的槽，跳过
+        lo = std::min(lo, v);
+        hi = std::max(hi, v);
+        ++valid;
+    }
+    if (valid < 2) return false;
+    *mn = lo;
+    *mx = hi;
+    return true;
+}
+
 struct RowAcc {
     PanelData& d;
     std::vector<PanelRow> pending;
@@ -47,6 +69,22 @@ struct RowAcc {
         r.value = std::move(value);
         r.level = level;
         pending.push_back(std::move(r));
+    }
+    // 金属 HUD 风格：数值 + 右侧 `[ min  max ]` 方括号区间 + 指标配色。
+    //   warnMinBelow / warnMaxAbove 决定括号里哪一侧标红；
+    //   不想标红就传 -1e30f / 1e30f。
+    void rowRange(const wchar_t* label, std::wstring value, int level, bool active,
+                  const float* series, const NPHistory* h, int dec, float warnMinBelow,
+                  float warnMaxAbove) {
+        row(label, std::move(value), level);
+        PanelRow& r = pending.back();
+        if (!active) return;
+        float mn = 0, mx = 0;
+        if (!HistRange(series, h, &mn, &mx)) return;
+        r.vmin = WF(mn, dec);
+        r.vmax = WF(mx, dec);
+        r.warnMin = (mn < warnMinBelow);
+        r.warnMax = (mx > warnMaxAbove);
     }
     // 一组收齐：有内容才输出分组标题，避免空标题
     void flush(const wchar_t* group) {
@@ -125,14 +163,17 @@ void BuildPanelData(PanelData& out, const NPConfig& c, const NPSensors& s, const
         r.unit = unit;
     };
     if (c.counters & NP_C_FPS) {
-        acc.row(L"FPS", active ? WF(t.fps, 0) : L"—",
-                active && t.fps < 30 ? PL_WARN : PL_ACCENT);
+        // 金属 HUD：FPS 用白色；低于 30 时数值转红，并且括号里的最小值也标红
+        acc.rowRange(L"FPS", active ? WF(t.fps, 0) : L"—",
+                     active && t.fps < 30 ? PL_WARN : PL_FPS, active, h ? h->fps : nullptr, h, 0,
+                     30.0f, 1e30f);
         if (showCharts && (c.counters & NP_C_GRAPH)) attach(acc.pending.back(), h->fps, 2);
     }
     if (c.counters & NP_C_FRAMETIME) {
-        acc.row(L"帧生成时间",
-                active ? Msv(t.frameMsAvg > 0.0001f ? t.frameMsAvg : t.frameMs) : L"—",
-                active && t.frameMs > 33.3f ? PL_WARN : PL_NORMAL);
+        acc.rowRange(L"帧生成时间",
+                     active ? Msv(t.frameMsAvg > 0.0001f ? t.frameMsAvg : t.frameMs) : L"—",
+                     active && t.frameMs > 33.3f ? PL_WARN : PL_MEM, active,
+                     h ? h->latFrame : nullptr, h, 1, -1e30f, 33.34f);
         if (showCharts && (c.counters & NP_C_GRAPH)) attach(acc.pending.back(), h->latFrame, 0);
     }
     if (c.counters & NP_C_LOW1) {
@@ -146,15 +187,18 @@ void BuildPanelData(PanelData& out, const NPConfig& c, const NPSensors& s, const
 
     // ---------------- CPU ----------------
     if (c.counters & NP_C_CPU_USAGE) {
-        int lv = s.cpuUsage > 90 ? PL_WARN : PL_NORMAL;
+        // 金属 HUD 的配色语言：CPU 侧的指标一律蓝
+        int lv = s.cpuUsage > 90 ? PL_WARN : PL_CPU;
         acc.row(L"CPU 占用", PctV(s.cpuUsage), lv);
     }
     if (c.counters & NP_C_CPU_TEMP) {
-        int lv = s.cpuTemp > 90 ? PL_WARN : PL_NORMAL;
+        int lv = s.cpuTemp > 90 ? PL_WARN : PL_CPU;
         acc.row(L"CPU 温度", Cv(s.cpuTemp), lv);
     }
     if (c.counters & NP_C_CPU_FRAME) {
-        acc.row(L"CPU 帧时间", active ? Msv(t.cpuFrameMs) : L"—");
+        // 金属 HUD 的 "Pre" 是蓝色 —— CPU 侧的时间类指标统一用蓝
+        acc.rowRange(L"CPU 帧时间", active ? Msv(t.cpuFrameMs) : L"—", PL_CPU, active,
+                     h ? h->latCpu : nullptr, h, 1, -1e30f, 33.34f);
         if (showCharts && (c.counters & NP_C_CHART_LATENCY)) attach(acc.pending.back(), h->latCpu, 0);
     }
     acc.flush(L"CPU");
@@ -166,11 +210,12 @@ void BuildPanelData(PanelData& out, const NPConfig& c, const NPSensors& s, const
         acc.row(L"显卡", n, PL_DIM);
     }
     if (c.counters & NP_C_GPU_USAGE) {
-        int lv = s.gpuUsage > 97 ? PL_WARN : PL_NORMAL;
+        // GPU 侧的指标一律绿
+        int lv = s.gpuUsage > 97 ? PL_WARN : PL_GPU;
         acc.row(L"GPU 占用", PctV(s.gpuUsage), lv);
     }
     if (c.counters & NP_C_GPU_TEMP) {
-        int lv = s.gpuTemp > 83 ? PL_WARN : PL_NORMAL;
+        int lv = s.gpuTemp > 83 ? PL_WARN : PL_GPU;
         acc.row(L"GPU 温度", Cv(s.gpuTemp), lv);
     }
     if (c.counters & NP_C_GPU_HOTSPOT) {
@@ -202,7 +247,9 @@ void BuildPanelData(PanelData& out, const NPConfig& c, const NPSensors& s, const
         // 于是「注入没成功」时面板上会出现一个假的 0.00 ms。
         else if (active && t.gpuFrameMs > 0.01f) v = Msv(t.gpuFrameMs);
         else v = L"—";
-        acc.row(L"GPU 帧时间", v, PL_NORMAL);
+        // 金属 HUD 的 "GPU" 是绿色 —— GPU 侧的时间类指标统一用绿
+        acc.rowRange(L"GPU 帧时间", v, PL_GPU, active, h ? h->latGpu : nullptr, h, 2, -1e30f,
+                     33.34f);
         if (showCharts && (c.counters & NP_C_CHART_LATENCY)) attach(acc.pending.back(), h->latGpu, 0);
     }
     // 光流加速器（OFA）：N 卡上 DLSS **帧生成**专用的硬件单元。

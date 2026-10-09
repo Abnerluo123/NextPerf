@@ -29,7 +29,13 @@ inline std::string WideToUtf8(const std::wstring& w) {
     return s;
 }
 
-enum PanelLevel { PL_NORMAL = 0, PL_ACCENT = 1, PL_WARN = 2, PL_DIM = 3 };
+// 行配色。PL_* 是原有的语义级别；PC_* 是 Metal HUD 那种「按指标分色」。
+// 两者共用一个字段（level），渲染器按值域区分即可，避免改动所有调用点。
+enum PanelLevel {
+    PL_NORMAL = 0, PL_ACCENT = 1, PL_WARN = 2, PL_DIM = 3,
+    // ↓ Metal HUD 风格：FPS 白 / 帧时间(CPU) 蓝 / GPU 绿 / 内存 白
+    PL_FPS = 4, PL_CPU = 5, PL_GPU = 6, PL_MEM = 7,
+};
 
 struct PanelRow {
     std::wstring label;
@@ -37,7 +43,16 @@ struct PanelRow {
     int          level = PL_NORMAL;
     bool         header = false; // 分组标题行（CPU / GPU / …），无数值
 
-    // 行内小折线图：挂在该行下方，独占一行，带 X/Y 轴
+    // ---- Metal HUD 风格的右侧方括号区间：`[ min  max ]`
+    // 空字符串 = 本行不显示方括号。数值由 np_build 从**图表窗口**里统计出来，
+    // 和 Apple 的 HUD 一样：括号里的就是曲线可见范围内的小/最大值。
+    std::wstring vmin, vmax;
+    // 括号里哪一侧该标红（由 np_build 按指标语义决定：
+    //   FPS 过低、帧时间/GPU 时间过高 → 红）。
+    bool         warnMin = false;
+    bool         warnMax = false;
+
+    // 行内小折线图：挂在该行下方，独占一行
     bool         chart = false;
     const float* series = nullptr;
     uint32_t     chartCap = 0;
@@ -73,9 +88,10 @@ private:
 
     ID2D1Factory*   d2d_ = nullptr;
     IDWriteFactory* dwrite_ = nullptr;
-    IDWriteTextFormat* fmt_ = nullptr;       // 左对齐正文
-    IDWriteTextFormat* fmtR_ = nullptr;      // 右对齐数值
-    IDWriteTextFormat* fmtSmall_ = nullptr;  // 坐标轴小字
+    IDWriteTextFormat* fmt_ = nullptr;       // 左对齐正文（中文标签，UI 字体）
+    IDWriteTextFormat* fmtR_ = nullptr;      // 右对齐数值（等宽 —— 金属 HUD 的数字列）
+    IDWriteTextFormat* fmtSmall_ = nullptr;  // 右对齐小字（括号里的数字，等宽）
+    IDWriteTextFormat* fmtSmallL_ = nullptr; // 左对齐小字（左括号，等宽）
     IDWriteTextFormat* fmtHead_ = nullptr;   // 分组标题
     float fontSize_ = 0.0f;
 };
