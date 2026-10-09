@@ -806,10 +806,11 @@ bool RenderPanel(const NPConfig& cfg) {
         if (w != lastW || h != lastH) {
             lastW = w; lastH = h;
             Log("panel logical size %dx%d | label=%.1f value=%.1f rng=%.1f head=%.1f "
-                "char=%.2f content=%.1f",
+                "char=%.2f content=%.1f | rowH=%.2f sep=%.2f",
                 w, h, (double)gPanel.diag.labelW, (double)gPanel.diag.valueW,
                 (double)gPanel.diag.rngW, (double)gPanel.diag.headW,
-                (double)gPanel.diag.charW, (double)gPanel.diag.contentW);
+                (double)gPanel.diag.charW, (double)gPanel.diag.contentW,
+                (double)gPanel.diag.rowH, (double)gPanel.diag.sepH);
         }
     }
     DrawCtx dc{&gPanel, &gPd, cfg};

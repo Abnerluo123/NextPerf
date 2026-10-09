@@ -261,13 +261,15 @@ void BuildPanelData(PanelData& out, const NPConfig& c, const NPSensors& s, const
     }
     if (c.counters & NP_C_CPU_FRAME) {
         // 金属 HUD 的 "Pre" 是蓝色 —— CPU 侧的时间类指标统一用蓝
-        acc.rowRange(L"帧时间", active ? Msv(t.cpuFrameMs) : L"—", PL_CPU, active,
+        acc.rowRange(L"CPU 帧时间", active ? Msv(t.cpuFrameMs) : L"—", PL_CPU, active,
                      h ? h->latCpu : nullptr, h, 1, -1e30f, 33.34f);
         if (showCharts && (c.counters & NP_C_CHART_LATENCY)) attach(acc.pending.back(), h->latCpu, 0);
     }
     acc.flush(L"CPU");
 
     // ---------------- GPU ----------------
+    // 分辨率的值先算好，等进入「系统」分组时再入行（用户要求归到系统组）
+    std::wstring resText;
     if (c.counters & NP_C_GPU_NAME && s.gpuName[0]) {
         std::wstring n = Utf8ToWide(s.gpuName);
         n = FitCols(n, 14);
@@ -314,7 +316,7 @@ void BuildPanelData(PanelData& out, const NPConfig& c, const NPSensors& s, const
         else if (active && t.gpuFrameMs > 0.01f) v = Msv(t.gpuFrameMs);
         else v = L"—";
         // 金属 HUD 的 "GPU" 是绿色 —— GPU 侧的时间类指标统一用绿
-        acc.rowRange(L"帧时间", v, PL_GPU, active, h ? h->latGpu : nullptr, h, 2, -1e30f,
+        acc.rowRange(L"GPU 帧时间", v, PL_GPU, active, h ? h->latGpu : nullptr, h, 2, -1e30f,
                      33.34f);
         if (showCharts && (c.counters & NP_C_CHART_LATENCY)) attach(acc.pending.back(), h->latGpu, 0);
     }
@@ -386,7 +388,8 @@ void BuildPanelData(PanelData& out, const NPConfig& c, const NPSensors& s, const
             v += L" → " + std::to_wstring(t.windowW) + L"×" + std::to_wstring(t.windowH);
             v += L" (" + WF(sc * 100.0f, 0) + L"%)";
         }
-        acc.row(L"分辨率", v);
+        // 分辨率移到「系统」分组（用户要求）—— 这里只把值准备好，稍后再入行
+        resText = v;
     }
     if (c.counters & NP_C_AI_MODULES && hooked) {
         acc.row(L"AI 模块", AiModuleText(t.aiModules), t.aiModules ? PL_ACCENT : PL_DIM);
@@ -394,6 +397,7 @@ void BuildPanelData(PanelData& out, const NPConfig& c, const NPSensors& s, const
     acc.flush(L"GPU");
 
     // ---------------- 系统 ----------------
+    if (!resText.empty()) acc.row(L"分辨率", resText);   // 用户要求：归到系统分组
     if (c.counters & NP_C_RAM) {
         std::wstring v = GBv(s.ramUsedGB);
         if (s.ramTotalGB > 0) v = WF(s.ramUsedGB, 1) + L"/" + WF(s.ramTotalGB, 1) + L" GB";

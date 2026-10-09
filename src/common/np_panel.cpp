@@ -277,6 +277,8 @@ void PanelRenderer::Measure(const PanelData& d, const NPConfig& c, float* w, flo
     diag.headW = headW;
     diag.charW = G.charW;
     diag.contentW = contentW;
+    diag.rowH = M.lh;
+    diag.sepH = M.lh * 0.5f;
     // 金属 HUD 偏窄：不再额外撑宽。
     // 量化到 4 个字符格（等宽栅格，天然单位）后**只增不减**地锁定 ——
     // 行随数据陆续出现时面板最多长大一次，绝不会来回伸缩。
@@ -293,8 +295,9 @@ void PanelRenderer::Measure(const PanelData& d, const NPConfig& c, float* w, flo
     bool firstRow = true;
     for (auto& r : d.rows) {
         if (r.header) {
-            // 隐藏标题：只留半行高的分隔（用户要求「留半行高度分割」）
-            rowsH += r.hideTitle ? (M.lh * 0.5f) : M.headH;
+            // 隐藏标题：只留半行高的分隔。
+            // ⚠ 首行的隐藏分隔**不占高度** —— 否则 HUD 顶端会多出一条空行。
+            if (!firstRow) rowsH += r.hideTitle ? (M.lh * 0.5f) : M.headH;
         } else {
             rowsH += M.lh;
             if (r.chart) rowsH += M.chartGap + M.chartH;
@@ -363,8 +366,8 @@ void PanelRenderer::Render(ID2D1RenderTarget* rt, float x, float y, const PanelD
     for (auto& r : d.rows) {
         if (r.header) {
             if (r.hideTitle) {
-                // 不画标题，只推进半行高当分隔
-                cy += M.lh * 0.5f;
+                // 不画标题，只推进半行高当分隔；**首行不推进**（否则顶端多一条空行）
+                if (!firstRow) cy += M.lh * 0.5f;
                 firstRow = false;
                 continue;
             }

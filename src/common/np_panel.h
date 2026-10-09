@@ -88,6 +88,8 @@ public:
     // 诊断用：Measure() 算出的各列宽度（定位「面板宽度随数值变化」是谁在变）
     struct Diag {
         float labelW = 0, valueW = 0, rngW = 0, headW = 0, charW = 0, contentW = 0;
+        float rowH = 0;    // 正文行高
+        float sepH = 0;    // 隐藏分组留下的半行高分隔
     };
     mutable Diag diag;
 
