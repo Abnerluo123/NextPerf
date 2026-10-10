@@ -1261,6 +1261,25 @@ HRESULT PresentCommon(IDXGISwapChain* sc, UINT sync, UINT flags,
                     gReflex.ok() ? 1 : 0);
             }
         }
+        // 低延迟开关状态：**驱动直证**（1 秒查一次就够了，没必要每帧）
+        if (gReflexDev && gReflex.hasSleepStatus()) {
+            static uint32_t sLastSleepQ = 0;
+            uint32_t tkS = GetTickCount();
+            if (tkS - sLastSleepQ > 1000) {
+                sLastSleepQ = tkS;
+                bool on = false;
+                if (gReflex.SleepStatus(gReflexDev, &on)) {
+                    gTel->hookFlags |= NP_HOOK_REFLEX_KNOWN;
+                    if (on) gTel->hookFlags |= NP_HOOK_REFLEX;
+                    else    gTel->hookFlags &= ~(uint32_t)NP_HOOK_REFLEX;
+                    static uint32_t sLastSleepLog = 0;
+                    if (tkS - sLastSleepLog > 10000) {
+                        sLastSleepLog = tkS;
+                        Log("reflex sleep status: lowLatency=%d (authoritative)", on ? 1 : 0);
+                    }
+                }
+            }
+        }
         if (gReflex.ok() && gReflexDev) {
             np::NVFrameReport fr{};
             if (gReflex.Poll(gReflexDev, &fr)) {

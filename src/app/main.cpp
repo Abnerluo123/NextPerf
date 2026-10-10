@@ -220,19 +220,99 @@ void AppPollSensors() {
     }
 }
 
-// 记录「上一个不是自己的前台窗口」。
-// 点「注入到前台进程」按钮时，前台窗口一定是 NextPerf 自己，所以必须靠这里
-// 记住用户刚才切走的那个游戏。主循环每 120ms 跑一次，切换窗口足够抓到。
+// ---------------------------------------------------------------------------
+// 前台窗口跟踪
+//
+// 点「注入到前台进程」按钮时，前台窗口一定是 NextPerf 自己，所以必须提前记住
+// 用户刚才切走的那个游戏。这里有两个坑都踩过：
+//
+//   坑 1：**靠主循环轮询会漏**。原来 120ms 轮询一次，快速 ALT+TAB 切过去又
+//         切回来就可能没采到，用户看到的就是"读不到进程"。
+//         改用 WinEvent 钩子：系统在**每一次**前台变化时主动回调，不会漏。
+//
+//   坑 2：**UWP（微软商店）应用拿到的不是它自己**。商店应用外面套了一层
+//         ApplicationFrameHost 的壳（窗口类名 ApplicationFrameWindow），
+//         GetWindowThreadProcessId 返回的是**那个壳的宿主进程**。
+//         往它注入毫无意义 —— 真正的应用是它的子窗口
+//         （Windows.UI.Core.CoreWindow）。所以要往下找一层。
+// ---------------------------------------------------------------------------
+
+// 判断窗口是不是 UWP 外壳
+static bool IsUwpFrameHost(HWND hwnd) {
+    wchar_t cls[64]{};
+    if (GetClassNameW(hwnd, cls, 64) && _wcsicmp(cls, L"ApplicationFrameWindow") == 0)
+        return true;
+    // 兜底：按进程名判断（壳进程固定叫 ApplicationFrameHost.exe）
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (!pid) return false;
+    std::wstring nm = ProcessExeName(pid);
+    for (auto& c : nm) c = (wchar_t)towlower(c);
+    return nm.find(L"applicationframehost") != std::wstring::npos;
+}
+
+// 解析前台窗口对应的**真实应用进程**（UWP 要往下找一层）
+static DWORD ResolveForegroundPid(HWND fg) {
+    if (!fg) return 0;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(fg, &pid);
+    if (!pid) return 0;
+    if (!IsUwpFrameHost(fg)) return pid;
+
+    struct Ctx { DWORD host; DWORD found; } ctx{pid, 0};
+    EnumChildWindows(
+        fg,
+        [](HWND child, LPARAM lp) -> BOOL {
+            auto* x = reinterpret_cast<Ctx*>(lp);
+            DWORD cp = 0;
+            GetWindowThreadProcessId(child, &cp);
+            // 取第一个 pid 与外壳不同的 —— 那就是被托管的应用
+            if (cp && cp != x->host) {
+                x->found = cp;
+                return FALSE;   // 找到就停
+            }
+            return TRUE;
+        },
+        reinterpret_cast<LPARAM>(&ctx));
+    return ctx.found ? ctx.found : pid;
+}
+
+// 记住一个前台窗口对应的进程（过滤掉自己）
+static void AppRememberForeground(HWND fg) {
+    DWORD pid = ResolveForegroundPid(fg);
+    if (!pid || pid == GetCurrentProcessId()) return;
+    if (pid != gApp.forePid) {
+        gApp.forePid = pid;
+        gApp.foreName = ProcessExeName(pid);
+        if (gApp.foreName.empty()) gApp.foreName = L"(未知进程)";
+    }
+}
+
+// WinEvent 回调：系统每次前台变化都会叫我们
+static void CALLBACK ForegroundWinEvent(HWINEVENTHOOK, DWORD ev, HWND hwnd, LONG idObject,
+                                        LONG idChild, DWORD, DWORD) {
+    if (ev != EVENT_SYSTEM_FOREGROUND || !hwnd) return;
+    if (idObject != OBJID_WINDOW || idChild != CHILDID_SELF) return;
+    AppRememberForeground(hwnd);
+}
+
+static HWINEVENTHOOK gFgHook = nullptr;
+
+// 懒安装（第一次轮询时装上），避免还要去改启动流程
+static void AppEnsureForegroundHook() {
+    if (gFgHook) return;
+    gFgHook = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, nullptr,
+                              ForegroundWinEvent, 0, 0,
+                              WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+}
+
 void AppTrackForeground() {
+    AppEnsureForegroundHook();
     HWND fg = GetForegroundWindow();
     if (fg) {
-        DWORD pid = 0;
-        GetWindowThreadProcessId(fg, &pid);
+        DWORD pid = ResolveForegroundPid(fg);
         if (pid && pid != GetCurrentProcessId()) {
-            if (pid != gApp.forePid) {
-                gApp.forePid = pid;
-                gApp.foreName = ProcessExeName(pid);
-            }
+            AppRememberForeground(fg);
             return;
         }
     }

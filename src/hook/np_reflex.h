@@ -50,6 +50,13 @@ struct NVLatencyParams {
 // MAKE_NVAPI_VERSION(struct, ver) = sizeof(struct) | (ver << 16)
 #define NP_NVAPI_VERSION(s, v) ((uint32_t)(sizeof(s) | ((uint32_t)(v) << 16)))
 
+// NvAPI_D3D_GetSleepStatus 的参数（与 nvapi.h:18252 逐字段对齐）
+struct NVGetSleepStatusParams {
+    uint32_t version;
+    uint32_t bLowLatencyMode;   // NvBool 是 32 位整数；非 0 = 低延迟已开启
+    uint8_t  rsvd[128];
+};
+
 class ReflexReader {
 public:
     // 载入 nvapi64.dll（失败再试 nvapi32.dll）并取接口。可在任意时刻调用，幂等。
@@ -66,6 +73,10 @@ public:
         auto init = reinterpret_cast<int(*)()>(qi(0x0150E828u));   // NvAPI_Initialize
         if (init && init() != 0) return false;                     // 0 = NVAPI_OK
         getLatency_ = reinterpret_cast<int(*)(void*, void*)>(qi(0x1A587F9Cu));  // GetLatency
+        // 0xAEF96CA1 = NvAPI_D3D_GetSleepStatus —— 能**直接回答**低延迟是否开启。
+        // 比用 CPU Wait 推断可靠：那是"等待被移出 Present"的旁证，这个是驱动直说。
+        getSleepStatus_ =
+            reinterpret_cast<int(*)(void*, void*)>(qi(0xAEF96CA1u));
         return getLatency_ != nullptr;
     }
 
@@ -95,9 +106,23 @@ public:
         return true;
     }
 
+    // 低延迟是否开启。返回 true = **驱动明确回答了**（此时 *on 可信）；
+    // 返回 false = 这个接口不可用，调用方应回退到自己的判据。
+    bool SleepStatus(void* dev, bool* on) {
+        if (!getSleepStatus_ || !dev || !on) return false;
+        NVGetSleepStatusParams p{};
+        p.version = NP_NVAPI_VERSION(NVGetSleepStatusParams, 1);
+        if (getSleepStatus_(dev, &p) != 0) return false;   // 0 = NVAPI_OK
+        *on = (p.bLowLatencyMode != 0);
+        return true;
+    }
+
+    bool hasSleepStatus() const { return getSleepStatus_ != nullptr; }
+
 private:
     HMODULE dll_ = nullptr;
     int (*getLatency_)(void*, void*) = nullptr;
+    int (*getSleepStatus_)(void*, void*) = nullptr;
 };
 
 }  // namespace np

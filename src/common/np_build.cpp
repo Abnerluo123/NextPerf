@@ -439,8 +439,14 @@ void BuildPanelData(PanelData& out, const NPConfig& c, const NPSensors& s, const
     //   阈值 1.6ms 按用户实测指定，想调直接改这个数。
     //   用平滑值 cpuWaitAvg 判定，避免临界值来回翻。
     if (c.counters & NP_C_CPU_FRAME) {
+        // 判据有两条，**优先用驱动直证**：
+        //   1) NP_HOOK_REFLEX_KNOWN 置位 = 我们问过 NvAPI_D3D_GetSleepStatus，
+        //      此时 NP_HOOK_REFLEX 就是驱动给出的权威答案；
+        //   2) 问不到才回退：CPU Wait < 1.6ms（等待被移出 Present 的旁证）。
         float waitRef = t.cpuWaitAvg > 0.0001f ? t.cpuWaitAvg : t.cpuWaitMs;
-        bool lowLatency = active && waitRef < 1.6f;
+        bool known = (t.hookFlags & NP_HOOK_REFLEX_KNOWN) != 0;
+        bool lowLatency = active && (known ? ((t.hookFlags & NP_HOOK_REFLEX) != 0)
+                                          : (waitRef < 1.6f));
         acc.row(L"低延迟", lowLatency ? L"On" : L"Off",
                 lowLatency ? PL_NORMAL : PL_DIM);
     }
