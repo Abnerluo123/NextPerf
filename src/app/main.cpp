@@ -548,7 +548,16 @@ static std::string HookHint(uint32_t flags) {
 static void UpdateStatus() {
     char buf[768];
     const NPTelemetry& t = gApp.telemetry;
-    bool live = t.attached && (GetTickCount64() - t.tickMs) < 2500;
+    // ⚠ 原来这里是 `(GetTickCount64() - t.tickMs) < 2500` —— **跨进程比时钟**，
+    //   和 overlay mode 那个 bug 同源（钩子写的时间戳可能落在"未来"或早已陈旧，
+    //   算出来是垃圾）。现在统一用「帧数是否在增长」判存活，与 overlay mode 一致。
+    static uint64_t sStFt = 0;
+    static uint64_t sStGrow = 0;
+    if (t.frameTotal != sStFt) {
+        sStFt = t.frameTotal;
+        sStGrow = GetTickCount64();
+    }
+    bool live = t.attached && sStGrow != 0 && (GetTickCount64() - sStGrow) < 2500;
 
     // 「上一次操作/失败原因」优先显示，并且有存活时间 —— 不能被 120ms 的
     // 常规刷新冲掉，否则用户永远看不到注入失败的原因（这是原来最大的问题）。
@@ -1158,6 +1167,27 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdLine, int cmdShow) {
                 if (ft != sLastFt) {
                     sLastFt = ft;
                     sLastGrowMs = now;
+                }
+                // ★ 陈旧遥测回收：钩子卸载后（无论走哪条路），主程序可能还持有那个
+                //   共享内存句柄，于是对象不销毁、每 tick 继续读到**冻结的旧数据**
+                //   （实测日志 tele=1 ft=5023 growAge=86469ms）。
+                //   判据：遥测连着但帧数超过 2.5 秒不再增长 -> 该钩子已死 -> 清掉。
+                //   这样状态栏、面板、图表都不会再念旧数据，而且不依赖跨进程时钟。
+                if (gApp.telemetry.attached && gApp.telemetry.pid != 0 && sLastGrowMs &&
+                    (now - sLastGrowMs) > 2500) {
+                    AppLog("telemetry: pid=%lu 帧数停增 %.1f 秒 -> 判定钩子已死，清空遥测",
+                           (unsigned long)gApp.telemetry.pid,
+                           (double)(now - sLastGrowMs) / 1000.0);
+                    {
+                        AppLock lk;
+                        DWORD dead = gApp.telemetry.pid;
+                        NPClearTelemetry(&gApp.telemetry);
+                        for (size_t i = gApp.injected.size(); i-- > 0;) {
+                            if (gApp.injected[i] == dead) gApp.injected.erase(gApp.injected.begin() + i);
+                        }
+                    }
+                    sLastFt = 0;
+                    sLastGrowMs = 0;
                 }
                 bool attached = gApp.telemetry.attached && sLastGrowMs != 0 &&
                                 (now - sLastGrowMs) < 2500;
