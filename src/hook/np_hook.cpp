@@ -2600,6 +2600,15 @@ static DWORD WINAPI Worker(LPVOID) {
         Sleep(200);
         // 主程序退出：完成自卸载（不再返回）
         if (gCfg && gCfg->magic == NP_MAGIC && gCfg->quit) SelfUnloadNow();
+        // ★ 主程序要求本进程卸载钩子（清空名单 / 移除某个游戏时会置这个字段）。
+        //   放在这里而不是 Present 里：SelfUnloadNow 的定义在下面，
+        //   在它之前用需要前置声明，而跨作用域的前置声明会变成「ambiguous」。
+        //   守卫线程每约 800ms 轮询一次，这个延迟对「卸载钩子」完全够用。
+        if (gCfg && gCfg->magic == NP_MAGIC && gCfg->detachPid != 0 &&
+            gCfg->detachPid == GetCurrentProcessId()) {
+            Log("detachPid matched -> SelfUnloadNow (asked by host)");
+            SelfUnloadNow();
+        }
         DetectAi();
 
         if (!PresentHooked()) {

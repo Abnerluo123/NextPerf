@@ -450,14 +450,11 @@ static void DoAction(int action) {
             gApp.statusText = "已恢复默认设置";
             break;
                 case A_FORGET: {
-                    // 清空「学习来的」条目（手动添加的保留）
-                    int n = 0;
-                    for (size_t i = gApp.games.size(); i-- > 0;) {
-                        if (gApp.games[i].learned) { gApp.games.erase(gApp.games.begin() + i); ++n; }
-                    }
-                    SettingsSave();
-                    AppLog("learn: 已清空学习名单（%d 条），手动添加的保留", n);
-                    SetNotice("已清空学习名单（" + std::to_string(n) + " 条），手动添加的保留");
+                    // 清空「学习来的」条目（手动添加的保留）。
+                    // ★ 走 ForgetLearned()：它会**先卸载这些游戏里的钩子再删条目** ——
+                    //   不卸载的话学习逻辑会立刻把它们学回来（用户实测的现象）。
+                    int n = ForgetLearned();
+                    SetNotice("已清空学习名单（" + std::to_string(n) + " 条，已卸载对应钩子）");
                     break;
                 }
         case A_ADDGAME: {
@@ -497,13 +494,9 @@ static void DoAction(int action) {
         }
         case A_REMGAME:
             if (gSelGame >= 0 && gSelGame < (int)gApp.games.size()) {
-                AppLog("remove game: %ls", gApp.games[gSelGame].path.c_str());
-                {
-                    AppLock lk;   // 同上：erase 同样会让守护线程的引用失效
-                    gApp.games.erase(gApp.games.begin() + gSelGame);
-                }
+                // ★ 同样走 ForgetGameAt：先卸载钩子再删条目（含落盘）
+                ForgetGameAt(gSelGame);
                 gSelGame = -1;
-                SettingsSave();
             }
             break;
         case A_QUIT:

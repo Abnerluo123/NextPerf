@@ -190,7 +190,14 @@ struct NPConfig {
     // 学习过程有验证（Present 挂上 + 认出 D3D + 帧在流动），但宁可让用户
     // 主动打开。**手动添加的条目不受此开关影响，一直自动注入。**
     uint32_t learnedAutoHook;
-    uint32_t reserved[5];
+    // 「请求某个 pid 的钩子自卸载」。非 0 且等于钩子自己的 pid 时，
+    // 钩子会走 SelfUnloadNow() 干净卸载（还原 vtable 补丁 + 注销 VEH）。
+    //
+    // 为什么不用 CreateRemoteThread 调 NpHookDetach：那需要解析远端导出地址
+    // （ASLR 下要自己算偏移），而且跨位数（32 位游戏）还得另做一套。
+    // 钩子本来每帧就在读 NPConfig，用这个字段既简单又天然支持跨位数。
+    uint32_t detachPid;
+    uint32_t reserved[4];
 };
 
 // 历史采样环形缓冲：图表曲线的数据源。

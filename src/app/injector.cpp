@@ -482,6 +482,44 @@ static std::vector<ProcEntry> EnumProcesses() {
     return out;
 }
 
+// 请求某个 pid 的钩子自卸载：置 cfg.detachPid，钩子在守卫线程（约 800ms 一轮）
+// 看到后会走 SelfUnloadNow —— 那套会 RestoreAllHooks（还原 vtable 补丁）、
+// 注销 VEH、FreeLibraryAndExitThread，正是「反复注入不闪退」用的干净卸载。
+void RequestHookDetach(DWORD pid) {
+    if (!pid) return;
+    gApp.cfg.detachPid = pid;
+    AppLog("detach: 请求 pid=%lu 的钩子自卸载", (unsigned long)pid);
+}
+
+// 移除第 index 条游戏记录：**先卸载钩子再删条目**。
+// 不卸载的话，学习逻辑会立刻从还活着的数据里把它重新学回来 ——
+// 这正是用户报的「清空后又自己回来」。
+void ForgetGameAt(int index) {
+    if (index < 0 || index >= (int)gApp.games.size()) return;
+    DWORD pid = gApp.games[index].pid;
+    std::wstring nm = gApp.games[index].name.empty() ? ExeNameOf(gApp.games[index].path)
+                                                     : gApp.games[index].name;
+    if (pid) RequestHookDetach(pid);
+    {
+        AppLock lk;
+        gApp.games.erase(gApp.games.begin() + index);
+    }
+    AppLog("forget: 已移除 %ls（pid=%lu，已请求卸载钩子）", nm.c_str(), (unsigned long)pid);
+    SettingsSave();
+}
+
+// 清空「学习来的」条目（手动添加的保留）。逐条走 ForgetGameAt 同一入口。
+int ForgetLearned() {
+    int n = 0;
+    for (size_t i = gApp.games.size(); i-- > 0;) {
+        if (gApp.games[i].learned) {
+            ForgetGameAt((int)i);
+            ++n;
+        }
+    }
+    return n;
+}
+
 void InjectorScanNow() {
     {
         AppLock lk;      // gApp.monitoring / gApp.games 都是跨线程共享的
@@ -511,6 +549,19 @@ void InjectorScanNow() {
             for (auto& p : procs) {
                 if (p.pid == GetCurrentProcessId()) continue;
                 if (p.name == want) { pid = p.pid; break; }
+            }
+            // detachPid 用完就清：pid 会被系统复用，不清的话将来某个恰好复用
+            // 该 pid 的进程会一注入就被卸载。这里本来就每轮枚举进程，零额外成本。
+            if (gApp.cfg.detachPid != 0) {
+                bool stillAlive = false;
+                for (auto& p : procs) {
+                    if (p.pid == gApp.cfg.detachPid) { stillAlive = true; break; }
+                }
+                if (!stillAlive) {
+                    AppLog("detach: pid=%lu 已退出，清除 detachPid",
+                           (unsigned long)gApp.cfg.detachPid);
+                    gApp.cfg.detachPid = 0;
+                }
             }
             if (pid != g.pid) {
                 if (pid) AppLog("watch: %ls is running (pid=%lu)", want.c_str(), (unsigned long)pid);

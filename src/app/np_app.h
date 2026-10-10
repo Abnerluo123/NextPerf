@@ -141,6 +141,18 @@ bool InjectorInit();
 void InjectorShutdown();
 bool InjectInto(DWORD pid);
 bool IsInjected(DWORD pid);
+
+// ---------------------------------------------------------------------------
+// HookControl —— 钩子的生命周期控制（用户要求「写成类，为后续单独删某个游戏
+// 也实现这个功能」）。目前以自由函数形式提供同一入口，后续要扩成类也只改这里。
+//
+//   RequestHookDetach(pid)  —— 请求该 pid 的钩子自卸载
+//   ForgetGameAt(index)     —— 移除第 index 条游戏记录（先卸载再删 + 落盘）
+//   ForgetLearned()         —— 清空「学习来的」条目（逐条走同一入口）
+// ---------------------------------------------------------------------------
+void RequestHookDetach(DWORD pid);
+void ForgetGameAt(int index);
+int  ForgetLearned();
 void InjectorTick();
 void InjectorScanNow();
 std::wstring DllPath();
