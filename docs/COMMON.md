@@ -632,9 +632,13 @@ void rowRange(label, value, level, active, series, h, dec, warnMinBelow, warnMax
 2. **`NPClearSensors()` 原来写 `s->version = 1`** → 「主程序写 / 钩子读」这一路
    **完全没有布局自检**：往中间插字段，两边照样能跑，但读出来的是错位字节。
    改成 `sizeof(NPSensors)`。（`CODE-REVIEW-2026-10-09.md`）
-3. **`NPClearConfig()` 的 `for (i < 8)` 越界写 16 字节**：`reserved` 已缩到 `[4]`。
-   钩子 `Cfg()` 用的是**栈上局部变量**且每帧调用 —— 这是真实的栈越界写，
-   目前"没出事"属于运气。详见 [`DATA-STRUCTS.md` §2.5](DATA-STRUCTS.md)。
+3. ✅ **（曾经的坑，已修复）`NPDefaultConfig()` 的 `for (i < 8)` 越界写 16 字节**：
+   `reserved` 已被逐步缩到 `[4]`，循环却没跟着改 —— 而 `AppState` 里紧邻 `cfg` 的就是
+   `sensors`，越界清零会把 `sensors.magic/version/tickMs` 打掉（发布的 Sensors 块
+   `magic = 0` → **被钩子直接忽略**，不崩但传感器全丢）。现写法是
+   `sizeof(c->reserved) / sizeof(c->reserved[0])`。
+   **教训：清数组一律用 `sizeof` 推导，不要写死数字。** 详情见
+   [`DATA-STRUCTS.md` §2.5](DATA-STRUCTS.md)。
 4. **`NPConfig` 加字段必须复用 `reserved[]`**（保持 `sizeof` 不变），
    否则"新 exe + 旧 DLL"会静默读到垃圾。`reserved` 现在**只剩 4 个槽位**。
 5. **哪些字段绝不能持久化**：`magic`/`version`/`size`/`quit`/`pauseHook`/`detachPid`。
@@ -794,3 +798,7 @@ python tests\merge_algo_check.py        # 帧内重复 Present 的合并算法
    （`NPDefaultConfig()` 不碰它们）—— 这算 bug 还是 feature 未确认。
 6. `NPConfig::version` 恒为 1（不是 `sizeof`），与另外两个结构体的约定不一致；
    统一它需要同时改 `tests/diag.py` 与 `DATA-STRUCTS.md`。
+7. **源码在动**：本文写作期间 `np_common.h` 被并行修改过一次
+   （越界写修复 + 容量宏补 `u` 后缀，497 → 506 行）。本文开头的哈希表只能证明
+   "写作那一刻的事实"，**改代码的人请顺手更新哈希与受影响段落**
+   （尤其 `DATA-STRUCTS.md` 的字段表）。

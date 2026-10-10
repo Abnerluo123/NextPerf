@@ -53,6 +53,49 @@ typedef uint32_t VkFlags;
 typedef uint64_t VkDeviceSize;
 typedef uint32_t VkSampleMask;
 
+// 各类 *Flags 在 ABI 上都是 uint32_t，官方头文件为每种标志起一个独立名字
+// 只是为了类型安全和可读性。这里把用得到的都补上 —— 布局完全等价。
+typedef VkFlags VkPipelineStageFlags;
+typedef VkFlags VkAccessFlags;
+typedef VkFlags VkImageUsageFlags;
+typedef VkFlags VkBufferUsageFlags;
+typedef VkFlags VkMemoryPropertyFlags;
+typedef VkFlags VkMemoryHeapFlags;
+typedef VkFlags VkQueueFlags;
+typedef VkFlags VkSampleCountFlags;
+typedef VkFlags VkColorComponentFlags;
+typedef VkFlags VkImageAspectFlags;
+typedef VkFlags VkQueryResultFlags;
+typedef VkFlags VkFenceCreateFlags;
+typedef VkFlags VkCommandPoolCreateFlags;
+typedef VkFlags VkCommandBufferUsageFlags;
+typedef VkFlags VkDependencyFlags;
+typedef VkFlags VkSurfaceTransformFlagsKHR;
+typedef VkFlags VkCompositeAlphaFlagsKHR;
+typedef VkFlags VkSwapchainCreateFlagsKHR;
+typedef VkFlags VkPipelineCreateFlags;
+typedef VkFlags VkPipelineShaderStageCreateFlags;
+typedef VkFlags VkPipelineVertexInputStateCreateFlags;
+typedef VkFlags VkPipelineInputAssemblyStateCreateFlags;
+typedef VkFlags VkPipelineViewportStateCreateFlags;
+typedef VkFlags VkPipelineRasterizationStateCreateFlags;
+typedef VkFlags VkPipelineMultisampleStateCreateFlags;
+typedef VkFlags VkPipelineColorBlendStateCreateFlags;
+typedef VkFlags VkPipelineDynamicStateCreateFlags;
+typedef VkFlags VkPipelineLayoutCreateFlags;
+typedef VkFlags VkRenderPassCreateFlags;
+typedef VkFlags VkSubpassDescriptionFlags;
+typedef VkFlags VkAttachmentDescriptionFlags;
+typedef VkFlags VkFramebufferCreateFlags;
+typedef VkFlags VkImageViewCreateFlags;
+typedef VkFlags VkShaderModuleCreateFlags;
+typedef VkFlags VkBufferCreateFlags;
+typedef VkFlags VkQueryPoolCreateFlags;
+typedef VkFlags VkSemaphoreCreateFlags;
+typedef VkFlags VkInstanceCreateFlags;
+typedef VkFlags VkDeviceCreateFlags;
+typedef VkFlags VkDeviceQueueCreateFlags;
+
 #define VK_TRUE  1u
 #define VK_FALSE 0u
 

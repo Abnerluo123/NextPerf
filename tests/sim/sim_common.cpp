@@ -242,6 +242,9 @@ SimConfig SimParseArgs(int argc, char** argv) {
             c.gpu_load_ms = d;
         } else if (key == "list-outputs" || key == "list-outputs-once") {
             c.list_outputs = true;
+        } else if (key == "dump-argv") {
+            // 只用于诊断「脚本传参被改写」；实际打印在 sim_main.cpp 里做，
+            // 因为那里才拿得到原始 argv。
         } else if (key == "help" || key == "h") {
             c.error = "__help__";
             return c;

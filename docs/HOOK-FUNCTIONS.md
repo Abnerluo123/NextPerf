@@ -2,9 +2,14 @@
 
 > 配套文档：[`HOOK.md`](HOOK.md)（钩子层主文档，含每个功能的实现逻辑与坑）、[`CATALOG.md`](CATALOG.md)（全项目文件编目）。
 >
-> **行号基准**：本文档核对时的 `src/hook/np_hook.cpp`（2744 行）、`np_draw.cpp`（610 行）、
-> `np_draw.h`（104 行）、`np_reflex.h`（128 行）、`dllmain.cpp`（26 行）。
-> 只要改动过这些文件，**行号必须重新核对**（见 HOOK.md §23.1）。
+> ⚠ **行号基准与过期风险**：本表按 **`src/hook/np_hook.cpp` = 2755 行**（`np_draw.cpp` 610 行、
+> `np_draw.h` 104 行、`np_reflex.h` 128 行、`dllmain.cpp` 26 行）核对。
+> 这个文件**正在被并行修改**（编写期间从 2684 → 2744 → 2755 行）。
+> **行号过期时请按函数名重新定位**，不要按行号猜：
+> ```
+> Select-String -Path src\hook\np_hook.cpp -Pattern '^(HRESULT PresentCommon|bool BeginList|void __stdcall NpECL)'
+> ```
+> 「函数名 / 作用 / 被谁调用 / 注意」这四列是稳定的，行号只是跳转入口。
 >
 > 列含义：
 > - **位置**：`文件:起-止`（绝对行号）
@@ -19,7 +24,7 @@
 | 函数名 | 位置 | 作用 | 被谁调用 | 注意 |
 | --- | --- | --- | --- | --- |
 | `DllMain` | `dllmain.cpp:13-26` | `ATTACH` → `NpHookAttach`；`DETACH` → `NpHookDetach` | Windows loader（注入器 `LoadLibrary`） | 先 `DisableThreadLibraryCalls`。**里面不做任何图形初始化**（loader lock） |
-| `NpHookAttach(HMODULE)` | `np_hook.cpp:2717-2721` | 存 `gSelf`、`InitializeCriticalSection(&gCs)`、起 worker 线程 | `dllmain.cpp:17` | 立即返回；真正工作全在 worker 线程 |
+| `NpHookAttach(HMODULE)` | `np_hook.cpp:2728-2732` | 存 `gSelf`、`InitializeCriticalSection(&gCs)`、起 worker 线程 | `dllmain.cpp:17` | 立即返回；真正工作全在 worker 线程 |
 | `NpHookDetach()` | `np_hook.cpp:2723-2744` | `gReady=false` → `RestoreAllHooks()` → 等 worker → `DeleteCriticalSection` | `dllmain.cpp:20`（`DLL_PROCESS_DETACH`） | ⚠ **必须还原 vtable**（`2725-2735`）；自卸载路径下不能等自己（`2736-2742`） |
 | `gNpCountingOverlayDraws` | 定义 `np_hook.cpp:948`，声明 `np_draw.cpp:15` | `extern "C" thread_local bool`：叠加绘制期间抑制 draw 计数 | `NpDrawInst`/`NpDrawIdx` 读；两个 overlay 写 | ⚠ 必须 `thread_local`；定义必须在匿名命名空间**之外**（否则链接失败） |
 
@@ -78,25 +83,25 @@
 
 ---
 
-## 6. 跳板函数（`extern "C"`，`np_hook.cpp:2157-2419`）
+## 6. 跳板函数（`extern "C"`，`np_hook.cpp:2168-2430`）
 
 > 这些函数**签名必须与被 hook 的成员函数完全一致**（`__stdcall`、参数顺序），
 > 否则栈会错位 —— 编译期也未必报错。
 
 | 函数名 | 位置 | 作用的 vtable 槽 | 被谁调用 | 注意 |
 | --- | --- | --- | --- | --- |
-| `NpPresent` | `2159-2161` | `Present`(8) | 宿主进程的 DXGI | 纯转发到 `PresentCommon(..., isP1=false)` |
-| `NpPresent1` | `2163-2166` | `Present1`(22) | 宿主 | 纯转发，`isP1=true` |
-| `NpCreateSwapChain` | `2174-2180` | `IDXGIFactory::CreateSwapChain`(10) | 宿主 | 先 `Log`；成功且 `!gUnloading` 才补 Present |
-| `NpCreateSwapChainHwnd` | `2182-2191` | `IDXGIFactory2::CreateSwapChainForHwnd`(15) | 宿主 | 同上；⚠ 若原函数缺失返回 `E_FAIL`（不会调用自己） |
-| `NpCreateSwapChainComp` | `2193-2200` | `IDXGIFactory2::CreateSwapChainForComposition`(24) | 宿主 | 同上 |
-| `NpECL` | `2202-2271` | `ID3D12CommandQueue::ExecuteCommandLists`(10) | 宿主提交线程 | ⚠ 只认 DIRECT 队列；锁定队列要 `AddRef`；只有 `q==gQueue12` 才插桩；`gFrameStarted` 用 CAS 抢且必须在 `EndList` 之前 |
-| `NpDispatchRays` | `2282-2328` | `DispatchRays`(76) | 宿主提交线程 | ⚠ 槽位号用 `fetch_add` **返回值**；探针异常 → `gD12Broken` + **只转发一次**（历史 bug：转发两遍） |
-| `NpBuildAS` | `2330-2335` | `BuildRaytracingAccelerationStructure`(72) | 宿主 | 只累加 `gAsBuilds` 后转发 |
-| `NpDispatch` | `2337-2386` | `Dispatch`(14) | 宿主提交线程 | ⚠ 与 `DispatchRays` 同类坑；异常时复位 `gAiSpanOpen` 并永久停手 |
-| `NpDrawInst` | `2388-2392` | `DrawInstanced`(12) | 宿主 + 我们自己的叠加 | `gNpCountingOverlayDraws` 时只转发不计数 |
-| `NpDrawIdx` | `2394-2398` | `DrawIndexedInstanced`(13) | 宿主 + 叠加 | 同上 |
-| `NpSetViewports` | `2400-2417` | `RSSetViewports`(21) | 宿主 | ⚠ 渲染分辨率**只认长宽比与输出一致**（`rel <= 1.05`）的最大视口 |
+| `NpPresent` | `2170-2172` | `Present`(8) | 宿主进程的 DXGI | 纯转发到 `PresentCommon(..., isP1=false)` |
+| `NpPresent1` | `2174-2177` | `Present1`(22) | 宿主 | 纯转发，`isP1=true` |
+| `NpCreateSwapChain` | `2185-2191` | `IDXGIFactory::CreateSwapChain`(10) | 宿主 | 先 `Log`；成功且 `!gUnloading` 才补 Present |
+| `NpCreateSwapChainHwnd` | `2193-2202` | `IDXGIFactory2::CreateSwapChainForHwnd`(15) | 宿主 | 同上；⚠ 若原函数缺失返回 `E_FAIL`（不会调用自己） |
+| `NpCreateSwapChainComp` | `2204-2211` | `IDXGIFactory2::CreateSwapChainForComposition`(24) | 宿主 | 同上 |
+| `NpECL` | `2213-2282` | `ID3D12CommandQueue::ExecuteCommandLists`(10) | 宿主提交线程 | ⚠ 只认 DIRECT 队列；锁定队列要 `AddRef`；只有 `q==gQueue12` 才插桩；`gFrameStarted` 用 CAS 抢且必须在 `EndList` 之前 |
+| `NpDispatchRays` | `2293-2339` | `DispatchRays`(76) | 宿主提交线程 | ⚠ 槽位号用 `fetch_add` **返回值**；探针异常 → `gD12Broken` + **只转发一次**（历史 bug：转发两遍） |
+| `NpBuildAS` | `2341-2346` | `BuildRaytracingAccelerationStructure`(72) | 宿主 | 只累加 `gAsBuilds` 后转发 |
+| `NpDispatch` | `2348-2397` | `Dispatch`(14) | 宿主提交线程 | ⚠ 与 `DispatchRays` 同类坑；异常时复位 `gAiSpanOpen` 并永久停手 |
+| `NpDrawInst` | `2399-2403` | `DrawInstanced`(12) | 宿主 + 我们自己的叠加 | `gNpCountingOverlayDraws` 时只转发不计数 |
+| `NpDrawIdx` | `2405-2409` | `DrawIndexedInstanced`(13) | 宿主 + 叠加 | 同上 |
+| `NpSetViewports` | `2411-2428` | `RSSetViewports`(21) | 宿主 | ⚠ 渲染分辨率**只认长宽比与输出一致**（`rel <= 1.05`）的最大视口 |
 
 ---
 
@@ -104,7 +109,7 @@
 
 | 函数名 | 位置 | 作用 | 被谁调用 | 注意 |
 | --- | --- | --- | --- | --- |
-| `PresentCommon(sc, sync, flags, pp, isP1)` | `np_hook.cpp:1182-1738` | 整个钩子层的心脏：防护 → 设备识别 → 分辨率/全屏 → 帧时间与帧内合并 → CPU 拆分 → Reflex → 时间戳收尾 → 遥测 → 叠加 → 调原函数 → **尾部收尾** | `NpPresent`/`NpPresent1` | ⚠⚠ **绝不在中间 `return`**（会跳过尾部收尾 → `gInPresent` 永远 `true` → 叠加永久失效）；⚠ `gUnloading` 判定必须在 `gTel` 解引用之前；⚠ 顺序：`setjmp`→`EnsureRt`→…→`CallOriginal`→CPU 拆分→复位状态 |
+| `PresentCommon(sc, sync, flags, pp, isP1)` | `np_hook.cpp:1193-1749` | 整个钩子层的心脏：防护 → 设备识别 → 分辨率/全屏 → 帧时间与帧内合并 → CPU 拆分 → Reflex → 时间戳收尾 → 遥测 → 叠加 → 调原函数 → **尾部收尾** | `NpPresent`/`NpPresent1` | ⚠⚠ **绝不在中间 `return`**（会跳过尾部收尾 → `gInPresent` 永远 `true` → 叠加永久失效）；⚠ `gUnloading` 判定必须在 `gTel` 解引用之前；⚠ 顺序：`setjmp`→`EnsureRt`→…→`CallOriginal`→CPU 拆分→复位状态 |
 
 子步骤定位（都在 `PresentCommon` 内）与对应行号：
 
@@ -154,9 +159,9 @@
 
 | 函数名 | 位置 | 作用 | 被谁调用 | 注意 |
 | --- | --- | --- | --- | --- |
-| `UpdateTelemetryCommon(cfg, nowQpc, realPresent)` | `np_hook.cpp:950-1162` | 完整遥测：崩溃上下文快照、状态、计数器、FPS 窗口计数、RT/Tensor 占比、Low 帧、PDH GPU 回填、图表、清零计数器 | `PresentCommon` `1540`（未暂停时） | ⚠ 开头刷新 `gDbg*` 崩溃快照（`953-959`）；⚠ `fps` 窗口只数 `realPresent`；⚠ RT/Tensor 分母用 `frameMs` 不用 `gpuFrameMs`；⚠ 末尾必须清 `gDraws/gDispatches/gAsBuilds` |
-| `PublishMinimalTelemetry()` | `np_hook.cpp:2577-2614` | 心跳：`tickMs`/`gfxApi`/`processName`/`lastError` | `Worker` `2704`（仅 `!PresentHooked()`） | 把「已注入但没数据」变成一句能看懂的话；按 API 分支写文案（`2592-2613`） |
-| `GuessApiFromModules()` | `np_hook.cpp:2566-2573` | 按模块猜 API（含 Vulkan/OpenGL） | `PublishMinimalTelemetry` `2581` | 与 `HostApiGuess` 不同：后者排除了本 DLL 自己导入的模块 |
+| `UpdateTelemetryCommon(cfg, nowQpc, realPresent)` | `np_hook.cpp:950-1173` | 完整遥测：崩溃上下文快照、状态、计数器、FPS 窗口计数、RT/Tensor 占比、Low 帧、PDH GPU 回填、图表、清零计数器 | `PresentCommon` `1551`（未暂停时） | ⚠ 开头刷新 `gDbg*` 崩溃快照（`953-959`）；⚠ `fps` 窗口只数 `realPresent`；⚠ RT/Tensor 分母用 `frameMs` 不用 `gpuFrameMs`；⚠ 末尾必须清 `gDraws/gDispatches/gAsBuilds` |
+| `PublishMinimalTelemetry()` | `np_hook.cpp:2588-2625` | 心跳：`tickMs`/`gfxApi`/`processName`/`lastError` | `Worker` `2715`（仅 `!PresentHooked()`） | 把「已注入但没数据」变成一句能看懂的话；按 API 分支写文案（`2603-2624`） |
+| `GuessApiFromModules()` | `np_hook.cpp:2577-2584` | 按模块猜 API（含 Vulkan/OpenGL） | `PublishMinimalTelemetry` `2592` | 与 `HostApiGuess` 不同：后者排除了本 DLL 自己导入的模块 |
 | `NPClearTelemetry` / `NPClearSensors` | `np_common.h:472-497` / `441-470` | 结构体清零 + 写 `sizeof` 版本 | `OpenIpc` `628`；`Sens()` `641` | ⚠ `version` 写的是 `sizeof`，读方用它做布局自检 |
 
 ---
@@ -165,17 +170,17 @@
 
 | 函数名 | 位置 | 作用 | 被谁调用 | 注意 |
 | --- | --- | --- | --- | --- |
-| `InitTs12(dev, q)` | `np_hook.cpp:672-706` | 建查询堆（64 槽）、4 个 readback、fence、`NP_ALLOC_RING=32` 个分配器、一条命令列表并 `Close()` | `EnsureD3D12Hooks` `2066` | 任一失败返回 `false`（会走日志分支）；`gTsFreq` 拿不到退 1000000 |
-| `BeginList()` | `np_hook.cpp:708-755` | 取分配器环下一个槽 → 检查 fence → `Reset` 分配器与命令列表 → 返回 `gList` | 叠加绘制 `1618`、`SubmitPendingResolve` `830` | ⚠ `try_lock`（抢不到就放弃本帧，**绝不阻塞**）；⚠ **绝不等 GPU**；⚠ 连续失败 > 600 → `gD12Broken`；任何 `Reset` 失败 → `gD12Broken` |
+| `InitTs12(dev, q)` | `np_hook.cpp:672-706` | 建查询堆（64 槽）、4 个 readback、fence、`NP_ALLOC_RING=32` 个分配器、一条命令列表并 `Close()` | `EnsureD3D12Hooks` `2077` | 任一失败返回 `false`（会走日志分支）；`gTsFreq` 拿不到退 1000000 |
+| `BeginList()` | `np_hook.cpp:708-755` | 取分配器环下一个槽 → 检查 fence → `Reset` 分配器与命令列表 → 返回 `gList` | 叠加绘制 `1629`、`SubmitPendingResolve` `830` | ⚠ `try_lock`（抢不到就放弃本帧，**绝不阻塞**）；⚠ **绝不等 GPU**；⚠ 连续失败 > 600 → `gD12Broken`；任何 `Reset` 失败 → `gD12Broken` |
 | `EndList(q)` | `np_hook.cpp:757-778` | `Close` → `ExecuteCommandLists` → `Signal(gFence)` → 记 `gAllocFence` → 同步叠加 fence → 解锁 | 同 `BeginList` 的两处 | ⚠ 没拿锁时直接返回（不要瞎解锁）；`Close` 失败 → `gD12Broken` |
-| `HarvestTimestamps()` | `np_hook.cpp:780-822` | fence 完成后 `Map` readback，算 GPU/RT/AI 毫秒并写遥测 | `PresentCommon` `1522` | ⚠ 单批 > 50ms 判为配对出错，丢弃；`0 < gpuMs < 1000` 才写；RT/Tensor 百分比**不在这里算** |
-| `SubmitPendingResolve(q, rtCount, aiUsed, batchCount)` | `np_hook.cpp:824-839` | 找一个空 `Pending` 槽，`ResolveQueryData(0, TS_SLOTS)` 到 readback | `PresentCommon` `1523` | 4 个槽都忙就**放弃这一帧**（不等待） |
-| `CanTimestamp(cl)` | `np_hook.cpp:2277-2280` | 列表是否允许插时间戳（必须 `DIRECT`） | `NpDispatchRays` `2303`、`NpDispatch` `2349` | ⚠ bundle 与直连列表**共用 vtable**，bundle 上 `EndQuery` 非法 → 必须用 `GetType()` 过滤 |
+| `HarvestTimestamps()` | `np_hook.cpp:780-822` | fence 完成后 `Map` readback，算 GPU/RT/AI 毫秒并写遥测 | `PresentCommon` `1533` | ⚠ 单批 > 50ms 判为配对出错，丢弃；`0 < gpuMs < 1000` 才写；RT/Tensor 百分比**不在这里算** |
+| `SubmitPendingResolve(q, rtCount, aiUsed, batchCount)` | `np_hook.cpp:824-839` | 找一个空 `Pending` 槽，`ResolveQueryData(0, TS_SLOTS)` 到 readback | `PresentCommon` `1534` | 4 个槽都忙就**放弃这一帧**（不等待） |
+| `CanTimestamp(cl)` | `np_hook.cpp:2288-2291` | 列表是否允许插时间戳（必须 `DIRECT`） | `NpDispatchRays` `2314`、`NpDispatch` `2360` | ⚠ bundle 与直连列表**共用 vtable**，bundle 上 `EndQuery` 非法 → 必须用 `GetType()` 过滤 |
 | `gD12Lock` / `gD12Locked` | `np_hook.cpp:328-329` | 全局命令列表的互斥 + 线程重入标记 | `BeginList`/`EndList` | ⚠ 用 `try_lock`；`thread_local` 标记防止同线程重入 |
 | `gD12Broken` | `np_hook.cpp:334` | D3D12 侧永久停手标志 | 多处读写 | 语义是**永久的**；置位后帧时间路径继续工作 |
 | `gAlloc[32]` / `gAllocFence[32]` / `gAllocCur` / `gBeginListFails` | `np_hook.cpp:408-412` | 分配器环与状态 | `BeginList`/`EndList` | ⚠ 环太小（3/8）会让叠加**永久停画** |
 | `gPending[4]` | `np_hook.cpp:414-421` | readback 延迟收割槽 | `HarvestTimestamps`/`SubmitPendingResolve` | `struct Pending` 定义在同处 |
-| `InitTs11(dev)` / `Ts11Tick(seq)` | `np_hook.cpp:844-854` / `856-885` | D3D11 三缓冲时间戳 | `PresentCommon` `1227` / `1528` | `GetData` 返回 `S_OK` 才算就绪；要求 `!dj.Disjoint` 且 `0 < ms < 1000` |
+| `InitTs11(dev)` / `Ts11Tick(seq)` | `np_hook.cpp:844-854` / `856-885` | D3D11 三缓冲时间戳 | `PresentCommon` `1238` / `1539` | `GetData` 返回 `S_OK` 才算就绪；要求 `!dj.Disjoint` 且 `0 < ms < 1000` |
 
 ---
 
@@ -185,34 +190,34 @@
 
 | 函数名 | 位置 | 作用 | 被谁调用 | 注意 |
 | --- | --- | --- | --- | --- |
-| `npg::GfxInit()` | `np_draw.cpp:74-81` | `npb::GfxInit()` + `LoadLibraryW("d3dcompiler_47.dll")` 取 `D3DCompile` | `EnsureRt` `1172` | 运行时编译着色器，不依赖预编译 blob |
-| `npg::GfxShutdown()` | `np_draw.cpp:83-86` | `npb::GfxShutdown()` + 释放 d3dcompiler | `SelfUnloadNow` `2534` | `gCompiler`/`gD3DCompile` 一并清空 |
+| `npg::GfxInit()` | `np_draw.cpp:74-81` | `npb::GfxInit()` + `LoadLibraryW("d3dcompiler_47.dll")` 取 `D3DCompile` | `EnsureRt` `1183` | 运行时编译着色器，不依赖预编译 blob |
+| `npg::GfxShutdown()` | `np_draw.cpp:83-86` | `npb::GfxShutdown()` + 释放 d3dcompiler | `SelfUnloadNow` `2545` | `gCompiler`/`gD3DCompile` 一并清空 |
 | `CompileShader(entry, target, out)` | `np_draw.cpp:88-95` | 编译内置全屏三角形 VS/PS | 两个 `Init` | 源码 `kShaderSrc` 在 `np_draw.cpp:61-72`；错误 blob 会被 `Release` |
-| `Overlay11::Draw(...)` | `np_draw.cpp:155-252` | D3D11 路径：动态纹理上传 + 每帧新建 RTV + `Draw(3,0)` | `PresentCommon` `1597` | ⚠⚠ **RTV 每帧新建、本帧放掉**（长期引用后台缓冲会让游戏 `ResizeBuffers` 失败 → 闪退）；⚠ 必须绑 `CULL_NONE` 光栅状态；⚠ 视口定位面板矩形 |
-| `Overlay12::Record(...)` | `np_draw.cpp:400-608` | D3D12 路径：上传堆 → `CopyTextureRegion` → 屏障 → 全屏三角形 | `PresentCommon` `1620`（由 `BeginList`/`EndList` 包住） | ⚠⚠ 描述符堆**换堆**而不是覆盖槽位；⚠ 换堆后 `settle_ = 30`；⚠ 上传缓冲走 fence 延迟回收 |
+| `Overlay11::Draw(...)` | `np_draw.cpp:155-252` | D3D11 路径：动态纹理上传 + 每帧新建 RTV + `Draw(3,0)` | `PresentCommon` `1608` | ⚠⚠ **RTV 每帧新建、本帧放掉**（长期引用后台缓冲会让游戏 `ResizeBuffers` 失败 → 闪退）；⚠ 必须绑 `CULL_NONE` 光栅状态；⚠ 视口定位面板矩形 |
+| `Overlay12::Record(...)` | `np_draw.cpp:400-608` | D3D12 路径：上传堆 → `CopyTextureRegion` → 屏障 → 全屏三角形 | `PresentCommon` `1631`（由 `BeginList`/`EndList` 包住） | ⚠⚠ 描述符堆**换堆**而不是覆盖槽位；⚠ 换堆后 `settle_ = 30`；⚠ 上传缓冲走 fence 延迟回收 |
 | `DrawCb(rt, ud)` | `np_hook.cpp:895-898` | D2D 回调：`PanelRenderer::Render` | `PanelBitmap::Render`（`np_hook.cpp:925`） | `DrawCtx` 定义在 `890-894` |
-| `RenderPanel(cfg)` | `np_hook.cpp:903-929` | `BuildPanelData` → `Measure` → `PanelBitmap::Render` → 记 `gBw/gBh` | `PresentCommon` `1565`、`1594`、`1616` | 尺寸变化时记一条 `panel logical size` 诊断日志（`916-921`） |
+| `RenderPanel(cfg)` | `np_hook.cpp:903-929` | `BuildPanelData` → `Measure` → `PanelBitmap::Render` → 记 `gBw/gBh` | `PresentCommon` `1576`、`1605`、`1627` | 尺寸变化时记一条 `panel logical size` 诊断日志（`916-921`） |
 | `gBw` / `gBh` | `np_hook.cpp:900` | 面板纹理**物理像素**尺寸（含光栅倍率） | 叠加路径 | `gBw>0 && gBh>0` 是「可以画」的前置条件 |
 
 ### 11.2 `Overlay11`（`np_draw.h:27-46`）
 
 | 函数名 | 位置 | 作用 | 被谁调用 | 注意 |
 | --- | --- | --- | --- | --- |
-| `Overlay11::Init(dev)` | `np_draw.cpp:98-141` | 编译 VS/PS、采样器、**预乘 alpha** 混合、`CULL_NONE` 光栅状态 | `PresentCommon` `1181` | ⚠ D3D11 默认 `CullMode=BACK`，全屏三角形正好是背面 → 不建这个状态则 `Draw` 成功但屏幕无内容 |
-| `Overlay11::Release()` | `np_draw.cpp:143-153` | 释放全部成员 | `SelfUnloadNow` `2470` | — |
+| `Overlay11::Init(dev)` | `np_draw.cpp:98-141` | 编译 VS/PS、采样器、**预乘 alpha** 混合、`CULL_NONE` 光栅状态 | `PresentCommon` `1192` | ⚠ D3D11 默认 `CullMode=BACK`，全屏三角形正好是背面 → 不建这个状态则 `Draw` 成功但屏幕无内容 |
+| `Overlay11::Release()` | `np_draw.cpp:143-153` | 释放全部成员 | `SelfUnloadNow` `2481` | — |
 | 成员 | `np_draw.h:36-45` | `vs_/ps_/tex_/srv_/blend_/samp_/raster_/rtv_/rtvSrc_/texW_/texH_` | — | ⚠ `texW_/texH_` 必须在纹理与 SRV 都建好之后才写（`np_draw.cpp:172-181`）；`rtvSrc_` 是历史遗留（现在不再 `AddRef` 后台缓冲） |
 
 ### 11.3 `Overlay12`（`np_draw.h:49-102`）
 
 | 函数名 | 位置 | 作用 | 被谁调用 | 注意 |
 | --- | --- | --- | --- | --- |
-| `Overlay12::Init(dev)` | `np_draw.cpp:255-322` | 根签名（SRV 表 + 静态采样器）、SRV 堆（1）、RTV 堆（8）、fence | `EnsureD3D12Hooks` `2022` | PSO **不在这里建**（依赖后台缓冲格式） |
+| `Overlay12::Init(dev)` | `np_draw.cpp:255-322` | 根签名（SRV 表 + 静态采样器）、SRV 堆（1）、RTV 堆（8）、fence | `EnsureD3D12Hooks` `2078` | PSO **不在这里建**（依赖后台缓冲格式） |
 | `Overlay12::EnsurePso(dev, rtvFormat)` | `np_draw.cpp:324-356` | 按后台缓冲格式建/换 PSO | `Record` `407` | 旧 PSO 走 `Retire` 延迟回收 |
 | `Overlay12::Retire(IUnknown*)` | `np_draw.cpp:379-385` | 挂到 fence 队列延迟回收（上限 16） | `EnsurePso`、`Record`、换堆 | ⚠ 立刻 `Release` 一个「已录进命令列表但 GPU 没执行完」的资源 = 释放正在使用的显存 |
 | `Overlay12::OnFrameCompleted()` | `np_draw.cpp:387-398` | fence 确认后真正 `Release` | `Record` `405`/`463` | 每帧回收一次 |
-| `Overlay12::Release()` | `np_draw.cpp:358-374` | 清空 pending + 释放全部 + **重置 `psoFormat_`** | `SelfUnloadNow` `2471` | ⚠ 不重置 `psoFormat_` 会让重新 `Init` 后的 `EnsurePso` 误判 |
+| `Overlay12::Release()` | `np_draw.cpp:358-374` | 清空 pending + 释放全部 + **重置 `psoFormat_`** | `SelfUnloadNow` `2482` | ⚠ 不重置 `psoFormat_` 会让重新 `Init` 后的 `EnsurePso` 误判 |
 | `Overlay12::fence()` / `fenceValuePtr()` | `np_draw.h:58-59` | 给 `EndList` 用来 `Signal` 并写值 | `EndList` `734-738` | 值必须与 `gFenceVal` 同步推进 |
-| `Overlay12::HeapSwaps()` | `np_draw.h:62` | RTV 堆被换过几次（诊断） | 叠加 5s 日志 `1625` | 暴涨说明游戏在频繁重建交换链 |
+| `Overlay12::HeapSwaps()` | `np_draw.h:62` | RTV 堆被换过几次（诊断） | 叠加 5s 日志 `1681` | 暴涨说明游戏在频繁重建交换链 |
 | `Overlay12::settlePending()` / `tickSettle()` | `np_draw.h:65-66` | 交换链重建后的静默帧计数 | `PresentCommon` `1500-1501` | 置位点是 `np_draw.cpp:548`（`settle_ = 30`） |
 | 成员 | `np_draw.h:73-101` | `root_/pso_/vsBlob_/psBlob_/psoFormat_/tex_/srvHeap_/rtvHeap_/rtvSlots_[8]/rtvSlotsN_/rtvHeapSwaps_/settle_/drawSkips_/rtvHeapSize_/texW_/texH_/fence_/fenceValue_/pending_[16]/pendingN_` | — | `drawSkips_` 只声明未使用；`rtvSlots_` 是 `struct RtvSlot { ID3D12Resource* res; int slot; }` 数组 |
 
@@ -227,9 +232,9 @@
 | `NP_NVAPI_VERSION(s, v)` | `np_reflex.h:51` | `sizeof(s) | (v << 16)` | 两个入参填充 | 版本号必须与结构大小绑定 |
 | `ReflexReader::Init()` | `np_reflex.h:63-81` | 载入 `nvapi64.dll`（失败退 `nvapi32.dll`）→ `nvapi_QueryInterface` → `NvAPI_Initialize` → 取两个接口 | `PresentCommon` `1357` | 幂等；`NvAPI_Initialize` 返回非 0 视为失败；**没有对应的 `FreeLibrary`**（见 HOOK.md §21.7） |
 | `ReflexReader::ok()` | `np_reflex.h:83` | `getLatency_ != nullptr` | `PresentCommon` `1359`/`1381` | — |
-| `ReflexReader::Poll(dev, out)` | `np_reflex.h:87-107` | 取最近一帧报告：从 64 帧里挑 `frameID` 最大且时刻非 0 的；剔除「结束早于开始」 | `PresentCommon` `1428` | 返回 `false` 表示这次没数据（游戏没用 Reflex）→ 调用方必须保持回退路径 |
-| `ReflexReader::SleepStatus(dev, &on)` | `np_reflex.h:111-118` | **驱动直证**低延迟是否开启 | `PresentCommon` `1414`（1 秒一次） | 返回 `true` 才代表「驱动明确回答了」；比用 CPU Wait 推断可靠（那是旁证） |
-| `ReflexReader::hasSleepStatus()` | `np_reflex.h:120` | 该接口是否可用 | `PresentCommon` `1408` | — |
+| `ReflexReader::Poll(dev, out)` | `np_reflex.h:87-107` | 取最近一帧报告：从 64 帧里挑 `frameID` 最大且时刻非 0 的；剔除「结束早于开始」 | `PresentCommon` `1439` | 返回 `false` 表示这次没数据（游戏没用 Reflex）→ 调用方必须保持回退路径 |
+| `ReflexReader::SleepStatus(dev, &on)` | `np_reflex.h:111-118` | **驱动直证**低延迟是否开启 | `PresentCommon` `1425`（1 秒一次） | 返回 `true` 才代表「驱动明确回答了」；比用 CPU Wait 推断可靠（那是旁证） |
+| `ReflexReader::hasSleepStatus()` | `np_reflex.h:120` | 该接口是否可用 | `PresentCommon` `1419` | — |
 | 接口 ID 常量 | `np_reflex.h:73-79` | `NvAPI_Initialize=0x0150E828`、`NvAPI_D3D_GetLatency=0x1A587F9C`、`NvAPI_D3D_GetSleepStatus=0xAEF96CA1` | `Init` | GetLatency 的 ID 来自 Intel PresentMon 的 `nvapi_interface_table.h` |
 | `gReflex` / `gReflexDev` / `gReflexTried` | `np_hook.cpp:377-379` | 读取器实例 / D3D 设备（AddRef 后**不释放**）/ 只试一次标记 | `PresentCommon` | 字段写入：`simMs`/`submitMs` 被 Reflex 值与启发式值**共用**（读到就覆盖） |
 
@@ -239,11 +244,11 @@
 
 | 函数名 | 位置 | 作用 | 被谁调用 | 注意 |
 | --- | --- | --- | --- | --- |
-| `RestoreAllHooks()` | `np_hook.cpp:2442-2498` | **幂等**还原：记日志 → 注销 VEH → 交换链表 → 工厂 → 队列 → 命令列表 → 指针置空 | `SelfUnloadNow` `2526`、`NpHookDetach` `2735` | ⚠⚠ 必须从**两条路径**都调（只写在自卸载里会让补丁留在原地 → 下次注入自递归栈溢出）；⚠ VEH 注销是「重复注入 100% 闪退」的根因修复（`2456-2460`） |
-| `SelfUnloadNow()` | `np_hook.cpp:2522-2561` | `gUnloading=true` → `Sleep(150)` → `RestoreAllHooks` → `Sleep(250)` → 释放图形/采集资源 → 释放互斥量与共享内存 → `FreeLibraryAndExitThread` | `Worker` `2662`/`2670` | ⚠ 顺序不能乱（先直通、再还原、排空后才允许 `FreeLibrary`）；**不返回** |
-| `detachPid` 判定 | `np_hook.cpp:2667-2671` | `gCfg->detachPid == GetCurrentProcessId()` → `SelfUnloadNow()` | worker 循环（200ms 轮询） | 字段定义 `np_common.h:193-200`；**为什么不用 `CreateRemoteThread`** 见 `np_common.h:196-199`（ASLR + 跨位数） |
-| `quit` 判定 | `np_hook.cpp:2662` | 主程序退出 → `SelfUnloadNow()` | worker 循环 | 条件含 `magic == NP_MAGIC` |
-| `gWorker` / `gInjectedMutex` | `np_hook.cpp:2424-2425` | worker 线程句柄 / 防重复注入互斥量 | `NpHookAttach` / `Worker` / `NpHookDetach` | 互斥量在 `Worker` `2627-2633` 创建并持有到进程结束；`NpHookDetach` 里**不能等自己** |
+| `RestoreAllHooks()` | `np_hook.cpp:2453-2509` | **幂等**还原：记日志 → 注销 VEH → 交换链表 → 工厂 → 队列 → 命令列表 → 指针置空 | `SelfUnloadNow` `2537`、`NpHookDetach` `2746` | ⚠⚠ 必须从**两条路径**都调（只写在自卸载里会让补丁留在原地 → 下次注入自递归栈溢出）；⚠ VEH 注销是「重复注入 100% 闪退」的根因修复（`2467-2471`） |
+| `SelfUnloadNow()` | `np_hook.cpp:2533-2572` | `gUnloading=true` → `Sleep(150)` → `RestoreAllHooks` → `Sleep(250)` → 释放图形/采集资源 → 释放互斥量与共享内存 → `FreeLibraryAndExitThread` | `Worker` `2673`/`2681` | ⚠ 顺序不能乱（先直通、再还原、排空后才允许 `FreeLibrary`）；**不返回** |
+| `detachPid` 判定 | `np_hook.cpp:2678-2682` | `gCfg->detachPid == GetCurrentProcessId()` → `SelfUnloadNow()` | worker 循环（200ms 轮询） | 字段定义 `np_common.h:193-200`；**为什么不用 `CreateRemoteThread`** 见 `np_common.h:196-199`（ASLR + 跨位数） |
+| `quit` 判定 | `np_hook.cpp:2673` | 主程序退出 → `SelfUnloadNow()` | worker 循环 | 条件含 `magic == NP_MAGIC` |
+| `gWorker` / `gInjectedMutex` | `np_hook.cpp:2435-2436` | worker 线程句柄 / 防重复注入互斥量 | `NpHookAttach` / `Worker` / `NpHookDetach` | 互斥量在 `Worker` `2638-2644` 创建并持有到进程结束；`NpHookDetach` 里**不能等自己** |
 
 ---
 
@@ -252,7 +257,7 @@
 | 函数名 | 位置 | 作用 | 被谁调用 | 注意 |
 | --- | --- | --- | --- | --- |
 | `Log(fmt, ...)` | `np_hook.cpp:557-610` | 写 `%TEMP%\NextPerfHook.log`，前缀 = 墙钟 + 进程名 + pid + tid | 全文件 | ⚠⚠ 写满 512KB 后**回到文件开头覆盖** → **最新的行在开头，结尾是旧内容**，排查别只看末尾。格式/编码约定见 `docs/LOGGING.md` 第 2 节 |
-| 关键诊断日志（行号） | `1178` render-thread gfx init；`1403` reflex init；`1421` reflex sleep status；`1441` reflex frame；`1475` present diag 5s；`1639` overlay NOT drawn；`1647` overlay drawn；`1668` overlay 5s；`1718` cpu split avg；`2445` RestoreAllHooks；`2621` attach；`2648` probe 计划；`2697` probe attempt；`216-228` **SEH + SEH ctx** | — | 这些是事后定位问题的**唯一证据**，改动相关路径时不要删 | — |
+| 关键诊断日志（行号） | `1189` render-thread gfx init；`1403` reflex init；`1421` reflex sleep status；`1441` reflex frame；`1475` present diag 5s；`1650` overlay NOT drawn；`1658` overlay drawn；`1679` overlay 5s；`1729` cpu split avg；`2456` RestoreAllHooks；`2632` attach；`2659` probe 计划；`2708` probe attempt；`216-228` **SEH + SEH ctx** | — | 这些是事后定位问题的**唯一证据**，改动相关路径时不要删 | — |
 
 ---
 

@@ -1099,7 +1099,14 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdLine, int cmdShow) {
                                 GameEntry g;
                                 g.name = nm;
                                 g.learned = true;
-                                gApp.games.push_back(g);
+                                {
+                                    // ★ 必须加锁：守护线程每 800ms 遍历 gApp.games，
+                                    //   push_back 触发扩容会让它的迭代器变成野指针（会崩）。
+                                    //   ui.cpp 的「添加游戏 exe」为此专门加了 AppLock，
+                                    //   学习这条路径原来漏了（审计发现 G2）。
+                                    AppLock lk;
+                                    gApp.games.push_back(g);
+                                }
                                 SettingsSave();
                                 AppLog("learn: 注入后验证通过（Present 挂上 + 认出 D3D + 帧在流动）"
                                        "-> 把 %ls 记入可信名单（实验性自动钩子见设置）",
@@ -1191,6 +1198,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdLine, int cmdShow) {
                 }
                 bool attached = gApp.telemetry.attached && sLastGrowMs != 0 &&
                                 (now - sLastGrowMs) < 2500;
+                // 供界面等处统一使用（见 np_app.h 里 telemetryLive 的说明）
+                gApp.telemetryLive = attached;
                 bool wantDesktop = !gOverlayOff && gApp.monitoring &&
                                    (gApp.cfg.overlayMode == 2 ||
                                     (!attached && gApp.cfg.overlayMode != 1));

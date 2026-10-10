@@ -25,6 +25,7 @@
 #include "sim.h"
 
 #include <dxgi1_2.h>   // IDXGIFactory1 / IDXGIAdapter1 / IDXGIOutput / DXGI_ADAPTER_DESC1
+#include <shellapi.h>  // CommandLineToArgvW
 #include <cstdio>
 #include <fcntl.h>
 #include <io.h>
@@ -119,9 +120,13 @@ static void ListOutputs() {
 
 // ---------------------------------------------------------------- 主流程
 
-int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
-    // 用 GetCommandLineW + CommandLineToArgvW 而不是 WinMain 的 lpCmdLine：
-    // 后者对引号 / 空格的处理很难预测，而 Python 传带空格的参数是常态。
+int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int) {
+    // 注意这里用的是 WinMain（LPSTR）而不是 wWinMain：
+    //   zig 自带的 mingw crt（crtexewin.c）只定义了 WinMain 入口，
+    //   用 wWinMain 会链接失败（undefined symbol: WinMain）。
+    //   反正参数要重新解析（WinMain 的 lpCmdLine 对引号处理不好），
+    //   所以这个 LPSTR 直接忽略，改用 GetCommandLineW + CommandLineToArgvW：
+    //   Python 传带空格的路径是常态，只有宽字符版本能正确处理。
     int argc = 0;
     LPWSTR* wargv = CommandLineToArgvW(GetCommandLineW(), &argc);
     std::vector<std::string> storage;
@@ -135,6 +140,20 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
     for (auto& s : storage) argv.push_back(const_cast<char*>(s.c_str()));
 
     bool stdin_usable = SetupStdio();
+
+    // --dump-argv：把解析后的原始参数逐条打到 stderr。排查「脚本传参被
+    // Windows / shell 改写」这类问题（引号、空格、编码）非常有用。
+    // 这里直接扫原始 argv，所以即使 SimParseArgs 不认这个参数也能生效。
+    bool dump_argv = false;
+    for (size_t i = 0; i < argv.size(); ++i) {
+        if (strcmp(argv[i], "--dump-argv") == 0) dump_argv = true;
+    }
+    if (dump_argv) {
+        fprintf(stderr, "[sim] argc=%llu\n", (unsigned long long)argv.size());
+        for (size_t i = 0; i < argv.size(); ++i) {
+            fprintf(stderr, "[sim]   argv[%llu] = <%s>\n", (unsigned long long)i, argv[i]);
+        }
+    }
 
     SimConfig cfg = SimParseArgs((int)argv.size(), argv.data());
     if (cfg.error == "__help__") {

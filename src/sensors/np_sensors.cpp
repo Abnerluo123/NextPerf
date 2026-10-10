@@ -398,7 +398,9 @@ void SensorHub::PollGameGpu(uint32_t pid, uint32_t frameDelta, NPSensors& out) {
     {
         double v = 0;
         if (pdh_.SumStarCounter(L"\\GPU Engine(*)\\Utilization Percentage", kw,
-                                L"engtype_compute", &v, nullptr)) {
+                                L"engtype_Compute", &v, nullptr)) {   // ⚠ 大小写敏感！真实实例名是大写 C
+        // （原来写全小写 engtype_compute -> wcsstr 大小写敏感 -> 命中 0 个
+        //   -> 永远显示 compute=-1.0%。子代理实测：engtype_Compute 有 5 个实例）
             out.engCompute = (float)v;
             lastCompute_ = (float)v;
         } else {
@@ -408,7 +410,8 @@ void SensorHub::PollGameGpu(uint32_t pid, uint32_t frameDelta, NPSensors& out) {
         // OFA = 光流加速器，N 卡上 DLSS **帧生成**专用的硬件单元。
         // 它只要在动，就说明帧生成在工作 —— 系统计数器直接给，不用估算。
         if (pdh_.SumStarCounter(L"\\GPU Engine(*)\\Utilization Percentage", kw,
-                                L"engtype_ofa", &v, nullptr)) {
+                                L"engtype_OFA", &v, nullptr)) {       // ⚠ 同上：真实是 OFA 全大写
+        // （原来写 engtype_ofa -> 命中 0 个；实测 engtype_OFA 有 38 个实例）
             out.engOfa = (float)v;
             lastOfa_ = (float)v;
         } else {

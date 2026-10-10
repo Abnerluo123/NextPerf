@@ -1,10 +1,23 @@
 # NextPerf 钩子层（Hook Layer）技术文档
 
+> **行号基准（务必先读）**：本文档全部行号对照的是 **`src/hook/np_hook.cpp` = 2755 行**
+> （`np_draw.cpp` = 610 行、`np_draw.h` = 104 行、`np_reflex.h` = 128 行、`dllmain.cpp` = 26 行、
+> `np_common.h` = 497 行、`np_stats.h` = 269 行）时的版本。
+>
+> ⚠ **`np_hook.cpp` 正在被并行修改中**：本文档编写期间它先是从 2684 行变成 2744 行
+> （新增了「崩溃上下文快照」`gDbg*` + `SEH ctx:` 日志），又变成 2755 行。
+> **行号是全文最易过期的信息** —— 如果你发现某处对不上，**按函数名去搜**，不要去信行号：
+> ```
+> # 例：定位 PresentCommon / BeginList / RestoreAllHooks
+> Select-String -Path src\hook\np_hook.cpp -Pattern '^(HRESULT PresentCommon|ID3D12GraphicsCommandList\* BeginList|static void RestoreAllHooks)'
+> ```
+> 文档里的**函数名、vtable 下标、口径描述、坑**是稳定的；行号只是方便你快速跳过去。
+
 > 适用范围：`src/hook/` 整个目录（注入到游戏进程里的那部分）。
 > 配套文档：[`HOOK-FUNCTIONS.md`](HOOK-FUNCTIONS.md)（函数/接口速查表）、[`CATALOG.md`](CATALOG.md)（全项目文件编目）。
 >
 > **维护约定（硬性）**：任何一次改 `src/hook/` 下的代码，**必须**同步更新本文档与 `docs/CATALOG.md`。
-> 行号、函数名、口径描述一旦和代码不一致，这份文档就会变成负资产 —— 它存在的意义就是让后来者不用重新啃 2600 行注释。
+> 行号、函数名、口径描述一旦和代码不一致，这份文档就会变成负资产 —— 它存在的意义就是让后来者不用重新啃 2700 行注释。
 
 ---
 
@@ -463,25 +476,25 @@ PatchSwapChainVtable → gSwapVtCount>0 → PresentHooked()=true → 后续探�
 
 ### 12.5 `NpECL` 的关键逻辑
 
-- `gUnloading` / `!q` → 直通（`2203`）。
-- **只认 DIRECT 队列**（`2205-2222`）：复制/计算队列拿去做叠加和 GPU 时间戳都是错的，
+- `gUnloading` / `!q` → 直通（`2214`）。
+- **只认 DIRECT 队列**（`2216-2233`）：复制/计算队列拿去做叠加和 GPU 时间戳都是错的，
   而且游戏常常先提交复制队列，先到先得会把 `gQueue12` 记错。
-- **锁定队列时必须 `AddRef`**（`2211-2218`）：引擎在切换全屏/重建交换链/设备丢失恢复时
+- **锁定队列时必须 `AddRef`**（`2222-2229`）：引擎在切换全屏/重建交换链/设备丢失恢复时
   会**销毁并重建命令队列**（有时连设备一起换）。只存裸指针，之后往已销毁的队列上
   `ExecuteCommandLists`/`Signal`：轻则围栏永不推进（`BeginList` 从此一直 allocator busy、
   叠加永久停画），重则在驱动里访问违例把游戏带崩。
-- **只有 `q == gQueue12` 才插桩**（`2224-2234`）：原来只判 `q` 非空，
+- **只有 `q == gQueue12` 才插桩**（`2235-2245`）：原来只判 `q` 非空，
   于是游戏往复制队列提交时，我们会把**自己的 DIRECT 命令列表**丢给复制队列执行 ——
   非法调用，设备 removed，游戏弹 `DXGI_ERROR_INVALID_CALL` 退出。
   自建测试宿主只有一条队列所以测不出来，真实游戏大量用复制队列，症状是「数据出来一秒后闪退」。
-- **「本帧已开始」用 `compare_exchange` 抢**（`2236-2246`）：
+- **「本帧已开始」用 `compare_exchange` 抢**（`2247-2257`）：
   `EndList()` 内部会再调一次 `q->ExecuteCommandLists`，也就是再进一次本函数，
   所以标记必须在 `EndList` **之前**抢到手，再加一道 `thread_local bool busy` 本线程重入锁；
   用「先读后写」会让两个线程同时通过检查、同时 `Reset` 同一条命令列表。
-- **模拟阶段结束只认渲染线程**（`2247-2254`）：后台流式线程随时都在提交；
+- **模拟阶段结束只认渲染线程**（`2258-2265`）：后台流式线程随时都在提交；
   还必须排除 `gInPresent`（我们自己的叠加和时间戳命令列表也是从渲染线程提交的），
   否则算出来的模拟阶段会变成整个帧周期。
-- **逐批 GPU 时间戳夹取已被删除**（`2256-2269`）：曾经给每一次 `ExecuteCommandLists`
+- **逐批 GPU 时间戳夹取已被删除**（`2267-2280`）：曾经给每一次 `ExecuteCommandLists`
   前后各插一条时间戳（2 次 `BeginList`）。真实游戏一帧提交十几到几十批（实测
   "more than 16 batches per frame"），一帧要 32+ 个分配器 —— 环瞬间被掏空，然后
   `BeginList: allocator starved` 刷屏、`overlay NOT drawn`，**叠加永久停画**。
@@ -1126,14 +1139,14 @@ FreeLibraryAndExitThread(gSelf, 0)   // 6. 从宿主进程卸载自己并结束�
 
 | # | 坑 | 位置 |
 | --- | --- | --- |
-| 10 | ★★ **绝不能在 `PresentCommon` 中间提前 `return`**：尾部还有一整套收尾（`gInPresent` / `gFrameStarted` / `gLastPresentQpc` / `gLastInPresentMs`），跳过会让 `gInPresent` 永远为 `true`，之后每帧都直通原函数，**叠加与 GPU 时间戳永久失效**。这个坑踩过**两次**（暂停分支、后台缓冲设备不匹配分支） | `1535-1540`、`1553-1559` |
-| 11 | **`gUnloading` 必须放在 `gTel` 解引用之前**，否则自卸载解除映射后渲染线程晚一步进来就是访问违例 | `1197-1202` |
-| 12 | **CPU 帧时间必须在 Present 返回之后算**：Busy 要用「本帧 Present 开始」、Wait 要用「本帧 Present 返回」，在 Present 之前求和会用到**上一帧**的 Wait（实测面板 `CPU 帧时间 ≠ Busy + Wait`：0.37 vs 0.24+5.95=6.19） | `1378-1385`、`1686-1697` |
-| 13 | **`DXGI_PRESENT_TEST` 不是帧**：不过滤会让帧数虚高、帧时间忽上忽下，窗口计数正好是真实帧率两倍（用户实测显示 120，实际 60） | `1274-1279`、`984-987` |
-| 14 | **超过 1 秒的间隔不是「一帧」**：塞进统计会把 1% Low / 0.1% Low 拖到个位数（「稳定 60fps 却显示 1% Low = 10」） | `1324-1327`、`1702-1703` |
-| 15 | **模拟阶段结束只认渲染线程、且要排除 `gInPresent`**：后台流式线程随时都在提交；我们自己的叠加/时间戳命令列表也是从渲染线程提交的 | `2247-2254` |
-| 16 | `gFrameStarted` 必须**在 `EndList` 之前**用 `compare_exchange` 抢（`EndList` 会再进一次 `NpECL`），否则两个线程会同时 `Reset` 同一条命令列表 | `2236-2246` |
-| 17 | **`GetBuffer(0)` 在 flip 模型下不一定是当前显示的那张**，必须问 `GetCurrentBackBufferIndex()`，否则面板交替闪烁甚至看不见 | `1573-1577` |
+| 10 | ★★ **绝不能在 `PresentCommon` 中间提前 `return`**：尾部还有一整套收尾（`gInPresent` / `gFrameStarted` / `gLastPresentQpc` / `gLastInPresentMs`），跳过会让 `gInPresent` 永远为 `true`，之后每帧都直通原函数，**叠加与 GPU 时间戳永久失效**。这个坑踩过**两次**（暂停分支、后台缓冲设备不匹配分支） | `1552-1557`、`1570-1576` |
+| 11 | **`gUnloading` 必须放在 `gTel` 解引用之前**，否则自卸载解除映射后渲染线程晚一步进来就是访问违例 | `1208-1213` |
+| 12 | **CPU 帧时间必须在 Present 返回之后算**：Busy 要用「本帧 Present 开始」、Wait 要用「本帧 Present 返回」，在 Present 之前求和会用到**上一帧**的 Wait（实测面板 `CPU 帧时间 ≠ Busy + Wait`：0.37 vs 0.24+5.95=6.19） | `1389-1396`、`1697-1708` |
+| 13 | **`DXGI_PRESENT_TEST` 不是帧**：不过滤会让帧数虚高、帧时间忽上忽下，窗口计数正好是真实帧率两倍（用户实测显示 120，实际 60） | `1285-1290`、`984-987` |
+| 14 | **超过 1 秒的间隔不是「一帧」**：塞进统计会把 1% Low / 0.1% Low 拖到个位数（「稳定 60fps 却显示 1% Low = 10」） | `1335-1338`、`1713-1714` |
+| 15 | **模拟阶段结束只认渲染线程、且要排除 `gInPresent`**：后台流式线程随时都在提交；我们自己的叠加/时间戳命令列表也是从渲染线程提交的 | `2258-2265` |
+| 16 | `gFrameStarted` 必须**在 `EndList` 之前**用 `compare_exchange` 抢（`EndList` 会再进一次 `NpECL`），否则两个线程会同时 `Reset` 同一条命令列表 | `2247-2257` |
+| 17 | **`GetBuffer(0)` 在 flip 模型下不一定是当前显示的那张**，必须问 `GetCurrentBackBufferIndex()`，否则面板交替闪烁甚至看不见 | `1584-1588` |
 
 ### 22.3 帧内重复 Present 的合并（本轮核心修复）
 
@@ -1182,16 +1195,16 @@ FreeLibraryAndExitThread(gSelf, 0)   // 6. 从宿主进程卸载自己并结束�
 
 | # | 坑 | 位置 |
 | --- | --- | --- |
-| 46 | ★ **`gQueue12` 必须 `AddRef`**：引擎在全屏切换/重建交换链/设备丢失恢复时会**销毁并重建命令队列**，裸指针之后 `ExecuteCommandLists`/`Signal` 轻则围栏不推进（叠加永久停画），重则驱动里访问违例 | `2211-2218` |
-| 47 | ★ **只给选定的 DIRECT 队列插桩**：原来只判 `q` 非空，于是把**我们自己的 DIRECT 命令列表**丢给游戏的复制队列执行 —— 非法调用、设备 removed、游戏弹 `DXGI_ERROR_INVALID_CALL` 退出。自建宿主只有一条队列所以测不出来 | `2224-2234` |
-| 48 | **只认 DIRECT 队列做时间戳/叠加**，且要先 `GetDesc` 判类型（游戏常常先提交复制队列，先到先得会记错） | `2205-2222` |
-| 49 | **bundle 上 `EndQuery` 是非法操作**，而 bundle 与直连列表**共用同一个 vtable** → 必须用 `GetType()` 过滤 | `2273-2280` |
+| 46 | ★ **`gQueue12` 必须 `AddRef`**：引擎在全屏切换/重建交换链/设备丢失恢复时会**销毁并重建命令队列**，裸指针之后 `ExecuteCommandLists`/`Signal` 轻则围栏不推进（叠加永久停画），重则驱动里访问违例 | `2222-2229` |
+| 47 | ★ **只给选定的 DIRECT 队列插桩**：原来只判 `q` 非空，于是把**我们自己的 DIRECT 命令列表**丢给游戏的复制队列执行 —— 非法调用、设备 removed、游戏弹 `DXGI_ERROR_INVALID_CALL` 退出。自建宿主只有一条队列所以测不出来 | `2235-2245` |
+| 48 | **只认 DIRECT 队列做时间戳/叠加**，且要先 `GetDesc` 判类型（游戏常常先提交复制队列，先到先得会记错） | `2216-2233` |
+| 49 | **bundle 上 `EndQuery` 是非法操作**，而 bundle 与直连列表**共用同一个 vtable** → 必须用 `GetType()` 过滤 | `2284-2291` |
 | 50 | **`Pending` 槽位有限（4 个）**，满了就放弃这一帧的 resolve，不能等 | `824-839` |
 | 51 | **`EndList` 里没拿锁就不要瞎解锁**（`BeginList` 放弃过的情况） | `757-758` |
 | 52 | **`BeginList` 里绝不能 `WaitForSingleObject`**：那是在游戏 Present 的调用栈里睡觉，直接变成游戏卡顿，还会污染我们自己的帧时间统计 | `722-724` |
 | 53 | **分配器环不能太小**（只给 3 或 8 会让 GPU 稍微落后就全部 busy → 叠加永久停画），现在是 32 | `403-406` |
-| 54 | **`gD12Broken` 是「永久停手」语义**：出过不可恢复的错（`Close`/`Reset` 失败、探测撞 SEH、连续 600 次拿不到分配器）就彻底放弃 D3D12 插桩，**帧时间路径继续工作** | `331-334`、`730-734`、`740-753`、`2321-2326`、`2367-2370` |
-| 55 | **`Dispatch` 探针异常后不能补写另一半时间戳**，也必须复位 `gAiSpanOpen`，否则 `HarvestTimestamps` 会把没写过的 `TS_AI_END` 当有效结束点，报出荒唐的 Tensor 占用 | `2361-2371` |
+| 54 | **`gD12Broken` 是「永久停手」语义**：出过不可恢复的错（`Close`/`Reset` 失败、探测撞 SEH、连续 600 次拿不到分配器）就彻底放弃 D3D12 插桩，**帧时间路径继续工作** | `331-334`、`730-734`、`740-753`、`2332-2337`、`2378-2381` |
+| 55 | **`Dispatch` 探针异常后不能补写另一半时间戳**，也必须复位 `gAiSpanOpen`，否则 `HarvestTimestamps` 会把没写过的 `TS_AI_END` 当有效结束点，报出荒唐的 Tensor 占用 | `2372-2382` |
 | 56 | **设备移除检测**：GPU 侧非法操作会导致 device removed，游戏随即自杀式退出；`GetDeviceRemovedReason` 健康时返回 `S_OK`，拿到别的失败码说明设备指针本身可疑，也要记 | `1505-1515` |
 
 ### 22.7 日志与排查
@@ -1203,7 +1216,7 @@ FreeLibraryAndExitThread(gSelf, 0)   // 6. 从宿主进程卸载自己并结束�
 | 59 | 日志上限从 64KB 提到 512KB：`present diag` / `frame dist` 每 5 秒各一条，64KB 只能存几分钟 | `569-571` |
 | 60 | **`recent ft` 连续序列是判断「伪影 vs 真抖动」最直接的手段**：`17 17 17 25 17 17 25` = 真抖动；`17 17 17 3 3 28 28 17` = 帧内多次 Present 的伪影 | `1055-1071` |
 | 61 | **`low compare`（merged vs raw）用来判断帧内合并是否生效或误合并** —— 光看一个数字分不出这两种情况 | `1073-1092` |
-| 62 | **`overlay 5s: drawn/skipped` 用来区分闪烁的两种成因**（没画上 vs 画错缓冲），不分开就无法决定怎么改 | `1651-1674` |
+| 62 | **`overlay 5s: drawn/skipped` 用来区分闪烁的两种成因**（没画上 vs 画错缓冲），不分开就无法决定怎么改 | `1662-1685` |
 | 63 | **`panel logical size` 只在尺寸变化时记** —— 「HUD 宽度随数值一直变化」这个问题靠它客观判定，理想情况整局只出现一次 | `909-922` |
 
 ---
@@ -1241,6 +1254,9 @@ FreeLibraryAndExitThread(gSelf, 0)   // 6. 从宿主进程卸载自己并结束�
 - [ ] 若新增/改动了 `NPTelemetry` / `NPSensors` / `NPConfig` 的**字段**：
       这是跨进程 ABI，必须走「加在末尾或占用 reserved 槽位」的方式，
       `version` 的 `sizeof` 自检要跟着一起验（`np_common.h:182-200`、`305-310`、`441-448`）。
+- [ ] 若要给 `NpSeh` 加新的「崩溃上下文」量：变量必须在 `NpSeh` **之前**声明
+      （用 `volatile` 快照，见 `np_hook.cpp:170-193`），并在 `UpdateTelemetryCommon`
+      开头刷新（`953-959`）。⚠ 只打**确定存在**的量，不确定名字的全局一律不打（宁少勿错）。
 
 ### 23.3 已知缺口（可作为后续迭代的入口）
 
@@ -1248,10 +1264,12 @@ FreeLibraryAndExitThread(gSelf, 0)   // 6. 从宿主进程卸载自己并结束�
 | --- | --- | --- |
 | 没有 `ResizeBuffers` 钩子 | 只能靠 D3D12 换堆 / D3D11 每帧新建 RTV 间接应对 | 见 §11；补上能显著减少「全屏后闪烁」类问题 |
 | `gCs` 死代码、`gCpuStartQpc` 只写不读、`drawSkips_` 只声明不计数 | 未确认是否有意保留 | 清理时注意 `gCs` 的 `DeleteCriticalSection` 也一起去掉 |
-| `InModule()` 已无人使用 | 有意保留为教训备忘（`430-440`） | **不要「顺手删掉」**，注释说明它就是文档 |
+| `gDbgInPresent` 只声明不赋值 | `NpSeh` 的 `SEH ctx:` 里 `inPresent=` 恒为 0 | 注释说明这是「只打确定存在的量」的有意取舍；要真想用，得在 `PresentCommon` 入口/出口同步它 |
+| `NPConfig::reserved` 只有 **4** 个元素，而 `NPDefaultConfig` 却在 `for (i = 0; i < 8; ++i)` 里写 | `np_common.h:200` vs `np_common.h:438` —— **越界写 16 字节** | 写入的是**主程序进程**里的栈结构，不跨进程；修的时候把循环改成 4，或把 `reserved` 扩到 8（后者会改 `sizeof`，必须同验三个进程的 `version` 自检） |
+| `InModule()` 已无人使用 | 有意保留为教训备忘（`472-477`） | **不要「顺手删掉」**，注释说明它就是文档 |
 | `lowWindowed` 口径不再被钩子层调用 | 保留在 `np_stats.h:138-166` 供对照 | 若恢复「Low 帧（严格）」开关，这里是入口 |
 | `gReflexDev` / `nvapi64.dll` 卸载时不释放 | 见 §21.7 | 若释放，必须同时让 Reflex 状态可重置 |
-| `gVpW/gVpH` 是 32 位标量竞态（注释认可「影响可忽略」） | `357` | 若要严谨可换成 `std::atomic<uint32_t>` |
+| `gVpW/gVpH` 是 32 位标量竞态（注释认可「影响可忽略」） | `394` | 若要严谨可换成 `std::atomic<uint32_t>` |
 
 ---
 
@@ -1259,18 +1277,18 @@ FreeLibraryAndExitThread(gSelf, 0)   // 6. 从宿主进程卸载自己并结束�
 
 | 接口 | 成员 | 下标 | 补丁函数 | 原函数全局 | 还原点 |
 | --- | --- | --- | --- | --- | --- |
-| `IDXGISwapChain` | `Present` | 8 | `NpPresent` | `gSwapVts[i].origPresent` | `RestoreAllHooks` `2420` |
-| `IDXGISwapChain1` | `Present1` | 22 | `NpPresent1` | `gSwapVts[i].origPresent1` | `2421` |
-| `IDXGIFactory` | `CreateSwapChain` | 10 | `NpCreateSwapChain` | `gOrigCreateSC` | `2425` |
-| `IDXGIFactory2` | `CreateSwapChainForHwnd` | 15 | `NpCreateSwapChainHwnd` | `gOrigCreateSCHwnd` | `2428` |
-| `IDXGIFactory2` | `CreateSwapChainForComposition` | 24 | `NpCreateSwapChainComp` | `gOrigCreateSCComp` | `2431` |
-| `ID3D12CommandQueue` | `ExecuteCommandLists` | 10 | `NpECL` | `gOrigECL` | `2435` |
-| `ID3D12GraphicsCommandList4` | `DispatchRays` | 76 | `NpDispatchRays` | `gOrigDR` | `2438` |
-| `ID3D12GraphicsCommandList4` | `BuildRaytracingAccelerationStructure` | 72 | `NpBuildAS` | `gOrigBAS` | `2440` |
-| `ID3D12GraphicsCommandList` | `Dispatch` | 14 | `NpDispatch` | `gOrigDispatch` | `2442` |
-| `ID3D12GraphicsCommandList` | `DrawInstanced` | 12 | `NpDrawInst` | `gOrigDrawInst` | `2444` |
-| `ID3D12GraphicsCommandList` | `DrawIndexedInstanced` | 13 | `NpDrawIdx` | `gOrigDrawIdx` | `2446` |
-| `ID3D12GraphicsCommandList` | `RSSetViewports` | 21 | `NpSetViewports` | `gOrigVP` | `2447` |
+| `IDXGISwapChain` | `Present` | 8 | `NpPresent` | `gSwapVts[i].origPresent` | `RestoreAllHooks` `2465` |
+| `IDXGISwapChain1` | `Present1` | 22 | `NpPresent1` | `gSwapVts[i].origPresent1` | `2466` |
+| `IDXGIFactory` | `CreateSwapChain` | 10 | `NpCreateSwapChain` | `gOrigCreateSC` | `2470` |
+| `IDXGIFactory2` | `CreateSwapChainForHwnd` | 15 | `NpCreateSwapChainHwnd` | `gOrigCreateSCHwnd` | `2473` |
+| `IDXGIFactory2` | `CreateSwapChainForComposition` | 24 | `NpCreateSwapChainComp` | `gOrigCreateSCComp` | `2476` |
+| `ID3D12CommandQueue` | `ExecuteCommandLists` | 10 | `NpECL` | `gOrigECL` | `2480` |
+| `ID3D12GraphicsCommandList4` | `DispatchRays` | 76 | `NpDispatchRays` | `gOrigDR` | `2483` |
+| `ID3D12GraphicsCommandList4` | `BuildRaytracingAccelerationStructure` | 72 | `NpBuildAS` | `gOrigBAS` | `2485` |
+| `ID3D12GraphicsCommandList` | `Dispatch` | 14 | `NpDispatch` | `gOrigDispatch` | `2487` |
+| `ID3D12GraphicsCommandList` | `DrawInstanced` | 12 | `NpDrawInst` | `gOrigDrawInst` | `2489` |
+| `ID3D12GraphicsCommandList` | `DrawIndexedInstanced` | 13 | `NpDrawIdx` | `gOrigDrawIdx` | `2491` |
+| `ID3D12GraphicsCommandList` | `RSSetViewports` | 21 | `NpSetViewports` | `gOrigVP` | `2492` |
 
 > 仅**读取**、不做补丁的下标：`SwapChain::GetBuffer(9)`、`GetFullscreenState(11)`、`GetDesc(12)`、
 > `GetHwnd(20)`、`GetCurrentBackBufferIndex(36)`；`CommandQueue::Signal(14)`、
@@ -1285,9 +1303,10 @@ FreeLibraryAndExitThread(gSelf, 0)   // 6. 从宿主进程卸载自己并结束�
 | `TS_BATCH_BASE` / `TS_BATCH_PAIRS` | 0 / 16 | 槽 0..31：逐批夹取 —— **当前已不使用**（§12.5） |
 | `TS_RT_BASE` / `TS_RT_PAIRS` | 32 / 8 | 槽 32..47：`DispatchRays` 每对夹一次 |
 | `TS_AI_START` / `TS_AI_END` | 48 / 49 | AI/后处理 compute 区间 |
-| `NP_ALLOC_RING` | 32 | 命令分配器环（`np_hook.cpp:370`） |
-| `gPending[4]` | 4 | readback 延迟收割槽（`np_hook.cpp:384`） |
-| `gTs11[3]` | 3 | D3D11 三缓冲轮转（`np_hook.cpp:393`） |
-| `NP_MAX_SWAPVT` | 4 | 交换链 vtable 小表容量（`np_hook.cpp:250`） |
+| `NP_ALLOC_RING` | 32 | 命令分配器环（`np_hook.cpp:407`） |
+| `gPending[4]` | 4 | readback 延迟收割槽（`np_hook.cpp:421`） |
+| `gTs11[3]` | 3 | D3D11 三缓冲轮转（`np_hook.cpp:430`） |
+| `NP_MAX_SWAPVT` | 4 | 交换链 vtable 小表容量（`np_hook.cpp:287`） |
+| `gDbg*` 崩溃上下文 | 8 | `volatile` 快照，给 `NpSeh` 打 `SEH ctx:` 用（`np_hook.cpp:186-193`） |
 | `rtvSlots_[8]` | 8 | D3D12 每后台缓冲一个 RTV 槽（`np_draw.h:85`） |
 | `pending_[16]` | 16 | D3D12 fence 延迟回收队列（`np_draw.h:100`） |

@@ -11,12 +11,18 @@
 
 | 文件 | 行数（LF） | sha256[:16] |
 | --- | --- | --- |
-| `np_common.h` | 497 | `AF8B9CC54D2A0FAE` |
+| `np_common.h` | 506 | `BBB2B37B53A0287D` |
 | `np_stats.h` | 269 | `3D35E2CC4A23F2A3` |
 | `np_panel.h` / `np_panel.cpp` | 130 / 545 | `BC18551444D18B75` / `78B50DEDF7467A5E` |
 | `np_build.h` / `np_build.cpp` | 13 / 473 | `F9A86AAF9FE2D8D0` / `4575FE184FEAF4E6` |
 | `np_json.h` | 218 | `FEA2F85281501ADA` |
 | `np_bitmap.h` / `np_bitmap.cpp` | 52 / 102 | `EF1EFD398865C713` / `F9B16F379B7A94F3` |
+
+> ⚠ **`np_common.h` 正在被并行修改。** 本文写作期间它被修复过一次
+> （`NPDefaultConfig()` 的 `reserved[]` 越界写，见 §2.5）：行数 497 → 506，
+> 哈希 `AF8B9CC5…` → `BBB2B37B…`；同时给容量宏补了 `u` 后缀
+> （`4096u` / `512u` / `128u` / `24u` / `8u` / `256u`，**值不变**）。
+> 上表是**修复后**的版本。若你读到本文时哈希不符，请以源码为准并回来更新本文。
 
 > 行数注：部分 Windows 工具（`Get-Content | Measure-Object -Line`）会把 **LF-only 文件
 > 的空行吃掉**，报出 344 之类的偏小数字。本文用的是 LF 换行符计数，与 `read`/`grep`
@@ -31,7 +37,7 @@
 | `Local\NextPerf_Config_v1` | `NPConfig` | **136** | 主程序 `CreateShm()` | 主程序（`AppPublish()` 每 tick memcpy 整个结构体） | 钩子 `Cfg()`；主程序自身（UI/叠加/`np_build`） | 勾选了哪些计数器、颜色、缩放、位置、刷新率、行为开关 |
 | `Local\NextPerf_Sensors_v1` | `NPSensors` | **448** | 主程序 `CreateShm()` | 主程序 `SensorHub::Poll()` → `AppPublish()` | 钩子 `Sens()`；主程序自身 | CPU/GPU/显存/内存/NVAPI 域/硬件 RT·Tensor 快照 |
 | `Local\NextPerf_Telemetry_v1_<pid>` | `NPTelemetry` | **55736** | **钩子进程自己** | 该进程的钩子 | 主程序（`AppState::telSlots`，按 pid 分别打开） | 帧时间环形缓冲、帧延迟、RT/Tensor、分辨率、AI 模块、诊断 |
-| `Local\NextPerf_Injected_<pid>` | （无数据） | — | 钩子（命名互斥量） | 钩子 | 主程序 `InjectorScanNow()`、`tests/diag.py` | 「这个进程真的载入了钩子」的证据 |
+| `Local\NextPerf_Injected_<pid>` | （无数据） | — | 钩子：`CreateMutexW(nullptr, TRUE, name)`，**持有到进程结束** | 钩子 | 主程序 `IsInjected()`（`OpenMutexW(SYNCHRONIZE, ...)`）、`tests/diag.py`、`tests/verify_inject.py`（钩子自卸载后这个互斥量会消失，用它当卸载证据） | 「这个进程真的载入了钩子」的证据（**不是**"注入成功"，注入成功但 DLL 早期 return 就不会有这个互斥量） |
 | `Local\NextPerf_SensorsMutex_v1` | （无数据） | — | — | — | — | ⚠ `NP_MUTEX_SENSORS` **全项目没有任何使用点**（只有 `np_common.h` 里的定义），是历史遗留 |
 
 设计要点：
@@ -177,7 +183,7 @@ inline void NPTelemetryShmName(uint32_t pid, wchar_t* out, size_t n);
 | `pauseHook` | uint32 | **不设置**（=0） | `1` = 主程序停止监视，钩子跳过叠加绘制与遥测更新（= 停止读游戏数据），只留最小心跳 | `main.cpp` `AppPublish()` **每 tick** 同步 `monitoring` 状态 | 钩子 `PresentCommon` | ❌ **绝不能持久化** |
 | `learnedAutoHook` | uint32 | **不设置**（=0） | 「学习来的条目」要不要自动注入。**手动添加的条目不受此开关影响，一直自动注入** | `ui.cpp` 循环控件「实验性自动注入」 | `injector.cpp` 扫描时 `if (g.learned && !cfg.learnedAutoHook) continue;` | ✅ `learnedAutoHook` |
 | `detachPid` | uint32 | **不设置**（=0） | 非 0 且 **等于钩子自己的 pid** → 钩子干净自卸载（还原 vtable 补丁 + 注销 VEH） | `injector.cpp` `RequestHookDetach()`；用完由注入器清零（约 2.5 秒后无条件清零） | 钩子守卫线程 | ❌ **绝不能持久化** |
-| `reserved[4]` | uint32×4 | 0 | 预留槽位。**加字段必须从这里挪**（保持 sizeof 不变） | `NPClearConfig()`（⚠ 见 §2.5） | 无人 | ❌ |
+| `reserved[4]` | uint32×4 | 0 | 预留槽位。**加字段必须从这里挪**（保持 sizeof 不变） | `NPDefaultConfig()`（用 `sizeof(reserved)/sizeof(reserved[0])` 推导，见 §2.5） | 无人 | ❌ |
 
 ### 2.3 从 `reserved[]` 挪出来的四个字段（历史与规则）
 
@@ -225,32 +231,53 @@ inline void NPTelemetryShmName(uint32_t pid, wchar_t* out, size_t n);
 `learnedAutoHook` 曾经读和写都没有 → 用户勾选后重启就丢；
 `bgColor` 曾经只有写没有读 → 用户改了背景色重启就丢。**加配置项必须同时加「存」和「取」。**
 
-### 2.5 ⚠ 已知缺陷：`NPClearConfig()` 越界写 16 字节
+### 2.5 ✅ 曾经的缺陷：`NPDefaultConfig()` 越界写 16 字节（**已修复**）
+
+**修复前的代码**（历史，别再写回去）：
 
 ```c
-// src/common/np_common.h，NPDefaultConfig() 结尾
-for (int i = 0; i < 8; ++i) c->reserved[i] = 0;   // ← reserved 现在只有 [4]！
+for (int i = 0; i < 8; ++i) c->reserved[i] = 0;   // ← reserved 已经只剩 [4] 了！
 ```
 
-`reserved` 已经从 `[8]` 缩到 `[4]`，但这个循环**没跟着改**，于是每次调用都会
-**往 `NPConfig` 之后多写 16 个字节的 0**。影响面（都是真实调用点）：
+`reserved` 从 `[8]` 被逐步缩到 `[4]`（槽位被 `autoInject` / `pauseHook` /
+`learnedAutoHook` / `detachPid` 用掉），但这个循环**没跟着改**，
+于是每次调用都会**往 `NPConfig` 之后多写 16 个字节的 0**。影响面（都是真实调用点）：
 
 | 调用点 | 对象 | 后果 |
 | --- | --- | --- |
-| 钩子 `Cfg()` | `NPConfig c{}` **栈上局部变量**（每帧都会调一次） | 每次都在栈上越界写 16 字节零。目前"没出事"是因为紧随其后的栈槽恰好没被用到/被重复初始化 —— 这属于**运气**，不是安全 |
-| `settings.cpp` `SettingsLoad()` | `&gApp.cfg`（`AppState` 的第一个成员） | 越界 16 字节正好落进 `AppState::sensors` 的头部（`magic`/`version`/`tickMs` 低 8 字节），随后被 `Poll()` 整体覆盖 → 无感，但属于 UB |
+| 钩子 `Cfg()` | `NPConfig c{}` **栈上局部变量**（每帧都会调一次） | 每次都在栈上越界写 16 字节零 —— 真实的栈越界写，只是"紧随其后的栈槽恰好还没被用到" |
+| `settings.cpp` `SettingsLoad()` | `&gApp.cfg`（`AppState` 的第一个成员） | 越界 16 字节正好落进 `AppState::sensors` 的头部（`magic` + `version` + `tickMs`，共 16 字节）→ 主程序发布的 `Sensors` 块 `magic = 0`，**被钩子直接忽略**（不崩，但传感器全丢） |
 | `ui.cpp`「恢复默认设置」 | `&gApp.cfg` | 同上 |
 | `main.cpp` 自检 | `&gApp.cfg` | 同上 |
 
-**正确修法**：`for (int i = 0; i < 4; ++i)` —— 或者干脆删掉这个循环，
-改为在函数开头 `*c = NPConfig{};`（但注意 `NPDefaultConfig` **故意不初始化**
-`autoInject`/`pauseHook`/`learnedAutoHook`/`detachPid`，见 §2.2；改成整体清空会改变
-「恢复默认设置」的行为）。
+**现在的写法**（`np_common.h`，已修复）：
 
-**另一个相关的小行为**：`ui.cpp` 的「恢复默认设置」调 `NPDefaultConfig(&gApp.cfg)`，
+```c
+// ★ 必须**跟着数组实际大小**清，不能写死数字。
+//   这里曾经是 `for (int i = 0; i < 8; ++i)`，而 reserved 已被逐步缩小到 [4] …
+//   由审计（子代理通读 np_common.h）发现。写成 sizeof 推导，以后改大小不会再犯。
+for (size_t i = 0; i < sizeof(c->reserved) / sizeof(c->reserved[0]); ++i) {
+    c->reserved[i] = 0;
+}
+```
+
+**教训（比 bug 本身重要）**：凡是"清空/初始化某个数组"的循环，
+**一律用 `sizeof(arr) / sizeof(arr[0])` 推导，不要写死数字** ——
+结构体的字段会被后来的迭代者搬来搬去（这个 `reserved` 就被搬过 5 次），
+写死的上限不会跟着变，而且这类越界**不一定崩**，只是悄悄把邻居清零。
+
+**另一个相关的小行为（仍在）**：`ui.cpp` 的「恢复默认设置」调 `NPDefaultConfig(&gApp.cfg)`，
 但该函数不碰 `autoInject` / `pauseHook` / `learnedAutoHook` / `detachPid`，
 所以**「恢复默认」不会把 `learnedAutoHook` 复位成 0**。这算 bug 还是 feature 未确认
 （用户没有明确要求），但要知道。
+
+**注释里的预告**：修复后的注释提到槽位曾被
+`autoInject / lowStrict / pauseHook / learnedAutoHook / detachPid` 使用 ——
+其中 **`lowStrict` 这个字段当前并不存在**（`NPConfig` 里没有它）。
+这多半是"Low 帧（严格）"开关的预留名（钩子注释里提到过这个开关）。
+**真要加它**：从 `reserved[]` 挪一个槽位（现在只剩 4 个）→ 同步 `NPClearConfig` →
+`ui.cpp` 加控件 → `settings.cpp` 加存/取 → 同步 `tests/verify_inject.py`（若涉及遥测）、
+`tests/diag.py` 的 `CFG_FIELDS` → 更新本文与 `COMMON.md` → 跑 `tests/struct_check.py`。
 
 ---
 
@@ -402,10 +429,13 @@ for (int i = 0; i < 8; ++i) c->reserved[i] = 0;   // ← reserved 现在只有 [
 > 上表由 ctypes 按平台 ABI 复现同一字段序列实测得到（`sizeof = 55736`，53 个字段），
 > 与 C++ 侧 `NPClearTelemetry()` 写入 `version` 的值必须一致。
 
-> 一个坑：这个结构体**不能按「每帧 memcpy 一份」的方式来用**（钩子写 / 主程序读，
-> 没有锁），主程序读的是「某一瞬间的快照」，本来就可能撕裂。实践中的处理是
-> **只信任 `tickMs` / `frameTotal` 这类标量**，曲线用主程序自己的 `NPHistory` 重采样。
-> 主程序 `PickTelemetry()` 会把整块**拷贝**成 `gApp.telemetry` 再用。
+> 一个坑：钩子写 / 主程序读之间**没有锁**。主程序 `PickTelemetry()` 的做法是把整块
+> **拷贝**成 `gApp.telemetry` 再用（`gApp.telemetry = *best->view;`）——
+> 这个拷贝本身不是原子的，理论上可能撕裂。实践上能接受，是因为
+> **面板只读标量字段**（fps / 帧时间 / 分辨率…），而**曲线完全走主程序自己的 `NPHistory`**；
+> 即便某一帧的某个 float 被撕裂，也只是瞬间一个小抖动，不会累积。
+> ⚠ **不要把这个块当成"无锁的逐帧数组"来用** —— 那三个 4096 的数组在读取时
+> 没有任何"一定完整"的保证。
 
 ### 4.2 逐字段表
 
@@ -436,8 +466,8 @@ for (int i = 0; i < 8; ++i) c->reserved[i] = 0;   // ← reserved 现在只有 [
 | `fpsLow01` | float | **0.1% Low（FPS）**，`lowPercentileFps(99.9, lowWin)` | 同上 | 面板「0.1% Low」行 | 活跃 |
 | `frameMs` | float | **最近一帧的原始帧生成时间** ms（未平滑）。参与统计、合并判定、图表 | `PresentCommon` | `UpdateTelemetryCommon()`（喂 `gStats`、算 EMA、算 `rtLoad` 分母）、`np_build` 兜底显示 | 活跃 |
 | `frameMsAvg` | float | 平滑后的帧时间（`np::Ema(0.10f)`）。**面板显示用这个** | `UpdateTelemetryCommon()` | `np_build.cpp`「帧时间」行（`frameMsAvg > 0.0001 ? frameMsAvg : frameMs`） | 活跃 |
-| `cpuFrameMs` | float | CPU 帧时间 = **`CPUBusy + CPUWait`**（PresentMon 口径）= 帧周期。⚠ 必须扣掉卡在 `Present` 里的等待，否则锁 60 时恒等于 16.66ms —— 那是帧周期，不是 CPU 的活 | `PresentCommon` 尾部（`busyMs + waitMs`）；首帧兜底 `= frameMs` | `NPHistoryPush` 之外的兜底显示；`np_build` 在平滑值未建立时兜底 | 活跃（但**面板优先用 `cpuBusyAvg + cpuWaitAvg`**，见 `cpuBusyAvg`） |
-| `cpuFrameMsAvg` | float | 平滑后的 CPU 帧时间（EMA） | `PresentCommon` | `NPHistoryPush`（钩子侧图表用它，避免锯齿） | 活跃 |
+| `cpuFrameMs` | float | CPU 帧时间 = **`CPUBusy + CPUWait`**（PresentMon 口径）= 帧周期。⚠ 必须扣掉卡在 `Present` 里的等待，否则锁 60 时恒等于 16.66ms —— 那是帧周期，不是 CPU 的活 | `PresentCommon` 尾部（`busyMs + waitMs`）；首帧兜底 `= frameMs` | 主程序 `NPHistoryPush`（桌面曲线的 `latCpu`）；`np_build` 在平滑值还没建立时兜底 | 活跃（但**面板优先用 `cpuBusyAvg + cpuWaitAvg`**，见 `cpuBusyAvg`） |
+| `cpuFrameMsAvg` | float | 平滑后的 CPU 帧时间（EMA） | `PresentCommon` | 钩子侧 `NPHistoryPush`（游戏内曲线的 `latCpu`，用平滑值避免锯齿看着像剧烈波动） | 活跃 |
 | `simMs` | float | **模拟阶段** ms：上一帧 `Present` 返回 → 本帧渲染线程第一次提交命令（游戏自己的逻辑/物理/动画/剔除）。有 Reflex 时会被游戏自报的权威值覆盖 | `PresentCommon`（启发式）/ Reflex 分支 | **无人读**（面板不再用它算 CPU 帧时间） | 写-无读（保留供对照） |
 | `submitMs` | float | **渲染提交** ms：第一次提交 → 调 `Present`（录制命令列表 + 提交，**本质上是在排队**，用户明确说不该算进 CPU 帧） | 同上 | 无人读 | 写-无读（保留供对照） |
 | `gpuFrameMs` | float | GPU 帧时间 ms | **不再是钩子自己推算的**：逐批时间戳夹取方案已整个拆除（它给每次 `ExecuteCommandLists` 插时间戳，真实游戏一帧十几到几十批 → allocator starved + 叠加永久停画）。现在在 `UpdateTelemetryCommon()` 里**从 `Sens().gpuBusyMs`（系统 PDH）回填** | `np_build.cpp`「GPU 帧时间」的兜底（要求 `> 0.01f` 才显示）；`NPHistoryPush`；图表环形缓冲 | 活跃，但**依赖 PDH**：读不到 PDH 时**恒为 0**（面板会显示 `—`，历史事故：所有以它为源的曲线是一条零线） |
@@ -478,7 +508,7 @@ for (int i = 0; i < 8; ++i) c->reserved[i] = 0;   // ← reserved 现在只有 [
 | 分类 | 字段 | 现况 / 想用起来该看哪里 |
 | --- | --- | --- |
 | 方案被拆除 | `gpuFrameMs` 的**自主推算** | 逐批 GPU 时间戳夹取已删；现在只是 PDH `gpuBusyMs` 的镜像。**要恢复自主测量，别重做逐批插时间戳**（会把 allocator 拖死） |
-| 写-无读（在结构体里占 ~50KB） | `frames[4096]`、`cpuFrames[4096]`、`gpuFrames[4096]`、`graphFrame/Cpu/Gpu[512]`、`graphWrite`、`graphCount` | 图表实际走 `NPHistory`（每 125ms 一个采样点、256 点）。这三个大数组是**每帧**精度，只适合离线导出/事后分析 |
+| 写-无读（在结构体里占 55296 字节 ≈ 54KB） | `frames[4096]`、`cpuFrames[4096]`、`gpuFrames[4096]`、`graphFrame/Cpu/Gpu[512]`、`graphWrite`、`graphCount` | 图表实际走 `NPHistory`（每 125ms 一个采样点、256 点）。这三个大数组是**每帧**精度，只适合离线导出/事后分析 |
 | 写-无读（小字段） | `p99Ms`、`p999Ms`、`simMs`、`submitMs`、`asBuilds`、`frameWrite` | 面板不显示；诊断日志自己调 `FrameStats` |
 | 只在特定条件下写 | `cpuFrames`/`gpuFrames`/`frameMs`（仅当合并判定通过、且间隔在 0.02~1000ms 之间）、`simMs`/`submitMs`（仅当渲染线程 + 时间戳有效）、`hookFlags` 的 `TIMESTAMP`（仅当查询堆就绪） | 读方必须**先判有效性**（`> 0.01f`、`!= 0`），不要直接当有效值显示 —— 「注入没成功时面板出现假的 0.00 ms」就是这么来的 |
 
@@ -586,8 +616,8 @@ struct GameEntry {
 | 15 | `NP_C_GPU_FB` | 显存带宽 | ✗ 默认关 | 需要 `domFb >= 0`（NVIDIA NVAPI 域） |
 | 16 | `NP_C_GPU_VID` | 视频引擎 | ✗ 默认关 | 需要 `domVid >= 0` |
 | 17 | `NP_C_GPU_BUS` | PCIe 总线 | ✗ 默认关 | 需要 `domBus >= 0` |
-| 18 | `NP_C_RT` | RT Core | ✅ | 硬件接口 → 实测 → 「启用 N 次」→「无 DXR」四档 |
-| 19 | `NP_C_TENSOR` | Tensor | ✅ | 硬件接口 → 实测 → 「AI 已启用 · 估算中」三档 |
+| 18 | `NP_C_RT` | RT Core | ✅ | **五档**：硬件接口 → 实测 → 「启用 N 次」→「无 DXR」→「需注入」 |
+| 19 | `NP_C_TENSOR` | Tensor | ✅ | **五档**：硬件接口 → 实测 → 「AI 已启用 · 估算中」→「无 AI」→「需注入」 |
 | 20 | `NP_C_RESOLUTION` | 分辨率（系统组） | ✅ | 需要 `hooked && t.renderW`；与输出不同时显示 `→ 输出 (缩放%)` |
 | 21 | `NP_C_API` | API | ✅ | `D3D11/D3D12/Vulkan/OpenGL/D3D9/未接入` + 窗口模式 |
 | 22 | `NP_C_DRAWS` | Draw/Disp | ✗ 默认关 | 需要 `hooked` |
@@ -730,8 +760,9 @@ unit == 1（百分比）→ 再夹到 [0, 100]，且保证 yMax - yMin >= 1
    的读取方**：当前只在主程序日志或传感器内部诊断里出现，**面板/UI 不展示**。
    是否有其他分支读取未逐一确认（grep 全仓库未见）。
 3. **`autoInject` 的最终归宿**：`AppAutoInjectTick()` 已被清空（故意），
-   但字段、JSON 键、`NP_ALL_COUNTERS` 之外的一切都还在。是保留占位还是彻底删掉，
-   需要决策 —— 删它会影响 `settings.cpp` 与该字段占的 `reserved[0]` 槽位。
+   但字段、JSON 键、`settings.cpp` 的读写全都还在（UI 里**没有**它的开关 ——
+   界面上那个「实验性自动注入」对应的是 `learnedAutoHook`）。是保留占位还是彻底删掉，
+   需要决策 —— 删它会影响 `settings.cpp`，并释放它占的 `reserved[0]` 槽位。
 4. **`NP_MUTEX_SENSORS`**：确认全项目无使用点，但**为什么**当初设计它（Config/Sensors
    是单向单写，本来不需要锁）没有记录 —— 可能是为将来多写方预留。
 5. **`opacity` / `textColor` / `accentColor` / `warnColor` / `fpsCap` / `pollMs`
@@ -740,3 +771,9 @@ unit == 1（百分比）→ 再夹到 [0, 100]，且保证 yMax - yMin >= 1
    删字段会改变 `sizeof(NPConfig)` → 按 §9 第 7 条处理；不删则要接受"配置里有几个假开关"。
 6. **`np_hook.cpp` 的行号**：本文只引用函数名，不引用该文件行号 ——
    它正在被频繁修改，行号不稳定。`src/common/` 的行号引用取自本文校准版本（见开头哈希）。
+7. **本文写作期间 `np_common.h` 被并行修改过**（497 → 506 行，修掉了 §2.5 的越界写；
+   容量宏补了 `u` 后缀）。**任何时刻若开头那张哈希表与源码不符，先重新通读
+   `np_common.h` 再相信本文的字段表** —— 尤其"字段列表/顺序/默认值"这三样。
+8. **`lowStrict`**：修复后的注释里出现了这个字段名，但 `NPConfig` 里**当前没有它**
+   （见 §2.5 末尾的加字段清单）。如果它被加进来，本文所有与 `reserved[]`、
+   `sizeof(NPConfig)`、JSON 键、`tests/diag.py::CFG_FIELDS` 相关的段落都要同步更新。

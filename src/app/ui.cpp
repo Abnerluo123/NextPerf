@@ -628,7 +628,9 @@ static void DrawGameList(HDC mem, int gameTop) {
         if (ge.pid) {
             const NPTelemetry& t = gApp.telemetry;
             bool mine = (gApp.telemetryPid == ge.pid);
-            bool live = t.attached && mine && (GetTickCount64() - t.tickMs) < 2500;
+            // ★ 不要在这里比较 tickMs（跨进程时钟，会算出垃圾值）。
+            //   主循环已按「帧计数是否增长」算好并存在 telemetryLive 里（审计发现 G3）。
+            bool live = t.attached && mine && gApp.telemetryLive;
             if (live) st = L"● 读取中";
             else if (ge.injected) {
                 // 注入成功但拿不到帧：把 API 摆出来，Vulkan/OpenGL 是设计边界

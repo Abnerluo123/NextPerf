@@ -435,7 +435,16 @@ inline void NPDefaultConfig(NPConfig* c) {
     c->vtableProbe = 1;
     c->quit = 0;
     c->simulate = 0;
-    for (int i = 0; i < 8; ++i) c->reserved[i] = 0;
+    // ★ 必须**跟着数组实际大小**清，不能写死数字。
+    //   这里曾经是 `for (int i = 0; i < 8; ++i)`，而 reserved 已被逐步
+    //   缩小到 [4]（为 autoInject / lowStrict / pauseHook / learnedAutoHook /
+    //   detachPid 腾槽位），于是**越界写 16 字节**：sizeof(NPConfig)=136 且尾部
+    //   无填充，AppState 里紧邻的 sensors.magic/version/tickMs 被静默清零
+    //   （不崩，但发布的 Sensors 变成 magic=0 被钩子忽略）。
+    //   由审计（子代理通读 np_common.h）发现。写成 sizeof 推导，以后改大小不会再犯。
+    for (size_t i = 0; i < sizeof(c->reserved) / sizeof(c->reserved[0]); ++i) {
+        c->reserved[i] = 0;
+    }
 }
 
 inline void NPClearSensors(NPSensors* s) {

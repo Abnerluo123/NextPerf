@@ -54,6 +54,12 @@ struct AppState {
     NPSensors     sensors{};
     NPTelemetry   telemetry{};
     NPHistory     hist{};          // 桌面叠加的图表历史（占用率等）
+    // 「钩子是否真的在接管」—— 由主循环（120ms tick）算好一次存这里。
+    // 判据是**帧计数 2.5 秒内是否增长**，绝不是跨进程比较 tickMs：
+    // 那个时间戳由游戏里的钩子写，主程序拿自己的时钟去减会算出 -31 /
+    // 42 亿毫秒这种垃圾值（曾导致「桌面 HUD 永不关闭」）。
+    // 放这里是为了避免每个用到的地方各写一遍时钟逻辑（ui.cpp 就漏改过一次）。
+    bool          telemetryLive = false;
     np::SensorHub hub;
 
     bool monitoring = false;     // 监控开关

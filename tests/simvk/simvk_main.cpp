@@ -40,10 +40,12 @@
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
+#include <cctype>
 #include <cmath>
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <functional>
 
 // ============================================================================
 // 0. 小工具：QPC 计时 / 线程安全输出 / 字符串
@@ -184,8 +186,8 @@ static std::string W2U(const std::wstring& w) { return W2U(w.c_str()); }
 static const uint32_t kVertSpv[] = {
     0x07230203, 0x00010000, 0x00000000, 45, 0x00000000,   // 魔数/版本1.0/生成器/bound/保留
 
-    NP_SPV_OP(17, 1), 1,                                  // OpCapability Shader
-    NP_SPV_OP(14, 2), 0, 1,                               // OpMemoryModel Logical GLSL450
+    NP_SPV_OP(17, 2), 1,                                  // OpCapability Shader
+    NP_SPV_OP(14, 3), 0, 1,                               // OpMemoryModel Logical GLSL450
     // OpEntryPoint Vertex %main "main" %inPos %inColor %vColor %gl_Position
     NP_SPV_OP(15, 9), 0, 23, 0x6E69616D, 0x00000000, 18, 19, 20, 21,
     NP_SPV_OP(3, 3), 2, 450,                              // OpSource GLSL 450
@@ -261,8 +263,8 @@ static const uint32_t kVertSpv[] = {
 static const uint32_t kFragSpv[] = {
     0x07230203, 0x00010000, 0x00000000, 15, 0x00000000,
 
-    NP_SPV_OP(17, 1), 1,                                  // OpCapability Shader
-    NP_SPV_OP(14, 2), 0, 1,                               // OpMemoryModel Logical GLSL450
+    NP_SPV_OP(17, 2), 1,                                  // OpCapability Shader
+    NP_SPV_OP(14, 3), 0, 1,                               // OpMemoryModel Logical GLSL450
     // OpEntryPoint Fragment %main "main" %vColor %outColor
     NP_SPV_OP(15, 7), 4, 11, 0x6E69616D, 0x00000000, 9, 10,
     NP_SPV_OP(16, 3), 11, 7,                              // OpExecutionMode %main OriginUpperLeft
@@ -465,6 +467,8 @@ struct LayerInfo {
     uint32_t    implVersion = 0;
     bool        implicit = false;
     bool        fromRegistry = false;
+    bool        disabled = false;      // 注册表值数据为 1（显式禁用）
+    bool        manifestRead = false;  // 清单 JSON 读得出来
     std::string manifestPath;
     std::string libraryPath;      // 清单里的 library_path（相对路径已按清单目录拼成绝对）
     bool        libraryExists = false;
@@ -480,7 +484,48 @@ static std::string VersionStr(uint32_t v) {
     return b;
 }
 
-// 极简 JSON 取值：找 "key" 后第一个字符串。够用即可（清单是我们自己控制的格式）。
+// 极简 JSON 取值：找 "key" 后第一个字符串。够用即可（清单格式是我们已知的）。
+// 注意必须做转义还原：清单里写的是 "library_path": ".\\xxx.dll"，
+// JSON 文本里是两个反斜杠字符，还原后才是真的单反斜杠路径。
+// （不还原的话拼出来的路径会变成 "C:\dir\\xxx.dll" —— Windows 能容忍，
+//   但输出很难看，而且拿去做字符串比较就会对不上。）
+static void JsonUnescape(std::string* s) {
+    std::string o;
+    o.reserve(s->size());
+    for (size_t i = 0; i < s->size(); ++i) {
+        if ((*s)[i] == '\\' && i + 1 < s->size()) {
+            char c = (*s)[++i];
+            switch (c) {
+                case 'n': o += '\n'; break;
+                case 't': o += '\t'; break;
+                case 'r': o += '\r'; break;
+                case 'b': o += '\b'; break;
+                case 'f': o += '\f'; break;
+                case 'u': {                       // \uXXXX：只处理 ASCII 范围
+                    if (i + 4 < s->size()) {
+                        unsigned cp = 0;
+                        bool ok = true;
+                        for (int k = 1; k <= 4; ++k) {
+                            char h = (*s)[i + k];
+                            unsigned d;
+                            if (h >= '0' && h <= '9') d = (unsigned)(h - '0');
+                            else if (h >= 'a' && h <= 'f') d = (unsigned)(h - 'a' + 10);
+                            else if (h >= 'A' && h <= 'F') d = (unsigned)(h - 'A' + 10);
+                            else { ok = false; break; }
+                            cp = cp * 16 + d;
+                        }
+                        if (ok) { i += 4; if (cp < 0x80) o += (char)cp; else o += '?'; }
+                        else o += c;
+                    } else o += c;
+                    break;
+                }
+                default: o += c; break;           // \\ \" \/ 等都归到"去掉反斜杠"
+            }
+        } else o += (*s)[i];
+    }
+    *s = o;
+}
+
 static bool JsonFindString(const std::string& text, const char* key, std::string* out) {
     std::string pat = std::string("\"") + key + "\"";
     size_t p = text.find(pat);
@@ -492,6 +537,7 @@ static bool JsonFindString(const std::string& text, const char* key, std::string
     size_t e = text.find('"', p + 1);
     if (e == std::string::npos) return false;
     *out = text.substr(p + 1, e - p - 1);
+    JsonUnescape(out);
     return true;
 }
 
@@ -550,66 +596,82 @@ static bool FileExistsW(const std::wstring& p) {
 }
 
 // 读一个注册表清单键，把 {层名 -> 清单路径} 收进来
+// 注册表里的一条层记录。
+//
+// ★ 关于注册表布局，这里有一个**极易搞错**的点，值得单独写清楚：
+//   HKLM\SOFTWARE\Khronos\Vulkan\ImplicitLayers 的存储形式是
+//       值名 (value NAME)  = 清单 JSON 的完整路径
+//       值数据(value DATA) = REG_DWORD，0 = 启用，1 = 禁用
+//   也就是说**路径在值名里，不在数据里**。
+//   （第一版就是按"数据是路径"写的，结果注册了 4 个隐式层的机器上
+//     一个都没解析出来，全被当成显式层 —— 这个 bug 值得留个记录。）
+struct RegistryLayer {
+    std::string name;          // 清单里的 "name"
+    std::string manifestPath;  // 清单 JSON 路径（= 注册表值名）
+    std::string description;
+    std::string libraryPath;   // 拼成绝对路径后的层 DLL
+    bool        implicit = false;
+    bool        is64 = true;
+    bool        disabled = false;    // 值数据为 1
+    bool        manifestRead = false;// 清单能不能读出来
+    std::vector<std::string> disableEnv;
+    std::vector<std::string> enableEnv;
+};
+
 static void ReadLayerKey(HKEY root, const wchar_t* subkey, bool implicitWanted,
-                         bool is64View,
-                         std::vector<std::pair<std::string, std::string>>* nameToManifest) {
+                         bool is64View, int* counter,
+                         std::vector<RegistryLayer>* out) {
     HKEY k = nullptr;
     REGSAM sam = KEY_READ | (is64View ? KEY_WOW64_64KEY : KEY_WOW64_32KEY);
     if (::RegOpenKeyExW(root, subkey, 0, sam, &k) != ERROR_SUCCESS) return;
 
     for (DWORD i = 0;; ++i) {
-        wchar_t valName[1024];
-        DWORD   valLen = 1024;
+        wchar_t valName[2048];
+        DWORD   valLen = 2048;         // 单位是"字符数"，含结尾的 0
         DWORD   type = 0;
-        BYTE    data[2048];
+        BYTE    data[16];
         DWORD   dataLen = sizeof(data);
         LONG r = ::RegEnumValueW(k, i, valName, &valLen, nullptr, &type, data, &dataLen);
-        if (r == ERROR_NO_MORE_ITEMS || r != ERROR_SUCCESS) break;
-        if (type != REG_SZ && type != REG_EXPAND_SZ) continue;
+        if (r != ERROR_SUCCESS) break;   // ERROR_NO_MORE_ITEMS 也走这里
 
-        std::wstring manifest((const wchar_t*)data);
-        std::string  manifestU = W2U(manifest);
+        RegistryLayer rl;
+        rl.implicit = implicitWanted;
+        rl.is64     = is64View;
+        // 值数据是 DWORD：1 = 该层被禁用
+        if (type == REG_DWORD && dataLen >= sizeof(DWORD))
+            rl.disabled = (*(const DWORD*)data) != 0;
+        rl.manifestPath = W2U(valName);
+        if (rl.manifestPath.empty()) continue;
 
+        std::wstring wmanifest(valName);
         std::string text;
-        if (!ReadWholeFileW(manifest, &text)) continue;
-
-        std::string nm, desc, lib;
-        if (!JsonFindString(text, "name", &nm)) continue;
-        JsonFindString(text, "description", &desc);
-        JsonFindString(text, "library_path", &lib);
-
-        nameToManifest->push_back({nm, manifestU});
-
-        // 把清单的附加信息挂到 LayerInfo 上，等会儿按名字合并
-        // （这里用一个小技巧：直接把附加信息编码进 manifest 字符串后面，
-        //   避免再定义一个并行结构体。见下方拆分。）
-        std::string& slot = nameToManifest->back().second;
-        slot += "\x01" + desc + "\x01" + lib + "\x01" + (implicitWanted ? "1" : "0") +
-                "\x01" + (is64View ? "1" : "0");
-
-        std::vector<std::string> dk, ek;
-        JsonFindObjectKeys(text, "disable_environment", &dk);
-        JsonFindObjectKeys(text, "enable_environment", &ek);
-        std::string enc;
-        for (auto& s : dk) enc += s + ",";
-        enc += "\x01";
-        for (auto& s : ek) enc += s + ",";
-        slot += "\x01" + enc;
+        if (ReadWholeFileW(wmanifest, &text)) {
+            rl.manifestRead = true;
+            JsonFindString(text, "name", &rl.name);
+            JsonFindString(text, "description", &rl.description);
+            std::string lib;
+            JsonFindString(text, "library_path", &lib);
+            if (!lib.empty()) {
+                // library_path 通常是 ".\\xxx.dll"，相对清单所在目录
+                std::wstring wlib(lib.begin(), lib.end());
+                size_t slash = wmanifest.find_last_of(L"\\/");
+                std::wstring dir = (slash == std::wstring::npos) ? L"" : wmanifest.substr(0, slash + 1);
+                if (wlib.size() >= 2 && wlib[0] == L'.' && (wlib[1] == L'\\' || wlib[1] == L'/'))
+                    wlib = dir + wlib.substr(2);
+                rl.libraryPath = W2U(wlib);
+            }
+            JsonFindObjectKeys(text, "disable_environment", &rl.disableEnv);
+            JsonFindObjectKeys(text, "enable_environment", &rl.enableEnv);
+        }
+        if (rl.name.empty()) {
+            // 清单读不出来（或没有 name 字段）时，至少用文件名占位，
+            // 这样统计项数和"有 N 个注册项"能对上，不会凭空少几条。
+            rl.name = "(清单无法解析) " + rl.manifestPath;
+        }
+        out->push_back(rl);
+        ++(*counter);
     }
     ::RegCloseKey(k);
-}
-
-// 把 manifest 字段拆成若干段（用 \x01 分隔），见 ReadLayerKey 里的写入
-static std::vector<std::string> Split1(const std::string& s) {
-    std::vector<std::string> out;
-    size_t start = 0;
-    for (;;) {
-        size_t p = s.find('\x01', start);
-        if (p == std::string::npos) { out.push_back(s.substr(start)); break; }
-        out.push_back(s.substr(start, p - start));
-        start = p + 1;
-    }
-    return out;
 }
 
 struct LayerRegistryStats {
@@ -644,7 +706,7 @@ static std::vector<LayerInfo> CollectLayers(VkApi& api, LayerRegistryStats* stat
     // (2) 注册表：谁在 ImplicitLayers / ExplicitLayers 里
     struct KeySpec { HKEY root; const wchar_t* sub; bool implicit; bool is64; int* counter;
                      const char* label; };
-    std::vector<std::pair<std::string, std::string>> found;   // name -> packed manifest
+    std::vector<RegistryLayer> found;
 
     KeySpec keys[] = {
         { HKEY_LOCAL_MACHINE, L"SOFTWARE\\Khronos\\Vulkan\\ImplicitLayers", true,  true,  &stats->hklm64Implicit, "HKLM\\...\\ImplicitLayers (64位视图)" },
@@ -656,64 +718,57 @@ static std::vector<LayerInfo> CollectLayers(VkApi& api, LayerRegistryStats* stat
     };
 
     for (auto& k : keys) {
-        size_t before = found.size();
-        ReadLayerKey(k.root, k.sub, k.implicit, k.is64, &found);
-        *k.counter = (int)(found.size() - before);
+        ReadLayerKey(k.root, k.sub, k.implicit, k.is64, k.counter, &found);
         char line[512];
-        sprintf(line, "%-56s : %d 项", k.label, *k.counter);
+        sprintf(line, "%-54s : %d 项", k.label, *k.counter);
         registryNotes->push_back(line);
     }
 
-    // (3) 合并
-    for (auto& f : found) {
-        std::vector<std::string> parts = Split1(f.second);
-        if (parts.size() < 6) continue;
-        std::string name = parts[0], manifest = parts[1], desc = parts[2], lib = parts[3];
-        bool impl = (parts[4] == "1");
-        bool is64 = (parts[5] == "1");
-        std::string denv = parts[6], eenv = parts[7];
+    // (3) 合并：注册表里的每条记录，按层名并进 loader 报的名单
+    for (auto& rl : found) {
+        LayerInfo* hit = nullptr;
+        for (auto& li : out) if (li.name == rl.name) { hit = &li; break; }
 
-        bool matched = false;
-        for (auto& li : out) {
-            if (li.name == name) {
-                li.implicit = impl; li.fromRegistry = true;
-                li.manifestPath = manifest;
-                li.libraryIs64 = is64;
-                if (li.description.empty()) li.description = desc;
-                // library_path 是相对清单目录的（".\\xxx.dll"），要拼成绝对路径
-                if (!lib.empty()) {
-                    std::wstring wlib(lib.begin(), lib.end());
-                    std::wstring wman(manifest.begin(), manifest.end());
-                    size_t slash = wman.find_last_of(L"\\/");
-                    std::wstring dir = (slash == std::wstring::npos) ? L"" : wman.substr(0, slash + 1);
-                    if (wlib.size() >= 2 && wlib[0] == L'.' && (wlib[1] == L'\\' || wlib[1] == L'/'))
-                        wlib = dir + wlib.substr(2);
-                    li.libraryPath = W2U(wlib);
-                    li.libraryExists = FileExistsW(wlib);
+        if (hit) {
+            hit->fromRegistry = true;
+            // 同一个层名可能在 64 位和 32 位视图里各注册一次（同名不同 DLL）。
+            // 只要有一次是隐式，就按隐式算 —— 那意味着它会被自动加载。
+            if (rl.implicit) hit->implicit = true;
+            if (hit->manifestPath.empty()) {
+                hit->manifestPath  = rl.manifestPath;
+                hit->libraryPath   = rl.libraryPath;
+                hit->libraryIs64   = rl.is64;
+                hit->disabled      = rl.disabled;
+                hit->manifestRead  = rl.manifestRead;
+                hit->disableEnv    = rl.disableEnv;
+                hit->enableEnv     = rl.enableEnv;
+                if (!rl.libraryPath.empty()) {
+                    std::wstring w(rl.libraryPath.begin(), rl.libraryPath.end());
+                    hit->libraryExists = FileExistsW(w);
                 }
-                auto splitComma = [](const std::string& s, std::vector<std::string>* v) {
-                    size_t st = 0;
-                    for (;;) {
-                        size_t p = s.find(',', st);
-                        if (p == std::string::npos) { if (st < s.size()) v->push_back(s.substr(st)); break; }
-                        if (p > st) v->push_back(s.substr(st, p - st));
-                        st = p + 1;
-                    }
-                };
-                splitComma(denv, &li.disableEnv);
-                splitComma(eenv, &li.enableEnv);
-                matched = true;
-                break;
             }
-        }
-        if (!matched) {
-            // 注册表里有、但 vkEnumerateInstanceLayerProperties 没报 —— 说明清单
-            // 坏了（JSON 解析失败 / DLL 路径无效 / 版本不兼容），loader 把它丢了。
-            // 这正是最值得暴露的情况：你以为层装好了，其实 loader 根本没认。
+        } else {
+            // 注册表里有、但 vkEnumerateInstanceLayerProperties 没报 —— 说明 loader
+            // 没认这个清单（JSON 格式错 / DLL 路径无效 / api_version 不兼容）。
+            // 这正是最值得暴露的情况：以为层装好了，其实 loader 根本没加载它。
             LayerInfo li;
-            li.name = name; li.description = desc + "（注册表有，但 loader 未列出 —— 清单可能损坏）";
-            li.implicit = impl; li.fromRegistry = true; li.manifestPath = manifest;
-            li.libraryIs64 = is64;
+            li.name         = rl.name;
+            li.description  = rl.description.empty()
+                              ? "（注册表已注册，但 loader 未列出 —— 清单可能损坏）"
+                              : rl.description + "（注册表已注册，但 loader 未列出 —— 清单可能损坏）";
+            li.implicit     = rl.implicit;
+            li.fromRegistry = true;
+            li.manifestPath = rl.manifestPath;
+            li.libraryPath  = rl.libraryPath;
+            li.libraryIs64  = rl.is64;
+            li.disabled     = rl.disabled;
+            li.manifestRead = rl.manifestRead;
+            li.disableEnv   = rl.disableEnv;
+            li.enableEnv    = rl.enableEnv;
+            if (!rl.libraryPath.empty()) {
+                std::wstring w(rl.libraryPath.begin(), rl.libraryPath.end());
+                li.libraryExists = FileExistsW(w);
+            }
             out.push_back(li);
         }
     }
@@ -749,17 +804,21 @@ static int DoListLayers(VkApi& api) {
     printf("\n");
 
     auto printOne = [](const LayerInfo& li) {
-        printf("  %s\n", li.name.c_str());
+        printf("  %s%s\n", li.name.c_str(), li.disabled ? "   [注册表标记为禁用]" : "");
         printf("      描述      : %s\n", li.description.c_str());
         printf("      规范版本  : %s (%u)   实现版本: %u\n",
                VersionStr(li.specVersion).c_str(), li.specVersion, li.implVersion);
-        if (!li.manifestPath.empty()) {
-            printf("      清单      : %s\n", li.manifestPath.c_str());
+        if (li.fromRegistry) {
+            printf("      清单      : %s%s\n", li.manifestPath.c_str(),
+                   li.manifestRead ? "" : "   [读取失败]");
             printf("      架构视图  : %s\n", li.libraryIs64 ? "64 位" : "32 位 (WOW6432Node)");
+        } else {
+            printf("      注册表    : 未在 ImplicitLayers/ExplicitLayers 中找到"
+                   "（可能由 loader 内建或其他机制提供）\n");
         }
         if (!li.libraryPath.empty()) {
             printf("      层 DLL    : %s  [%s]\n", li.libraryPath.c_str(),
-                   li.libraryExists ? "存在" : "缺失 —— 该层会加载失败");
+                   li.libraryExists ? "存在" : "缺失 → 该层会加载失败");
         }
         for (auto& d : li.disableEnv) printf("      禁用变量  : %s=1\n", d.c_str());
         for (auto& e : li.enableEnv)  printf("      启用变量  : %s=1\n", e.c_str());
@@ -812,7 +871,6 @@ static HWND  g_hwnd = nullptr;
 static bool  g_quit = false;
 static volatile LONG g_pendingW = 0, g_pendingH = 0;   // WM_SIZE 攒下来的新尺寸
 static bool  g_modeChangedDisplay = false;             // 是否改过显示模式（退出必须还原）
-static UINT  g_taskbarCreated = 0;
 
 static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
@@ -838,7 +896,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             if ((wp & 0xFFF0) == SC_KEYMENU) return 0;
             break;
     }
-    return ::DefWindowProcW(h, wp, lp);
+    return ::DefWindowProcW(h, msg, wp, lp);
 }
 
 // 还原显示模式。任何退出路径都必须走到这里 —— 用了 CDS_FULLSCREEN 改了
@@ -1062,6 +1120,11 @@ struct Renderer {
     VkPresentModeKHR presentMode = VK_PRESENT_MODE_FIFO_KHR;
     std::vector<VkPresentModeKHR> presentModes;
 
+    // resize 命令在无边框/全屏模式下没法改窗口大小（窗口占满显示器），
+    // 只能改交换链图像尺寸。非 0 时优先用它，而不是 surface 报的 currentExtent。
+    // Vulkan 允许交换链尺寸 != currentExtent，present 引擎会做拉伸。
+    VkExtent2D requestedExtent{ 0, 0 };
+
     std::string deviceName;
     uint32_t    apiVersion = 0, driverVersion = 0, vendorID = 0;
 
@@ -1091,6 +1154,7 @@ static const char* kInstanceExts[] = { "VK_KHR_surface", "VK_KHR_win32_surface" 
 static const char* kDeviceExts[]   = { "VK_KHR_swapchain" };
 
 bool Renderer::CreateInstanceAndDevice(const Options& o, bool /*vsync*/) {
+    (void)o;   // 目前不需要从参数里取东西，保留签名是为了以后加 --api-version 之类的开关
     if (!api.LoadDll()) {
         Info("[致命] 无法加载 vulkan-1.dll。本机没有 Vulkan 运行时。");
         return false;
@@ -1288,13 +1352,27 @@ bool Renderer::CreateSwapchain(uint32_t w, uint32_t h, bool vsync, VkSwapchainKH
     colorSpace = pick.colorSpace;
 
     // 尺寸：currentExtent == 0xFFFFFFFF 表示 surface 自己决定（Wayland 之类的场景），
-    // Windows 上一般会给出真实客户区大小，我们就用它，并由调用方保证 w/h 已经同步过。
+    // Windows 上一般会给出真实客户区大小，我们就用它。
+    // 例外：resize 命令显式要求了尺寸（requestedExtent），此时优先用它并夹到合法区间。
     VkExtent2D ext{};
-    if (caps.currentExtent.width != 0xFFFFFFFFu) {
+    auto clampExtent = [&](uint32_t w, uint32_t h) -> VkExtent2D {
+        VkExtent2D e{};
+        e.width  = w < caps.minImageExtent.width  ? caps.minImageExtent.width
+                 : (w > caps.maxImageExtent.width  ? caps.maxImageExtent.width  : w);
+        e.height = h < caps.minImageExtent.height ? caps.minImageExtent.height
+                 : (h > caps.maxImageExtent.height ? caps.maxImageExtent.height : h);
+        return e;
+    };
+    if (requestedExtent.width && requestedExtent.height) {
+        VkExtent2D c = clampExtent(requestedExtent.width, requestedExtent.height);
+        if (c.width != requestedExtent.width || c.height != requestedExtent.height)
+            Info("[交换链] 请求尺寸 %ux%u 超出可支持范围，夹到 %ux%u",
+                 requestedExtent.width, requestedExtent.height, c.width, c.height);
+        ext = c;
+    } else if (caps.currentExtent.width != 0xFFFFFFFFu) {
         ext = caps.currentExtent;
     } else {
-        ext.width  = w < caps.minImageExtent.width  ? caps.minImageExtent.width  : (w > caps.maxImageExtent.width  ? caps.maxImageExtent.width  : w);
-        ext.height = h < caps.minImageExtent.height ? caps.minImageExtent.height : (h > caps.maxImageExtent.height ? caps.maxImageExtent.height : h);
+        ext = clampExtent(w, h);
     }
     if (ext.width == 0 || ext.height == 0) {
         // 最小化时 currentExtent 可能是 0，此时不该建交换链
@@ -2049,7 +2127,7 @@ struct Emitter {
         }
         layerJson += "]";
 
-        char buf[2048];
+        char buf[4096];
         sprintf(buf,
             "{\"type\":\"summary\",\"stop_reason\":\"%s\",\"frames\":%u,\"seconds\":%.3f,"
             "\"avg_fps\":%.2f,\"avg_frame_ms\":%.3f,"
@@ -2110,6 +2188,13 @@ static int RunSim(const Options& o, const std::vector<LayerInfo>& layers) {
     // 为了让「帧刚开始就被最小化」这种情况不至于空转烧 CPU
     Info("[运行] 开始渲染。stdin 可用命令: resize W H | mode ... | vsync on|off | fpscap N | quit");
 
+    // stdin 必须在**独立线程**上读：渲染循环不能阻塞在 ReadFile 上。
+    // 命令通过 g_cmdQueue 交给渲染线程执行 —— 所有 Vulkan 调用都留在主线程，
+    // 避免多线程访问 device 带来的同步问题。
+    HANDLE stdinThread = ::CreateThread(nullptr, 0, StdinThread, nullptr, 0, nullptr);
+    if (!stdinThread) Info("[警告] 无法创建 stdin 线程，运行时命令不可用（GetLastError=%lu）", ::GetLastError());
+    else Info("[运行] stdin 命令线程已启动");
+
     while (!g_quit) {
         // ---- 消息泵（必须每帧来一次，否则窗口会「无响应」）
         MSG msg;
@@ -2143,8 +2228,8 @@ static int RunSim(const Options& o, const std::vector<LayerInfo>& layers) {
                             Info("[stdin] resize → 窗口客户区 %ux%u", c.a, c.b);
                         } else {
                             // 无边框/全屏模式下窗口占满显示器，只改交换链图像尺寸（会被拉伸）
-                            R.extent.width  = c.a;
-                            R.extent.height = c.b;
+                            R.requestedExtent.width  = c.a;
+                            R.requestedExtent.height = c.b;
                             wantRecreate = true;
                             Info("[stdin] resize → 仅交换链图像 %ux%u（窗口仍占满显示器，会拉伸）", c.a, c.b);
                         }
@@ -2204,6 +2289,9 @@ static int RunSim(const Options& o, const std::vector<LayerInfo>& layers) {
             if (R.CreateSwapchain(cw, ch, opt.vsync, VK_NULL_HANDLE)) {
                 ++swapRecreatedCount;
                 swapRecreatedThisFrame = true;
+                // requestedExtent 是「一次性」请求：这次重建用完就清掉，
+                // 免得后面 WM_SIZE 或切 vsync 触发的重建还沿用旧的目标尺寸。
+                R.requestedExtent.width = R.requestedExtent.height = 0;
                 prevFrameStart = QpcMs();
             } else {
                 Info("[交换链] 重建失败，稍后重试");
@@ -2233,7 +2321,13 @@ static int RunSim(const Options& o, const std::vector<LayerInfo>& layers) {
 
         // 2) 这个槽位已经空闲 —— 现在可以安全读它的 GPU 时间戳了。
         //    读到的是 (frameId - kFramesInFlight) 那一帧的数据。
-        double gpuMs = R.ReadGpuMs(slot);
+        //
+        //    ⚠ 必须用 pending[slot].valid 做闸门：查询池刚创建时里面的查询
+        //    从未被执行过，此时带 VK_QUERY_RESULT_WAIT_BIT 调用
+        //    vkGetQueryPoolResults 可能永远等不到结果（挂死）。
+        //    只有在「这个槽位确实提交过一帧」之后才去读。
+        double gpuMs = -1.0;
+        if (R.pending[slot].valid) gpuMs = R.ReadGpuMs(slot);
         {
             FrameRecord& done = R.pending[slot];
             if (done.valid) {
@@ -2358,19 +2452,15 @@ static int RunSim(const Options& o, const std::vector<LayerInfo>& layers) {
             stats.presentMs.push_back(presentMs);
         }
 
-        // 10) 窗口标题上滚动显示帧号 —— 肉眼确认「真的在出帧」的最快方式
+        // 10) 窗口标题上滚动显示帧号 —— 肉眼确认「真的在出帧」的最快方式，
+        //     也是给人工测试者看的：帧号不动就说明卡住了。
         if ((frameId % 30) == 0) {
             double elapsed = (QpcMs() - wallStart) / 1000.0;
             double fps = elapsed > 0 ? (double)frameId / elapsed : 0.0;
-            wchar_t t[256];
-            swprintf(t, 256, L"NextPerf simvk — %s | %ux%u %s | %.1f FPS | frame %u",
-                     R.deviceName.empty() ? L"?" : L"Vulkan", R.extent.width, R.extent.height,
-                     PresentModeName(R.presentMode) ? (opt.vsync ? L"vsync" : L"novsync") : L"",
-                     fps, frameId);
-            // swprintf 的 %s 在宽字符版里要的是宽串，上面那些是窄串，单独拼一次
             char nb[256];
-            sprintf(nb, "NextPerf simvk | %ux%u %s | %.1f FPS | frame %u",
-                    R.extent.width, R.extent.height, PresentModeName(R.presentMode), fps, frameId);
+            sprintf(nb, "NextPerf simvk | %s | %ux%u %s | %.1f FPS | frame %u",
+                    R.deviceName.c_str(), R.extent.width, R.extent.height,
+                    PresentModeName(R.presentMode), fps, frameId);
             std::wstring wt(nb, nb + strlen(nb));
             ::SetWindowTextW(g_hwnd, wt.c_str());
         }
@@ -2394,7 +2484,7 @@ static int RunSim(const Options& o, const std::vector<LayerInfo>& layers) {
         R.api.vkDeviceWaitIdle(R.device);
         for (uint32_t s = 0; s < kFramesInFlight; ++s) {
             FrameRecord& done = R.pending[s];
-            if (!done.valid) continue;
+            if (!done.valid) continue;    // 没提交过就绝不能去读（见主循环里的说明）
             done.gpuMs = R.ReadGpuMs(s);
             if (o.json) Emitter::EmitFrame(done, kFramesInFlight);
             if (done.gpuMs >= 0 && stats.gpuMs.size() < Stats::CAP) stats.gpuMs.push_back(done.gpuMs);
