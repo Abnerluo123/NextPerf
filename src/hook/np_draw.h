@@ -58,6 +58,8 @@ public:
     ID3D12Fence* fence() const { return fence_; }
     UINT64*      fenceValuePtr() { return &fenceValue_; }
     void         OnFrameCompleted();  // 回收上传缓冲
+    // 诊断用：描述符堆被换过几次（交换链重建 / 全屏转换会触发）
+    int          HeapSwaps() const { return rtvHeapSwaps_; }
 
 private:
     bool EnsurePso(ID3D12Device* dev, DXGI_FORMAT rtvFormat);
@@ -78,6 +80,11 @@ private:
     struct RtvSlot { ID3D12Resource* res; int slot; };
     RtvSlot rtvSlots_[8]{};
     int     rtvSlotsN_ = 0;
+    // 描述符堆被换掉过几次（交换链重建 = 全屏转换 / ResizeBuffers 会导致）。
+    // 每次换堆都要把旧堆 Retire 掉，用来诊断「全屏后闪烁/消失」这类问题。
+    int     rtvHeapSwaps_ = 0;
+    // 绘制被跳过的帧数（供诊断：闪烁是不是因为我们没画上去）
+    int     drawSkips_ = 0;
     UINT rtvHeapSize_ = 0;
     int  texW_ = 0, texH_ = 0;
 

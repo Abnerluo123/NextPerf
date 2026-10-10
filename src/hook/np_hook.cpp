@@ -1508,6 +1508,31 @@ HRESULT PresentCommon(IDXGISwapChain* sc, UINT sync, UINT flags,
         }
     }
 
+    // ---- 叠加绘制统计（诊断「全屏后闪烁」）
+    //
+    // 闪烁有两种完全不同的成因，必须先分清是哪种才能改：
+    //   A) 我们**没画上去**（某些帧 drawnOk=false）-> 画面交替有/无 = 闪烁
+    //   B) 我们**每帧都画了**，但画到的那张后台缓冲不是最终呈现的 ->
+    //      面板内容在几张缓冲之间跳 = 闪烁
+    // 这条统计用 drawn / skipped 的比例直接区分 A 与 B。
+    // 另外把 D3D12 描述符堆的换堆次数也带上：换堆次数暴涨说明游戏在频繁
+    // 重建交换链（全屏转换、ResizeBuffers），那正是闪烁/消失的高发场景。
+    if (wantOverlay) {
+        static uint32_t sOvDrawn = 0, sOvSkip = 0;
+        static uint64_t sOvStatMs = 0;
+        if (drawnOk) ++sOvDrawn;
+        else if (stateOk) ++sOvSkip;
+        uint64_t tstat = GetTickCount64();
+        if (sOvStatMs == 0) sOvStatMs = tstat;
+        if (tstat - sOvStatMs >= 5000) {
+            Log("overlay 5s: drawn=%u skipped=%u heapSwaps=%d (skipped 多 => 成因A 没画上；"
+                "drawn 正常但画面闪 => 成因B 画错缓冲)",
+                sOvDrawn, sOvSkip, gOv12.HeapSwaps());
+            sOvDrawn = sOvSkip = 0;
+            sOvStatMs = tstat;
+        }
+    }
+
     gJmpArmed = false;
 
     // 原始 Present 的耗时（`Present(1,0)` 会阻塞到垂直消隐）。

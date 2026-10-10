@@ -516,11 +516,29 @@ bool Overlay12::Record(ID3D12Device* dev, ID3D12GraphicsCommandList* list,
     //     命令全部已完成（OnFrameCompleted 每帧回收），此时覆盖是安全的。
     //     不满足就这一帧先不画，下一帧再试 —— 宁可不画，也不画错。
     if (slot < 0 && rtvSlotsN_ >= 8) {
-        if (pendingN_ != 0) return false;
-        // 注：这里本想打一条日志说明重置了几次，但 Log 在本编译单元的命名空间里
-        // 声明不上（定义在 np_hook.cpp 的另一个命名空间），链接会失败。
-        // 重置本身的行为不需要日志也能验证（重置后叠加层会恢复绘制）。
+        // ★ 换一个**全新的描述符堆**，旧堆交给 Retire() 延迟释放。
+        //
+        // 为什么必须换堆而不是覆盖旧槽位：
+        //   GPU 是**执行时**才去读描述符堆的，而读它的是**游戏自己的命令列表**
+        //   （我们只是往那个列表里录了 OMSetRenderTargets）。所以"没有在途命令列表"
+        //   这件事我们根本无法判断 —— pending_ 只跟踪我们自己的上传缓冲。
+        //   之前用 pendingN_ == 0 做判据是**不够的**，会覆盖正在被读的描述符，
+        //   表现就是偶发闪退 + 闪烁。
+        //   换堆则绕开了整个问题：旧堆原封不动留给还在执行的那几帧用，
+        //   由 Retire -> OnFrameCompleted 在 fence 确认后才 Release。
+        //
+        // 顺带这也是正确的资源管理：旧堆里的描述符引用着**已经作废的旧后台缓冲**，
+        // 只有把堆放掉才能真正释放它们（否则游戏的 ResizeBuffers 会失败 = 闪退）。
+        ID3D12DescriptorHeap* fresh = nullptr;
+        D3D12_DESCRIPTOR_HEAP_DESC rh2{};
+        rh2.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+        rh2.NumDescriptors = 8;
+        if (FAILED(dev->CreateDescriptorHeap(&rh2, IID_PPV_ARGS(&fresh))) || !fresh)
+            return false;              // 建不出来就这一帧不画，别硬来
+        Retire(rtvHeap_);              // 接管旧堆所有权，fence 后才 Release
+        rtvHeap_ = fresh;
         rtvSlotsN_ = 0;
+        ++rtvHeapSwaps_;
     }
 
     if (slot < 0) {
