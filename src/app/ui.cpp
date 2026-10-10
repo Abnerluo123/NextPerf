@@ -59,6 +59,8 @@ static const CounterDef kGCpu[] = {
     {NP_C_CPU_CLOCK, L"CPU 频率"},
     {NP_C_CPU_POWER, L"CPU 功耗"},
     {NP_C_CPU_FRAME, L"CPU 帧时间"},
+    {NP_C_CPU_BUSY, L"CPU Busy（高级）"},
+    {NP_C_CPU_WAIT, L"CPU Wait（高级）"},
 };
 static const CounterDef kGGpu[] = {
     {NP_C_GPU_NAME, L"显卡型号"},

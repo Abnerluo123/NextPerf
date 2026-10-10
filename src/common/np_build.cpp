@@ -287,12 +287,17 @@ void BuildPanelData(PanelData& out, const NPConfig& c, const NPSensors& s, const
         float busyRef = t.cpuBusyAvg > 0.0001f ? t.cpuBusyAvg : t.cpuBusyMs;
         bool lowLatency = (t.hookFlags & NP_HOOK_REFLEX) != 0 || busyRef > 2.0f;
         if (active && lowLatency) acc.pending.back().hint = L" 低延迟";
+    }
 
-        // ---- CPU Busy / CPU Wait（PresentMon 口径的两个半边，二者之和 = 帧周期）
-        // 颜色与 CPU 其他参数一致（PL_CPU）；各挂一条折线图。
+    // ---- CPU Busy / CPU Wait 两个半边（PresentMon 口径，二者之和 = 帧周期）
+    // **默认不显示**（用户要求：保留但默认关），而且它们之和已经作为「CPU 帧时间」
+    // 显示出来了，所以只在用户主动勾选时才单独列出。颜色与 CPU 其他参数一致（PL_CPU）。
+    if (c.counters & NP_C_CPU_BUSY) {
         acc.row(L"CPU Busy", active && t.cpuBusyAvg > 0.0001f ? Msv(t.cpuBusyAvg) : L"—",
                 PL_CPU);
         if (showCharts && (c.counters & NP_C_CHART_LATENCY)) attach(acc.pending.back(), h->latBusy, 0);
+    }
+    if (c.counters & NP_C_CPU_WAIT) {
         acc.row(L"CPU Wait", active && t.cpuWaitAvg > 0.0001f ? Msv(t.cpuWaitAvg) : L"—",
                 PL_CPU);
         if (showCharts && (c.counters & NP_C_CHART_LATENCY)) attach(acc.pending.back(), h->latWait, 0);

@@ -90,6 +90,10 @@ enum NP_COUNTER : uint64_t {
     NP_C_CHART_LATENCY= 1ull << 30,  // 图表：帧生成 / CPU / GPU 延迟曲线
     NP_C_CPU_CLOCK    = 1ull << 31,  // CPU 当前频率（CallNtPowerInformation）
     NP_C_CPU_POWER    = 1ull << 32,  // CPU 包功耗（EMI / HWiNFO）
+    // CPU Busy / CPU Wait 两个半边。**故意不加进 NP_ALL_COUNTERS**，
+    // 所以默认不显示（用户要求：保留但默认关）。想看得去界面上勾。
+    NP_C_CPU_BUSY     = 1ull << 33,
+    NP_C_CPU_WAIT     = 1ull << 34,
 };
 
 #define NP_ALL_COUNTERS                                                        \

@@ -1146,11 +1146,21 @@ HRESULT PresentCommon(IDXGISwapChain* sc, UINT sync, UINT flags,
         //   阈值取**半个帧周期**（自适应）：合并后 gLastPresentQpc 不推进，
         //   下一次的间隔自然覆盖整个帧，得到正确的 16.7ms。
         //   夹在 2~40ms，保证 120fps（8.3ms 帧）与 30fps（33ms 帧）都不会被误合并。
+        // ★★ 已回退（用户实测：开启后「帧时间」本身变得忽高忽低）★★
+        //
+        //  原意：实测真实 Present 的最小间隔只有 2.17ms（帧周期 16.7ms），
+        //        怀疑游戏在一帧内多次调用 Present，于是想把过近的呈现并成一帧。
+        //  为什么回退：这个假设**在本地验证不了**（测试宿主 32fps、不会拆分帧），
+        //        而用户实机反馈它把帧时间读数弄得不稳定了 —— 说明判定条件
+        //        在某些真实时序下会误吞正常帧。**不该在验证不了的情况下改核心路径。**
+        //
+        //  正确做法：先看 `recent ft(40)` 打出来的**原始序列**，确认到底是不是
+        //  「密集的短帧+长帧配对」。确认了再按实际间隔分布设计条件，而不是拍脑袋。
+        //  下面保留 halfFrame 的计算与字段，方便有证据后一行打开。
         float halfFrame = (gTel && gTel->fpsAvg > 1.0f) ? (1000.0f / gTel->fpsAvg) * 0.5f : 8.0f;
-        if (halfFrame < 2.0f) halfFrame = 2.0f;
-        if (halfFrame > 40.0f) halfFrame = 40.0f;
-        if (gStats.count() > 0 && fm < halfFrame) {
-            gAbsorbThisPresent = true;   // 并入同一帧：不记账、不推进时间戳
+        (void)halfFrame;
+        if (false && gStats.count() > 0 && fm < halfFrame) {
+            gAbsorbThisPresent = true;   // 已停用，理由见上
         }
         // 超过 1 秒的间隔不是「一帧」，是切出去/加载/挂起留下的空档。
         // 把它塞进统计会把 1% Low / 0.1% Low 直接拖到个位数 ——
@@ -1210,14 +1220,20 @@ HRESULT PresentCommon(IDXGISwapChain* sc, UINT sync, UINT flags,
         float busy = (float)QpcMs(now - gPresentRetQpc);
         // 超过 1 秒的不是「一帧」，是切出去/加载留下的空档
         if (busy > 0.0f && busy < 1000.0f) {
-            gTel->cpuFrameMs = busy;
-            // 同值同时写进 cpuBusyMs：这是 PresentMon 的 CPUBusy 口径，
-            // 面板上单列一行，并用于「低延迟」提示的判据。
+            // 同值同时写进 cpuBusyMs：这是 PresentMon 的 CPUBusy 口径
             gTel->cpuBusyMs = busy;
         }
     } else {
         gTel->cpuFrameMs = gTel->frameMs;
     }
+    // ★ CPU 帧时间 = CPUBusy + CPUWait（用户明确要求）。
+    //
+    //   理由：这两个半边加起来才是「一帧里 CPU 侧的总时长」——
+    //     上一帧 Present 返回 --(CPUBusy)--> 本帧 Present 开始
+    //     本帧 Present 开始 --(CPUWait)--> Present 返回
+    //   单独看任何一个都不完整：Busy 在流水线渲染里接近 0，Wait 又随垂直同步变化。
+    //   两者之和恰好等于帧周期里的 CPU 部分，是玩家真正关心的那个数。
+    gTel->cpuFrameMs = gTel->cpuBusyMs + gTel->cpuWaitMs;
     {
         static np::Ema cpuEma(0.10f);
         gTel->cpuFrameMsAvg = cpuEma.update(gTel->cpuFrameMs);
