@@ -1013,6 +1013,73 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdLine, int cmdShow) {
             // 只有桌面 HUD 被关掉了（用户报的第三个问题）。
             // AppPublish 是幂等的、开销极小（几十字节的 memcpy），无条件调用最稳。
             AppPublish();
+            // ------------------------------------------------------------------
+            // v1.6 学习：用户手动注入后，**验证真的读到数据**才把该 exe 记入可信名单。
+            //
+            // 为什么必须验证（用户明确要求）：
+            //   「记住这个用户 hook 也可能 hook 错，所以要看 hook 之后是否有可读取
+            //     数据出来，以及 d3d 之类的能不能出来」
+            //
+            // 三条件全部满足、并持续 3 秒，才记：
+            //   ① NP_HOOK_PRESENT —— Present 真的挂上（不是只注入成功）
+            //   ② gfxApi != UNKNOWN —— 认出了 D3D
+            //   ③ frameTotal 在这 3 秒里确实增长了 —— 帧数据真的在流动
+            // ------------------------------------------------------------------
+            {
+                static DWORD    sLearnPid = 0;
+                static uint32_t sLearnSince = 0;
+                static uint64_t sLearnFt = 0;
+                const NPTelemetry& lt = gApp.telemetry;
+                bool hooked = (lt.hookFlags & NP_HOOK_PRESENT) != 0;
+                bool hasApi = lt.gfxApi != NP_API_UNKNOWN;
+                uint32_t ltk = GetTickCount();
+                if (gApp.monitoring && lt.pid != 0 && hooked && hasApi) {
+                    if (sLearnPid != lt.pid) {
+                        sLearnPid = lt.pid;
+                        sLearnSince = ltk ? ltk : 1;
+                        sLearnFt = lt.frameTotal;
+                    }
+                    if (sLearnSince && ltk - sLearnSince >= 3000) {
+                        bool flowing = lt.frameTotal > sLearnFt;
+                        sLearnSince = 0;   // 同一个 pid 只判一次
+                        if (flowing) {
+                            // 取进程名（PROCESS_QUERY_LIMITED_INFORMATION ->
+                            // **商店/UWP 进程也能查**，不像 VM_READ 那样打不开）
+                            std::wstring nm;
+                            HANDLE hp = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, lt.pid);
+                            if (hp) {
+                                wchar_t buf[MAX_PATH]{};
+                                DWORD n = MAX_PATH;
+                                if (QueryFullProcessImageNameW(hp, 0, buf, &n) && n) {
+                                    std::wstring full(buf);
+                                    size_t sl = full.find_last_of(L"\\/");
+                                    nm = (sl == std::wstring::npos) ? full : full.substr(sl + 1);
+                                    for (auto& c : nm) c = (wchar_t)towlower(c);
+                                }
+                                CloseHandle(hp);
+                            }
+                            bool known = nm.empty();
+                            for (auto& g : gApp.games) {
+                                if (g.name == nm) { known = true; break; }
+                            }
+                            bool self = (nm == L"nextperf.exe");
+                            if (!nm.empty() && !known && !self) {
+                                GameEntry g;
+                                g.name = nm;
+                                g.learned = true;
+                                gApp.games.push_back(g);
+                                SettingsSave();
+                                AppLog("learn: 注入后验证通过（Present 挂上 + 认出 D3D + 帧在流动）"
+                                       "-> 把 %ls 记入可信名单（实验性自动钩子见设置）",
+                                       nm.c_str());
+                            }
+                        }
+                    }
+                } else {
+                    sLearnPid = 0;
+                    sLearnSince = 0;
+                }
+            }
             if (gApp.monitoring) {
                 AppPollSensors();
                 AppPublish();

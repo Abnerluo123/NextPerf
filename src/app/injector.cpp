@@ -500,7 +500,13 @@ void InjectorScanNow() {
         // 每轮把「配置的游戏现在是什么状态」重新算一遍，UI 直接显示这个。
         // 用户看到的「待注入」原来没有任何解释，这一栏就是解释。
         for (auto& g : gApp.games) {
-            std::wstring want = ExeNameOf(g.path);
+            // 学习来的条目没有可读路径（商店应用在 WindowsApps 下，普通用户读不了），
+            // 所以优先用 name；手动添加的条目没有 name，回退到从 path 取。
+            std::wstring want = g.name.empty() ? ExeNameOf(g.path) : g.name;
+            if (want.empty()) continue;
+            // 学习来的条目要用户主动打开「实验性自动注入」才动手 ——
+            // 手动添加的条目不受此开关影响，一直自动注入。
+            if (g.learned && !gApp.cfg.learnedAutoHook) continue;
             DWORD pid = 0;
             for (auto& p : procs) {
                 if (p.pid == GetCurrentProcessId()) continue;

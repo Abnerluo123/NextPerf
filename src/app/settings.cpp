@@ -95,8 +95,36 @@ bool SettingsLoad() {
                 if (e.type == np::Json::Str) {
                     GameEntry g;
                     g.path = np::Utf8ToWide(e.str);
+                    // 取 exe 名（小写）。ExeNameOf 是 injector.cpp 里的 static，
+                    // 这里不可见，就地写一遍（几行，不值得为它改头文件）。
+                    {
+                        std::wstring p = g.path;
+                        size_t sl = p.find_last_of(L"\\/");
+                        std::wstring nm = (sl == std::wstring::npos) ? p : p.substr(sl + 1);
+                        for (auto& c : nm) c = (wchar_t)towlower(c);
+                        g.name = nm;
+                    }
                     gApp.games.push_back(g);
                 }
+            }
+        }
+    }
+    // 读取「学习来的」条目（只存 exe 名 —— 商店应用的路径读不到）
+    if (auto* arr = get("learned")) {
+        if (arr->type == np::Json::Arr) {
+            for (auto& e : arr->arr) {
+                if (e.type != np::Json::Str) continue;
+                std::wstring nm = np::Utf8ToWide(e.str);
+                if (nm.empty()) continue;
+                bool dup = false;
+                for (auto& g : gApp.games) {
+                    if (g.name == nm) { dup = true; break; }
+                }
+                if (dup) continue;
+                GameEntry g;
+                g.name = nm;
+                g.learned = true;
+                gApp.games.push_back(g);
             }
         }
     }
@@ -129,8 +157,21 @@ void SettingsSave() {
     root.obj["simulate"] = Json::mkNum(gApp.cfg.simulate);
 
     Json::Value games = Json::mkArr();
-    for (auto& g : gApp.games) games.arr.push_back(Json::mkStr(np::WideToUtf8(g.path)));
+    // games 仍然只存**手动添加**的路径（保持老格式，零迁移风险）
+    for (auto& g : gApp.games) {
+        if (g.learned) continue;
+        games.arr.push_back(Json::mkStr(np::WideToUtf8(g.path)));
+    }
     root.obj["games"] = games;
+
+    // 「学习来的」条目单独存 exe 名 —— 商店应用的路径读不到，只能按名字认
+    {
+        auto learned = Json::mkArr();   // mkArr 返回的是 Value，不是 Json
+        for (auto& g : gApp.games) {
+            if (g.learned && !g.name.empty()) learned.arr.push_back(Json::mkStr(np::WideToUtf8(g.name)));
+        }
+        root.obj["learned"] = learned;
+    }
 
     WriteFile(SettingsPath(), Json::dump(root));
 }

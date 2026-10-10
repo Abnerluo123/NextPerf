@@ -38,9 +38,15 @@ bool TrayAvailable();
 // 游戏列表项：路径 + 运行时状态（由注入器每轮扫描填）
 struct GameEntry {
     std::wstring path;
+    // exe 名（小写）。**学习来的条目只填 name、path 为空** ——
+    // 商店（UWP）应用的 exe 在 WindowsApps 下，普通用户读不了，只能按名字匹配。
+    std::wstring name;
     DWORD pid = 0;        // 当前匹配到的进程，0 = 没在运行
     bool  injected = false;
     bool  hooked = false; // 钩子已接管画面（有新鲜遥测）
+    // true = 由「注入成功后自动学习」加的（见 main.cpp 的学习逻辑）；
+    // false = 用户手动添加的。
+    bool  learned = false;
 };
 
 struct AppState {

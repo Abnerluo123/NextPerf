@@ -29,7 +29,9 @@ static const COLORREF kDim = RGB(0x8A, 0x91, 0x99);
 static const int kWinW = 1000;
 // 730 = 原来的 690 + 38：「自动注入 3D 窗口」那一行是后加的，
 // 当时忘了同步加高窗口，结果把「退出监视」等按钮挤到窗口外面去了（用户实测）。
-static const int kWinH = 692;
+// 730 = 692 + 38：为「实验性自动注入」那一行腾出的高度。
+// ⚠ 上次加行忘了同步加高，把按钮挤出了窗口 —— 加行必须同时改这里。
+static const int kWinH = 730;
 // 计数器列表高度。只在这里定义一次 —— 原来 Layout() 和 WM_PAINT 里各写了一遍
 // S(452)，改一处漏一处就会让列表和游戏区对不上。
 // 400 是给「游戏进程」下面两行按钮腾出来的（状态栏固定在 S(658)，不能压）。
@@ -107,6 +109,7 @@ static int gTotalRows = 0;   // 计数器列表总行数（含组标题）
 enum WType { W_CHECK, W_GROUP, W_BUTTON, W_SLIDER_F, W_SLIDER_I, W_CYCLE, W_GAMEROW };
 enum Act {
     A_NONE = 0, A_START, A_STOP, A_SAVE, A_DEFAULT, A_ADDGAME, A_REMGAME, A_INJECTFRONT,
+    A_FORGET,      // v1.6：清空「学习来的」可信名单
     A_ELEVATE, A_LOGDIR, A_QUIT
 };
 
@@ -343,6 +346,22 @@ static void Layout() {
     cycle(L"注入探测交换链", (int*)&gApp.cfg.vtableProbe, {L"开启", L"关闭"}, {1, 0},
           RX + RW / 2 + S(4), ry, half);
 
+    // ★ v1.6「假自动」可信名单：**实验性、默认关闭**。
+    //   开启后，凡是「注入验证通过并学习过」的 exe，一启动就自动注入。
+    //   学习有验证（Present 挂上 + 认出 D3D + 帧在流动），但仍是实验性功能，
+    //   所以默认关。**手动添加的游戏不受此开关影响，一直自动注入。**
+    ry += S(38);
+    cycle(L"实验性自动注入", (int*)&gApp.cfg.learnedAutoHook, {L"关闭", L"开启"}, {0, 1},
+          RX, ry, half);
+    {
+        std::wstring lab = L"清空学习名单";
+        int learnedN = 0;
+        for (auto& g : gApp.games) if (g.learned) ++learnedN;
+        if (learnedN) lab += L"（" + std::to_wstring(learnedN) + L"）";
+        Add(W_BUTTON, RX + RW / 2 + S(4), ry, half, S(30), lab.c_str());
+        gW.back().action = A_FORGET;
+    }
+
     // 「自动注入 3D 窗口」开关**已移除**。
     // 靠窗口特征猜「是不是游戏」不可靠（窗口化游戏与普通窗口属性无区别；
     // 商店应用的前台是壳窗口；枚举目标模块会打不开 UWP 甚至把游戏搞崩），
@@ -430,6 +449,17 @@ static void DoAction(int action) {
             NPDefaultConfig(&gApp.cfg);
             gApp.statusText = "已恢复默认设置";
             break;
+                case A_FORGET: {
+                    // 清空「学习来的」条目（手动添加的保留）
+                    int n = 0;
+                    for (size_t i = gApp.games.size(); i-- > 0;) {
+                        if (gApp.games[i].learned) { gApp.games.erase(gApp.games.begin() + i); ++n; }
+                    }
+                    SettingsSave();
+                    AppLog("learn: 已清空学习名单（%d 条），手动添加的保留", n);
+                    SetNotice("已清空学习名单（" + std::to_string(n) + " 条），手动添加的保留");
+                    break;
+                }
         case A_ADDGAME: {
             wchar_t path[MAX_PATH]{};
             OPENFILENAMEW ofn{};
