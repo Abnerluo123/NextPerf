@@ -35,6 +35,21 @@
   * `CPUWait` = 本帧在 Present 内部停留的时长
   * 二者之和 = **CPU 帧时间**
 
+### 兼容性修复（本轮重点）
+
+* **32 位游戏现在可以注入了** —— 之前检测到 32 位目标直接拒绝。
+  修了两层：① 编出真正的 32 位钩子 `NextPerfHook32.dll`；
+  ② 更关键的是**注入机制**——我们是 64 位进程，原来用的是**我们自己** kernel32 里的
+  `LoadLibraryW` 地址，那个地址在 32 位进程的地址空间里根本不存在，远端线程起不来。
+  改为标准的 **WoW64 注入**：走目标进程的 PEB 找到**它自己那份** 32 位 `LoadLibraryW`。
+  实测：`remote LoadLibrary returned 0x62B40000`（非零即成功），32 位钩子正常挂上。
+* **「注入上一个程序」更可靠了** —— 原来靠主循环每 120ms 轮询 `GetForegroundWindow`，
+  快速 ALT+TAB 会漏掉。改用 **WinEvent 钩子**（系统在每次前台变化时主动通知，不会漏）。
+* **微软商店（UWP）应用能识别了** —— UWP 应用的窗口属于 `ApplicationFrameHost.exe`
+  外壳，原来会把这个壳当成游戏。现在会往下找一层，拿到真实应用进程。
+  **⚠️ 商店应用请不要用「添加游戏 exe」**，原因见下面的说明。
+* **新增命令行注入**：`NextPerf.exe --inject <pid>`（退出码 0=成功 / 3=失败）。
+
 ### 修复
 
 * **CPU 帧时间的显示问题** —— 之前面板上 `CPU 帧时间` 与 `CPU Busy + CPU Wait` 对不上
@@ -88,7 +103,32 @@
   届时现在这套严格算法会保留为可选开关：**「1% / 0.1% Low（严格）」**，
   想抓单帧卡顿的人可以打开它。
 * **RT Core / Tensor Core 的读取** —— 仍待解决（见下文说明）
+* **「无注入降级模式」** —— 用 PDH + NVAPI 在**没有注入**的情况下显示基础数据。
+  这条其实**现在就能做到**：PDH 与 NVAPI/NVML 都不需要注入，**独占全屏下照样可读**，
+  因为它们读的是系统计数器与驱动，与游戏怎么呈现无关。缺的只是让面板在没有钩子时也显示。
+  （查证过 `D3D12 Debug Layer` / DRED / PIX / GFXReconstruct —— **都不是**能实时采集数据的
+  "拦截层"，此路不通，所以走 PDH + NVAPI 这条已有的路。）
+* **NVAPI 驱动直读扩充** —— 已从 PresentMon 自带的接口表里查全了 ID 与结构体定义
+  （`NvAPI_GPU_GetAllClockFrequencies` 0xDCB616C3、`GetPerfDecreaseInfo` 0x7F7F4600、
+  `GetArchInfo` 0xD8265D24 等），作为 NVML 不可用时的回退路径。
 * **退出程序后面板不刷新状态** —— 待修
+
+### 设计上做不到 / 不支持（不是 bug）
+
+这两条**无法通过改代码解决**，如实写在这里，免得反复尝试：
+
+* **反作弊游戏不支持注入** —— EasyAntiCheat / BattlEye / Vanguard 这类反作弊
+  **主动阻止**外部 DLL 注入，这是它们的**设计目标**，不是我们的缺陷。
+  连"不注入、纯 ETW"这条退路都会被部分反作弊封掉：
+  PresentMon 有一个专门的 issue（[GameTechDev/PresentMon#573](https://github.com/GameTechDev/PresentMon/issues/573)）
+  记录了**EA AntiCheat 启动后 `StartTraceW` 直接返回 ACCESS_DENIED**。
+  **本工具不会尝试绕过反作弊**（既有封号风险，也不符合工具定位）。
+
+* **微软商店应用不要用「添加游戏 exe」** —— 商店应用的真实 exe 位于
+  `C:\Program Files\WindowsApps\`，该目录**默认对普通用户完全没有读取权限**，
+  连打开文件都会失败。所以"添加 exe 时提示权限不够"**不是注入失败，是根本读不到那个文件**。
+  **正确做法**：用「注入上一个程序」（先切到游戏窗口），或命令行 `--inject <pid>`。
+  这两条路都不需要读 `WindowsApps`。
 
 ### 完全没有验证过的功能
 
