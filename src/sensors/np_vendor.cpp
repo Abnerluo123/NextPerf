@@ -65,6 +65,8 @@ static const NvU32 kIdGpuThermalSettings   = 0xE3640A56u;
 static const NvU32 kIdGpuDynamicPstates    = 0x60DED2EDu;
 static const NvU32 kIdGpuGetUsages         = 0x189A1FDFu;
 static const NvU32 kIdGpuGetTachReading    = 0x5F608315u;
+// 下面两个 ID 来自 PresentMon 自带的 nvapi_interface_table.h（NVIDIA 官方 ID 清单）
+static const NvU32 kIdGpuGetAllClocks      = 0xDCB616C3u;   // GetAllClockFrequencies
 
 bool NvapiApi::Load() {
     if (loaded) return true;
@@ -91,6 +93,7 @@ bool NvapiApi::Load() {
     if (QueryInterface(kIdGpuGetUsages, &fn) == 0 && fn) GPU_GetUsages = reinterpret_cast<decltype(GPU_GetUsages)>(fn);
     fn = nullptr;
     if (QueryInterface(kIdGpuGetTachReading, &fn) == 0 && fn) GPU_GetTachReading = reinterpret_cast<decltype(GPU_GetTachReading)>(fn);
+    if (QueryInterface(kIdGpuGetAllClocks, &fn) == 0 && fn) GPU_GetAllClockFrequencies = reinterpret_cast<decltype(GPU_GetAllClockFrequencies)>(fn);
 
     if (!Initialize || !EnumPhysicalGPUs) { FreeLibrary(dll); dll = nullptr; return false; }
     if (Initialize() != 0) { FreeLibrary(dll); dll = nullptr; return false; }
@@ -307,4 +310,33 @@ bool HwinfoCtx::FindAny(const wchar_t* labelKw, double* out) const {
         if (NpContainsI(r.label, labelKw)) { *out = r.value; return true; }
     }
     return false;
+}
+
+
+// ---------------------------------------------------------------------------
+// NVAPI 直读 GPU 频率（核心 / 显存）。返回 true 表示读到了。
+// 用途：NVML 不可用时的**回退路径**（换机器/换驱动时很常见）。
+// 数值单位：NVAPI 给的是 kHz，这里换算成 MHz。
+// ---------------------------------------------------------------------------
+bool NvapiReadGpuClocks(NvapiApi& nv, NvPhysicalGpuHandle gpu, double* coreMhz, double* memMhz) {
+    if (!nv.GPU_GetAllClockFrequencies || !gpu) return false;
+    NV_GPU_CLOCK_FREQUENCIES clk{};
+    clk.version = NV_GPU_CLOCK_FREQUENCIES_VER_2;
+    // ClockType 位域取 0 = CURRENT_FREQ（当前频率）
+    clk.clockTypeFlags = 0;
+    if (nv.GPU_GetAllClockFrequencies(gpu, &clk) != 0) return false;   // 0 = NVAPI_OK
+
+    bool any = false;
+    // ⚠ 域索引照抄 nvapi.h:2211：GRAPHICS=0，MEMORY=**4**（不是 1）
+    const NvU32 dCore = NP_NVAPI_CLK_GRAPHICS;
+    const NvU32 dMem = NP_NVAPI_CLK_MEMORY;
+    if (coreMhz && clk.domain[dCore].presentFlags & 1u) {
+        *coreMhz = clk.domain[dCore].frequency / 1000.0;
+        any = true;
+    }
+    if (memMhz && clk.domain[dMem].presentFlags & 1u) {
+        *memMhz = clk.domain[dMem].frequency / 1000.0;
+        any = true;
+    }
+    return any;
 }

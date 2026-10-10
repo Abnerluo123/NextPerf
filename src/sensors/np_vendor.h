@@ -122,6 +122,31 @@ typedef struct {
 } NV_GPU_USAGES;
 #define NV_GPU_USAGES_VER_1 NP_MAKE_NVAPI_VERSION(NV_GPU_USAGES, 1)
 
+// NV_GPU_CLOCK_FREQUENCIES —— NVAPI 直读 GPU 核心/显存频率
+//
+// 逐字段对照 PresentMon 自带的 nvapi.h:5962（权威定义）：
+//     version; ClockType:4|reserved:20|reserved1:8（合计 32 位）;
+//     domain[32]{ bIsPresent:1|reserved:31, frequency(kHz) }
+// 位域在内存里的排布就是普通 NvU32，所以直接声明成 NvU32 即可。
+#define NVAPI_MAX_GPU_PUBLIC_CLOCKS 32
+typedef struct {
+    NvU32 version;
+    NvU32 clockTypeFlags;   // ClockType:4 | reserved:20 | reserved1:8
+    struct {
+        NvU32 presentFlags; // bIsPresent:1 | reserved:31
+        NvU32 frequency;    // 单位 kHz，要 /1000 得 MHz
+    } domain[NVAPI_MAX_GPU_PUBLIC_CLOCKS];
+} NV_GPU_CLOCK_FREQUENCIES;
+// 官方 VER_3 与 VER_2 共用同一个结构体，这里用 2（更保守）
+#define NV_GPU_CLOCK_FREQUENCIES_VER_2 \
+    NP_MAKE_NVAPI_VERSION(NV_GPU_CLOCK_FREQUENCIES, 2)
+
+// 域索引（nvapi.h:2211）—— ⚠ MEMORY 是 4 不是 1，极易搞错
+#define NP_NVAPI_CLK_GRAPHICS  0
+#define NP_NVAPI_CLK_MEMORY    4
+#define NP_NVAPI_CLK_PROCESSOR 7
+#define NP_NVAPI_CLK_VIDEO     8
+
 typedef NvAPI_Status (*NvAPI_QueryInterface_t)(NvU32 interfaceId, void** pFunction);
 
 struct NvapiApi {
@@ -138,6 +163,9 @@ struct NvapiApi {
     NvAPI_Status (*GPU_GetDynamicPstatesInfoEx)(NvPhysicalGpuHandle, NV_GPU_DYNAMIC_PSTATES_INFO_EX*) = nullptr;
     NvAPI_Status (*GPU_GetUsages)(NvPhysicalGpuHandle, NV_GPU_USAGES*) = nullptr;
     NvAPI_Status (*GPU_GetTachReading)(NvPhysicalGpuHandle, NvU32*) = nullptr;
+    // 0xDCB616C3 = NvAPI_GPU_GetAllClockFrequencies（ID 来自 PresentMon 的接口表）
+    NvAPI_Status (*GPU_GetAllClockFrequencies)(NvPhysicalGpuHandle,
+                                               NV_GPU_CLOCK_FREQUENCIES*) = nullptr;
 
     NvPhysicalGpuHandle gpus[NVAPI_MAX_PHYSICAL_GPUS]{};
     NvU32 gpuCount = 0;
@@ -237,3 +265,7 @@ private:
     std::vector<Reading> readings;
     uint64_t lastStamp = 0;
 };
+
+// NVAPI 直读 GPU 核心/显存频率（MHz）。NVML 不可用时的回退路径。
+// 实现在 np_vendor.cpp；ID 与结构体定义见本文件上方。
+bool NvapiReadGpuClocks(NvapiApi& nv, NvPhysicalGpuHandle gpu, double* coreMhz, double* memMhz);

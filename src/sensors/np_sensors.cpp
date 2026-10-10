@@ -898,6 +898,21 @@ void SensorHub::PollGpuNvidia(NPSensors& out) {
                 NvU32 rpm = 0;
                 if (nvapi_.GPU_GetTachReading(g, &rpm) == 0 && rpm > 0) out.gpuFanRpm = (float)rpm;
             }
+
+            // ---- 频率回退：NVAPI 直读（NvAPI_GPU_GetAllClockFrequencies 0xDCB616C3）
+            //
+            // 为什么需要：GPU 频率的主来源是 NVML，而 README 里如实写了
+            // 「换机器 / 换驱动，传感器很可能读不到数据」。NVAPI 是另一条独立通路，
+            // 走的是同一个驱动但**不依赖 NVML 那套库**，能补上这个弱点。
+            // gpuClock / memClock 默认 -1，所以 <= 0 就表示"还没读到"。
+            if (out.gpuClock <= 0.0f || out.memClock <= 0.0f) {
+                double cMhz = 0, mMhz = 0;
+                if (NvapiReadGpuClocks(nvapi_, g, &cMhz, &mMhz)) {
+                    if (out.gpuClock <= 0.0f && cMhz > 0) out.gpuClock = (float)cMhz;
+                    if (out.memClock <= 0.0f && mMhz > 0) out.memClock = (float)mMhz;
+                    out.sources |= NP_SRC_NVAPI;
+                }
+            }
         }
     }
 }
