@@ -167,6 +167,31 @@ bool IsFatalCode(DWORD c) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 崩溃上下文快照
+//
+// 为什么单独搞一组变量：SEH 处理器在文件很靠前的位置，而 gApi / gTel /
+// PresentHooked 等都声明在它后面，直接用编译不过。所以在这里放一组
+// volatile 快照，由每帧都走的 UpdateTelemetryCommon 更新，SEH 只读。
+//
+// 用途：光有 `SEH: code=... at 模块+偏移` 只能知道崩在哪，不知道**当时在干什么**。
+// 本项目遇到过的几类崩溃区别恰恰在上下文：
+//   * 交换链重建窗口期录命令 -> NVIDIA 驱动内部固定偏移崩溃
+//     （已知：切窗口 / 全屏 / 改分辨率 / 开关垂直同步 都走重建路径，
+//       此时 heapSwaps 会增长）
+//   * Present 路径内的异常 -> 探测或挂钩状态问题（inPresent=1）
+//   * 卸载过程中的野指针 -> 残留问题（frames 不再增长）
+// volatile：这些值会被多线程写、被异常处理器读，不要让它被优化掉。
+// ---------------------------------------------------------------------------
+static volatile LONG   gDbgApi = 0;
+static volatile LONG   gDbgInPresent = 0;
+static volatile LONG   gDbgHooked = 0;
+static volatile LONG   gDbgDev11 = 0;
+static volatile LONG   gDbgDev12 = 0;
+static volatile LONG   gDbgHeapSwaps = 0;
+static volatile LONG   gDbgMerged = 0;
+static volatile LONG64 gDbgFrames = 0;
+
 LONG CALLBACK NpSeh(PEXCEPTION_POINTERS ei) {
     if (!gJmpArmed || !ei || !ei->ExceptionRecord) return EXCEPTION_CONTINUE_SEARCH;
     DWORD code = ei->ExceptionRecord->ExceptionCode;
@@ -189,6 +214,18 @@ LONG CALLBACK NpSeh(PEXCEPTION_POINTERS ei) {
         snprintf(where, sizeof(where), "?+%p", addr);
     }
     Log("SEH: code=0x%08lx at %s", (unsigned long)code, where);
+    // ★ 崩溃上下文：只有地址不足以定位，把「崩溃时我们正在做什么」一起打出来。
+    //   本项目遇到过的几类崩溃，区别恰恰在上下文：
+    //     * 交换链**重建窗口期**录命令 -> NVIDIA 驱动内部固定偏移崩溃
+    //       （已知：切窗口 / 全屏 / 改分辨率 / 开关垂直同步 都走重建路径）
+    //     * Present 路径内的异常 -> 探测或挂钩状态问题
+    //     * 卸载过程中的野指针 -> 残留问题
+    //   这些状态量都廉价可读，但对定位帮助极大。
+    //   只打确定存在的量，不确定名字的全局一律不打（宁少勿错）。
+    Log("SEH ctx: api=%d inPresent=%d presentHooked=%d frames=%lld "
+        "dev11=%d dev12=%d heapSwaps=%d merged=%d",
+        (int)gDbgApi, (int)gDbgInPresent, (int)gDbgHooked, (long long)gDbgFrames,
+        (int)gDbgDev11, (int)gDbgDev12, (int)gDbgHeapSwaps, (int)gDbgMerged);
     std::longjmp(gJmp, 1);
     return EXCEPTION_CONTINUE_SEARCH;   // 不会走到这里
 }
@@ -912,6 +949,14 @@ extern "C" thread_local bool gNpCountingOverlayDraws = false;
 
 void UpdateTelemetryCommon(const NPConfig& cfg, uint64_t nowQpc, bool realPresent) {
     NPTelemetry& t = *gTel;
+    // 刷新崩溃上下文快照（见文件前面的说明）。开销极小，每帧一次。
+    gDbgApi = (LONG)gApi;
+    gDbgHooked = PresentHooked() ? 1 : 0;
+    gDbgMerged = (LONG)gMergedCount;
+    gDbgFrames = (LONG64)t.frameTotal;
+    gDbgHeapSwaps = (LONG)gOv12.HeapSwaps();
+    gDbgDev11 = gDev11 ? 1 : 0;
+    gDbgDev12 = gDev12 ? 1 : 0;
     t.attached = 1;
     t.tickMs = GetTickCount64();
     t.gfxApi = (uint32_t)gApi;
