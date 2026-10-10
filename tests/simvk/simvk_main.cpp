@@ -867,6 +867,85 @@ static int DoListLayers(VkApi& api) {
 }
 
 // ============================================================================
+// 3.5 「这个函数到底被层包装了没有」—— 进程内的硬证据
+// ============================================================================
+//
+// 这是本工具对 NextPerf 最有价值的一个探针，所以单独讲清楚原理。
+//
+// 问题：Vulkan 没有任何 API 能告诉你「当前有哪些层处于激活状态」。
+//       vkEnumerateInstanceLayerProperties 列的是"装了什么"，不是"挂了什么"。
+//       对 NextPerf 来说，"我的层到底挂上了没"恰恰是最关键的问题。
+//
+// 办法：看**函数指针落在哪个模块里**。
+//   * 没有任何层包装时，vkGetDeviceProcAddr(dev,"vkQueuePresentKHR")
+//     返回的是 loader（vulkan-1.dll）里的终止跳板；
+//   * 一旦某个层声明要拦截 vkQueuePresentKHR，loader 返回的就是
+//     **层 DLL 里的那个函数**，模块随之变成 xxxLayer64.dll。
+//   GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS) 可以把一个
+//   代码地址反查回它所属的模块，于是就有了确凿的、不依赖日志的结论。
+//
+// 局限（必须说明）：只能证明"被**某个**层包装了"，不能指出是哪个层 ——
+//   不过模块名通常就写着是哪家的层。另外如果层选择不拦截该函数，
+//   这里会显示 vulkan-1.dll，那是"没被这个函数拦截"，不等于"层没加载"。
+struct ProcOrigin {
+    std::string module;      // 函数所属模块的完整路径
+    std::string moduleName;  // 只要文件名
+    bool        fromLoader = false;
+};
+
+static ProcOrigin DescribeProc(const char* name, void* fn) {
+    ProcOrigin o;
+    if (!fn) { o.module = "(空指针)"; o.moduleName = o.module; return o; }
+    HMODULE m = nullptr;
+    if (::GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                             GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                             (LPCWSTR)fn, &m) && m) {
+        wchar_t p[MAX_PATH] = L"";
+        ::GetModuleFileNameW(m, p, MAX_PATH);
+        o.module = W2U(p);
+        size_t s = o.module.find_last_of("\\/");
+        o.moduleName = (s == std::string::npos) ? o.module : o.module.substr(s + 1);
+        o.fromLoader = (_stricmp(o.moduleName.c_str(), "vulkan-1.dll") == 0);
+    } else {
+        o.module = "(不属于任何已加载模块)";
+        o.moduleName = o.module;
+    }
+    (void)name;
+    return o;
+}
+
+// 打印一份「分派归属」报告。层只要拦截了这几个函数中的任何一个，
+// 对应的模块名就会从 vulkan-1.dll 变成层 DLL。
+static void ReportDispatch(VkApi& api) {
+    struct Item { const char* name; void* fn; };
+    Item items[] = {
+        { "vkQueuePresentKHR",          (void*)api.vkQueuePresentKHR },
+        { "vkQueueSubmit",              (void*)api.vkQueueSubmit },
+        { "vkAcquireNextImageKHR",      (void*)api.vkAcquireNextImageKHR },
+        { "vkCreateSwapchainKHR",       (void*)api.vkCreateSwapchainKHR },
+        { "vkCreateGraphicsPipelines",  (void*)api.vkCreateGraphicsPipelines },
+        { "vkCmdDraw",                  (void*)api.vkCmdDraw },
+    };
+    int wrapped = 0;
+    Info("[分派归属] 以下函数指针实际落在哪个模块里（层拦截了就会不是 vulkan-1.dll）：");
+    for (auto& it : items) {
+        ProcOrigin o = DescribeProc(it.name, it.fn);
+        if (!o.fromLoader && it.fn) ++wrapped;
+        Info("[分派归属]   %-26s -> %s%s", it.name, o.moduleName.c_str(),
+             o.fromLoader ? "" : "   ← 被层拦截！");
+    }
+    if (wrapped == 0) {
+        Info("[分派归属] 结论：这 6 个函数目前都由 loader(vulkan-1.dll) 直接分派，"
+             "没有任何层拦截它们。");
+        Info("[分派归属]       （注意：这不等于「没有层被加载」—— 层可能加载了但选择"
+             "不拦截这些函数，或者只拦截了没在这里列出的函数。）");
+    } else {
+        Info("[分派归属] 结论：有 %d 个函数被层接管了（见上面标了「被层拦截」的行）。",
+             wrapped);
+    }
+}
+
+// ============================================================================
 // 4. Win32 窗口
 // ============================================================================
 
@@ -1351,8 +1430,10 @@ bool Renderer::CreateLogicalDevice() {
         return false;
     }
     api.vkGetDeviceQueue(device, queueFamily, 0, &queue);
-    Info("[Vulkan] 逻辑设备创建成功，vkQueuePresentKHR=%p（层包装过的会是别的地址）",
-         (void*)api.vkQueuePresentKHR);
+    Info("[Vulkan] 逻辑设备创建成功");
+
+    // 「我的层挂上了没」—— 这是本工具存在的首要理由，所以每次启动都打一份
+    ReportDispatch(api);
     return true;
 }
 
@@ -2716,8 +2797,13 @@ int main(int argc, char** argv) {
         DWORD en = ::GetEnvironmentVariableA("VK_INSTANCE_LAYERS", envBuf, sizeof(envBuf));
         if (en > 0 && en < sizeof(envBuf)) {
             Info("[层] VK_INSTANCE_LAYERS = %s", envBuf);
-            Info("[层]   → loader 会把这些层追加进启用列表；若其中有层不存在，"
-                 "vkCreateInstance 会以 VK_ERROR_LAYER_NOT_PRESENT 失败（这本身就是验证手段）。");
+            // 实测（loader 1.4.341）：VK_INSTANCE_LAYERS 里写一个**不存在**的层名，
+            // vkCreateInstance **不会**失败 —— 新版 loader 只是忽略它并继续。
+            // 所以「实例建成功」不能用来证明 VK_INSTANCE_LAYERS 生效了。
+            // 想确认生效，用 VK_LOADER_DEBUG=layer 看 loader 日志，
+            // 或看下面 [分派归属] 那段（层拦截了函数就会显示层 DLL 的模块名）。
+            Info("[层]   → loader 会把这些层追加进启用列表。注意：实测本机 loader 对"
+                 "「不存在的层名」是忽略而非报错，所以实例建成功≠该层已生效。");
         } else {
             Info("[层] VK_INSTANCE_LAYERS 未设置（隐式层仍会由 loader 自动启用）");
         }

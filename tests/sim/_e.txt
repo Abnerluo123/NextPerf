@@ -1,8 +1,0 @@
-[sim 273941475.54ms] D3D11 设备就绪 feature_level=0xB100 buffers=2 fmt=BGRA8 flip_discard
-[sim 273941479.47ms] 启动：api=dx11 pid=9212 退出条件=3 秒 锁帧=144 vsync=on 初始 1280x720 windowed
-[sim 273941479.58ms] 控制通道：往 stdin 逐行写命令（resize/window/vsync/fpscap/stats/status/quit）
-[sim] 结束(time_limit)：共 178 帧，计入统计 168 帧
-[sim]   平均帧率 57.79 fps   帧时间 avg 17.303 / P50 15.308 / P99 34.723 / P99.9 62.502 ms
-[sim]   1% Low 20.57 fps   0.1% Low 16.00 fps
-[sim]   CPU 帧时间 avg 10.514 ms   Present 阻塞 avg 10.490 ms   GPU avg 0.003 ms（165 帧有样本，频率来源 timestamp-disjoint）
-[sim]   交换链重建 0 次，Present 失败 0 次，最终代数 1

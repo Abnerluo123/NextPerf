@@ -107,8 +107,7 @@ private:
         Com<ID3D12GraphicsCommandList> list_post;  // 复用同一对象，避免每帧重建
         Com<ID3D12Resource> readback;        // 时间戳回读缓冲（READBACK 堆）
         int64_t gpu_frame = -1;              // 这一槽记录的是哪一帧
-        UINT64 fence_value = 0;              // 该帧命令提交后的 fence 值（0=未提交）
-        bool read = false;                   // 是否已经读过回读缓冲
+        UINT64 fence_value = 0;              // 该帧两条列表都提交后的 fence 值（0=未提交）
     };
 
     bool CreateDeviceAndQueue(std::string* err);
@@ -218,13 +217,38 @@ bool Dx12Engine::CreateDeviceAndQueue(std::string* err) {
         *err = "CreateEvent 失败";
         return false;
     }
-    hr = dev_->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, nullptr, nullptr,
-                                 IID_PPV_ARGS(list_.Put()));
+    // 命令列表在 D3D12 里允许先建一个「空」的，之后每帧 Reset 复用，
+    // 避免每帧 Create/Release 的开销。
+    //
+    // 关于 pCommandAllocator=nullptr：D3D12 文档说可以传 nullptr 表示
+    // 「还没有分配器，第一次 Reset 时必须给一个」，但实测在 NVIDIA 驱动
+    // （RTX 5080 Laptop，Blackwell）上这个写法会返回 E_INVALIDARG。
+    // 所以这里先造一个临时分配器把列表建出来 —— 效果一样，兼容性更好。
+    // 必须成对记住：Close 之后才能 Reset，Reset 之前必须已经 Close。
+    {
+        Com<ID3D12CommandAllocator> tmp_alloc;
+        hr = dev_->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                          IID_PPV_ARGS(tmp_alloc.Put()));
+        if (FAILED(hr)) {
+            *err = "CreateCommandAllocator(临时) 失败 hr=" + std::to_string((unsigned long)hr);
+            return false;
+        }
+        hr = dev_->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, tmp_alloc.Get(), nullptr,
+                                     IID_PPV_ARGS(list_.Put()));
+        if (FAILED(hr)) {
+            *err = "CreateCommandList(主列表) 失败 hr=" + std::to_string((unsigned long)hr) + " (" +
+                   SimHrName((long)hr) + ")";
+            return false;
+        }
+        // tmp_alloc 在这里析构：列表已经建好，之后每帧 Reset 时会绑定别的分配器。
+        // D3D12 允许命令列表换分配器（只要在 Reset 时给新的）。
+    }
+    hr = list_->Close();
     if (FAILED(hr)) {
-        *err = "CreateCommandList 失败 hr=" + std::to_string((unsigned long)hr);
+        *err = "初始命令列表 Close 失败 hr=" + std::to_string((unsigned long)hr);
         return false;
     }
-    list_->Close();
+    SimLog("D3D12 队列 / fence / 命令列表就绪");
     return true;
 }
 
@@ -317,7 +341,6 @@ bool Dx12Engine::CreateFrameResources(std::string* err) {
         f.list_post->Close();
         f.gpu_frame = -1;
         f.fence_value = 0;
-        f.read = false;
     }
 
     // 时间戳查询堆：kFrameRing 帧 × kQPerFrame 个时间戳
