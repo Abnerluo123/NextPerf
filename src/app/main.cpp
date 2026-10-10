@@ -1058,6 +1058,29 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdLine, int cmdShow) {
                                 }
                                 CloseHandle(hp);
                             }
+                            // ★ 兜底：QueryFullProcessImageNameW 失败时（对商店/UWP 或
+                            //   保护更严的进程有可能），改用系统级进程快照取名字 ——
+                            //   CreateToolhelp32Snapshot **不需要打开目标进程**，
+                            //   所以一定有名字。拿不到路径无所谓，学习只需要名字
+                            //   （商店应用的路径本来也读不了）。
+                            //   不加这个兜底的话，失败会得到空名字 -> 静默跳过学习，很隐蔽。
+                            if (nm.empty()) {
+                                HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+                                if (snap != INVALID_HANDLE_VALUE) {
+                                    PROCESSENTRY32W pe{};
+                                    pe.dwSize = sizeof(pe);
+                                    if (Process32FirstW(snap, &pe)) {
+                                        do {
+                                            if (pe.th32ProcessID == lt.pid) {
+                                                nm = pe.szExeFile;
+                                                for (auto& c : nm) c = (wchar_t)towlower(c);
+                                                break;
+                                            }
+                                        } while (Process32NextW(snap, &pe));
+                                    }
+                                    CloseHandle(snap);
+                                }
+                            }
                             bool known = nm.empty();
                             for (auto& g : gApp.games) {
                                 if (g.name == nm) { known = true; break; }
