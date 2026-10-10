@@ -502,6 +502,27 @@ bool Overlay12::Record(ID3D12Device* dev, ID3D12GraphicsCommandList* list,
     int slot = -1;
     for (int i = 0; i < rtvSlotsN_; ++i)
         if (rtvSlots_[i].res == backbuffer) { slot = rtvSlots_[i].slot; break; }
+
+    // ★ 槽位满了 => 交换链被重建过多次（全屏独占转换 / ResizeBuffers 都会换掉一整批
+    //   后台缓冲对象，每个新对象占一个新槽）。
+    //   旧槽里的描述符仍然引用着**已经作废的旧后台缓冲** —— 这既让游戏的
+    //   ResizeBuffers 失败（就是刚修好的那个闪退），也让我们自己画到旧缓冲上
+    //   （用户实测：全屏后换场景开始**闪烁**，闪一会就**看不见**了，正是槽位用尽后
+    //   本函数返回 false 停止绘制）。
+    //
+    //   所以这里**重置整组槽位**，把对旧后台缓冲的引用放掉。
+    //   ⚠ 必须确认没有在途命令列表：GPU 是**执行时**才去读描述符堆的，
+    //     覆盖一个正在被读的槽会让它画到错的地方。pendingN_ == 0 表示我们记录过的
+    //     命令全部已完成（OnFrameCompleted 每帧回收），此时覆盖是安全的。
+    //     不满足就这一帧先不画，下一帧再试 —— 宁可不画，也不画错。
+    if (slot < 0 && rtvSlotsN_ >= 8) {
+        if (pendingN_ != 0) return false;
+        // 注：这里本想打一条日志说明重置了几次，但 Log 在本编译单元的命名空间里
+        // 声明不上（定义在 np_hook.cpp 的另一个命名空间），链接会失败。
+        // 重置本身的行为不需要日志也能验证（重置后叠加层会恢复绘制）。
+        rtvSlotsN_ = 0;
+    }
+
     if (slot < 0) {
         if (rtvSlotsN_ >= 8) return false;   // 换了 8 张缓冲还没复用？放弃，别硬来
         slot = rtvSlotsN_;
