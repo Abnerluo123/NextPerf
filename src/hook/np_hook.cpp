@@ -1076,7 +1076,16 @@ void UpdateTelemetryCommon(const NPConfig& cfg, uint64_t nowQpc, bool realPresen
         t.fpsLow1 = gStats.lowPercentileFps(99.0f, lowWin);
         t.fpsLow01 = gStats.lowPercentileFps(99.9f, lowWin);
     } else {
-        t.fpsLow1 = gStats.lowWindowed(1.0f, 500.0f, np::FrameStats::kCap);
+        // ★ 回看长度是这里的关键 —— 用户实测「切换窗口后 low 帧永远高不上去」：
+        //   日志里 win500_1 卡在 39.8 整整 15 秒（掉下去就回不来）。
+        //   根因是原来两个口径都用**全部样本**（≈68 秒）取最差，于是一次卡顿
+        //   会把数值钉住将近 70 秒。
+        //   现在：
+        //     1% Low   -> 约 12 秒（60fps 下 720 帧 ≈ 24 个窗口，最差 1% = 1 个窗口）
+        //                 语义：「最近 12 秒里最差的那个半秒」，卡顿十几秒内过期
+        //     0.1% Low -> 保留全部样本（≈68 秒）—— 它本来就该是「极值」，
+        //                 长历史在语义上合理，也避免 1%/0.1% 算出同一个数
+        t.fpsLow1 = gStats.lowWindowed(1.0f, 500.0f, 720);
         t.fpsLow01 = gStats.lowWindowed(0.1f, 500.0f, np::FrameStats::kCap);
         // 样本还不够（lowWindowed 少于 4 个窗口会返回 0）时先用严格口径兜底
         if (t.fpsLow1 <= 0.0f) t.fpsLow1 = gStats.lowPercentileFps(99.0f, lowWin);
@@ -1484,8 +1493,12 @@ HRESULT PresentCommon(IDXGISwapChain* sc, UINT sync, UINT flags,
     UpdateTelemetryCommon(cfg, now, realPresent);
 
     // ---- 叠加
+    // 交换链刚重建过就让叠加层静默几帧：那段窗口期录屏障/绘制会踩到
+    // NVIDIA 驱动的崩溃点（见 np_draw.cpp 里 settle_ 置位处的说明）。
+    gOv12.tickSettle();
+    bool settling = gOv12.settlePending();
     bool wantOverlay = (cfg.overlayMode != 2) && (gDev11 || gDev12) &&
-                       !(gDev12 && !d12ok);
+                       !(gDev12 && !d12ok) && !settling;
     bool panelOk = false, drawnOk = false;
     // ★ 原来这里（后台缓冲属于别的设备时）是 `bb->Release(); return CallOriginal();`
     //   —— 从 PresentCommon 的**中间**直接返回，把函数尾部的一整套收尾全跳过了：

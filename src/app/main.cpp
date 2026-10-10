@@ -940,6 +940,23 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdLine, int cmdShow) {
                 bool wantDesktop = !gOverlayOff && gApp.monitoring &&
                                    (gApp.cfg.overlayMode == 2 ||
                                     (!attached && gApp.cfg.overlayMode != 1));
+                // 诊断：无边框下「桌面 HUD 与游戏内 HUD 同时存在」的问题定位用。
+                // 每 5 秒一条，把判定依据全部打出来，免得再靠猜。
+                {
+                    static uint32_t sLastOvLog = 0;
+                    uint32_t tk = GetTickCount();
+                    if (tk - sLastOvLog > 5000) {
+                        sLastOvLog = tk;
+                        AppLog("overlay mode: mode=%u attached=%d (tele=%d age=%ums pid=%lu) "
+                               "monitoring=%d off=%d -> wantDesktop=%d",
+                               gApp.cfg.overlayMode, attached ? 1 : 0,
+                               gApp.telemetry.attached ? 1 : 0,
+                               (unsigned)(now - gApp.telemetry.tickMs),
+                               (unsigned long)gApp.telemetry.pid,
+                               gApp.monitoring ? 1 : 0, gOverlayOff ? 1 : 0,
+                               wantDesktop ? 1 : 0);
+                    }
+                }
                 OverlaySetVisible(wantDesktop);
                 OverlayUpdate();
                 UpdateStatus();

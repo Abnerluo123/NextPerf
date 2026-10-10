@@ -60,6 +60,10 @@ public:
     void         OnFrameCompleted();  // 回收上传缓冲
     // 诊断用：描述符堆被换过几次（交换链重建 / 全屏转换会触发）
     int          HeapSwaps() const { return rtvHeapSwaps_; }
+    // 交换链刚被重建过、还需要静默几帧（见 np_hook.cpp 里的使用处）：
+    // 重建窗口期往游戏的命令列表里录屏障/绘制会踩到驱动的崩溃点。
+    bool         settlePending() const { return settle_ > 0; }
+    void         tickSettle() { if (settle_ > 0) --settle_; }
 
 private:
     bool EnsurePso(ID3D12Device* dev, DXGI_FORMAT rtvFormat);
@@ -83,6 +87,8 @@ private:
     // 描述符堆被换掉过几次（交换链重建 = 全屏转换 / ResizeBuffers 会导致）。
     // 每次换堆都要把旧堆 Retire 掉，用来诊断「全屏后闪烁/消失」这类问题。
     int     rtvHeapSwaps_ = 0;
+    // 交换链重建后的静默帧数（换堆时置位，逐帧递减）
+    int     settle_ = 0;
     // 绘制被跳过的帧数（供诊断：闪烁是不是因为我们没画上去）
     int     drawSkips_ = 0;
     UINT rtvHeapSize_ = 0;

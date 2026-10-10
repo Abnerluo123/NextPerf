@@ -539,6 +539,13 @@ bool Overlay12::Record(ID3D12Device* dev, ID3D12GraphicsCommandList* list,
         rtvHeap_ = fresh;
         rtvSlotsN_ = 0;
         ++rtvHeapSwaps_;
+        // ★ 交换链刚被重建（全屏/窗口切换）-> 静默若干帧。
+        //   实测证据：切换窗口/无边框/全屏时会在 nvwgf2umx.dll+0x330124
+        //   （NVIDIA 用户态驱动，同一偏移反复出现 = 驱动里一个确定的崩溃点）触发
+        //   0xC0000005 把游戏带走，而崩溃只发生在交换链重建那段窗口期。
+        //   我们改不了驱动，但可以**避开那个时刻**：这几十帧不往游戏的命令列表里
+        //   录屏障与绘制，等重建彻底稳定下来再继续。
+        settle_ = 30;
     }
 
     if (slot < 0) {
