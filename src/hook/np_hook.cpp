@@ -499,13 +499,32 @@ void Log(const char* fmt, ...) {
     if (size > 512 * 1024) SetFilePointer(h, 0, nullptr, FILE_BEGIN);
     else SetFilePointer(h, 0, nullptr, FILE_END);
 
-    char buf[768];
-    unsigned long long ms = GetTickCount64();
-    // pid 也要记：这个日志文件是**所有被注入进程共用**的，
-    // 同时注入两个游戏时没有 pid 根本分不清哪一行是谁写的。
-    int len = snprintf(buf, sizeof(buf), "[%llu.%03llu pid=%lu tid=%lu] ", ms / 1000ull,
-                       ms % 1000ull, (unsigned long)GetCurrentProcessId(),
+    char buf[1024];
+    // ---- 日志前缀：墙钟时间 + 进程名 + pid + tid
+    //
+    // 原来只有「开机后毫秒数」，排查时**根本对不上用户说的时间点**
+    // （用户说"21:39 挂不上"，日志里却是 177085.000，无从下手）。
+    // 而且只有 pid 没有进程名 —— 这个文件是**所有被注入进程共用的**，
+    // 光看 pid=34600 完全不知道是哪个游戏，只能回头问用户，非常低效。
+    // 这两条都是实际排查中被卡住过的地方，一并补上。
+    SYSTEMTIME st{};
+    GetLocalTime(&st);
+    static char sExe[64] = {0};
+    if (!sExe[0]) {
+        wchar_t p[MAX_PATH]{};
+        DWORD pn = GetModuleFileNameW(nullptr, p, MAX_PATH);
+        if (pn && pn < MAX_PATH) {
+            const wchar_t* base = wcsrchr(p, L'\\');
+            base = base ? base + 1 : p;
+            WideCharToMultiByte(CP_UTF8, 0, base, -1, sExe, (int)sizeof(sExe), nullptr, nullptr);
+        }
+        if (!sExe[0]) strcpy_s(sExe, "?");
+    }
+    int len = snprintf(buf, sizeof(buf), "[%02d:%02d:%02d.%03d pid=%lu %s tid=%lu] ",
+                       (int)st.wHour, (int)st.wMinute, (int)st.wSecond, (int)st.wMilliseconds,
+                       (unsigned long)GetCurrentProcessId(), sExe,
                        (unsigned long)GetCurrentThreadId());
+    if (len < 0 || len >= (int)sizeof(buf)) len = 0;
     va_list ap;
     va_start(ap, fmt);
     len += vsnprintf(buf + len, sizeof(buf) - (size_t)len, fmt, ap);
