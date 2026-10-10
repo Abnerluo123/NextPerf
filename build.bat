@@ -82,6 +82,12 @@ set SRC_DLL="%ROOT%src\hook\dllmain.cpp" "%ROOT%src\hook\np_hook.cpp" "%ROOT%src
 if errorlevel 1 goto :fail
 
 copy /Y "%DIST%\NextPerfHook.dll" "%DIST%\NextPerfHook64.dll" >nul
+
+rem --- 32-bit hook for 32-bit games (PE Machine 0x014C) ---
+rem Same sources; clang uses the LAST -target, so this overrides the x64 one.
+echo [3/3] Building NextPerfHook32.dll (32-bit games) ...
+"%ZIG%" c++ %CXX% -target x86-windows-gnu -shared -o "%DIST%\NextPerfHook32.dll" %SRC_DLL% %LIBS_DLL%
+if errorlevel 1 goto :fail
 del /Q "%DIST%\*.pdb" "%DIST%\*.lib" >nul 2>&1
 
 echo.

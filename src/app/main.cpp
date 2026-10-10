@@ -702,6 +702,32 @@ static void EnableDpiAwareness() {
     SetProcessDPIAware();
 }
 
+// ---------------------------------------------------------------- 命令行注入
+// 用法：NextPerf.exe --inject <pid>
+// 存在意义：让注入（尤其是 32 位目标的 WoW64 注入）可以被自动化验证，
+// 不必去点界面；顺带也方便脚本化调用。
+// 退出码：0 = 成功，1 = 参数不对/进程不存在，3 = 注入失败。
+static int RunInjectCli(const char* args) {
+    using namespace npa;
+    const char* p = args;
+    while (*p && (*p < '0' || *p > '9')) ++p;
+    if (!*p) {
+        AppLog("--inject: 缺少 pid 参数");
+        return 1;
+    }
+    DWORD pid = (DWORD)strtoul(p, nullptr, 10);
+    if (!pid) {
+        AppLog("--inject: pid 解析失败");
+        return 1;
+    }
+    AppLog("---- --inject pid=%lu ----", (unsigned long)pid);
+    bool wow = ProcessIsWow64(pid);
+    AppLog("--inject: target pid=%lu isWow64=%d", (unsigned long)pid, wow ? 1 : 0);
+    bool ok = InjectInto(pid);
+    AppLog("--inject: result=%s", ok ? "OK" : "FAILED");
+    return ok ? 0 : 3;
+}
+
 int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdLine, int cmdShow) {
     using namespace npa;
 
@@ -713,6 +739,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdLine, int cmdShow) {
 
     if (cmdLine && strstr(cmdLine, "--selftest")) return RunSelfTest() ? 2 : 0;
     if (cmdLine && strstr(cmdLine, "--uismoke")) return RunUiSmoke(inst);
+    // 命令行注入：不需要图形，所以在 GfxInit 之前就返回
+    if (cmdLine && strstr(cmdLine, "--inject")) return RunInjectCli(cmdLine);
 
     if (!npb::GfxInit()) {
         MessageBoxW(nullptr, L"无法初始化 Direct2D，程序将退出。", L"NextPerf", MB_ICONERROR);

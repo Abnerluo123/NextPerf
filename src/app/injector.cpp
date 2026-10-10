@@ -156,6 +156,121 @@ bool IsInjected(DWORD pid) {
     return false;
 }
 
+// ---------------------------------------------------------------------------
+// WoW64（跨位数）注入支持
+//
+// 我们是 64 位程序。往 32 位目标注入时**不能**用我们自己的 LoadLibraryW 地址 ——
+// 那是 64 位 kernel32 里的地址，在 32 位进程的地址空间里不存在，
+// 远端线程起不来（实测现象：目标进程里始终没有我们的模块，钩子日志也不生成）。
+//
+// 正解：
+//   1) NtQueryInformationProcess(ProcessWow64Information=26) 直接给出目标的 32 位 PEB
+//   2) 走 32 位 PEB 的 Ldr->InMemoryOrderModuleList 找到 kernel32.dll 的 DllBase
+//   3) 解析它的导出表，取 **32 位 LoadLibraryW** 的地址
+//   4) 用这个 32 位地址 CreateRemoteThread
+//
+// ⚠ 下面所有偏移都按 **32 位** 布局硬编码（64 位的指针宽度不同，偏移也不一样）。
+// ---------------------------------------------------------------------------
+
+typedef LONG(NTAPI* NpNtQueryInformationProcess_t)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+
+static bool NpReadRemote(HANDLE proc, uint64_t addr, void* buf, SIZE_T n) {
+    SIZE_T got = 0;
+    if (!ReadProcessMemory(proc, reinterpret_cast<LPCVOID>(static_cast<uintptr_t>(addr)), buf, n,
+                           &got))
+        return false;
+    return got == n;
+}
+
+// 在 32 位模块里按导出名找函数，返回**绝对地址**（modBase + 导出 RVA）
+static uint32_t NpExportAddr32(HANDLE proc, uint32_t modBase, const char* funcName) {
+    IMAGE_DOS_HEADER dos{};
+    if (!NpReadRemote(proc, modBase, &dos, sizeof(dos)) || dos.e_magic != IMAGE_DOS_SIGNATURE)
+        return 0;
+    IMAGE_NT_HEADERS32 nt{};
+    if (!NpReadRemote(proc, (uint64_t)modBase + dos.e_lfanew, &nt, sizeof(nt))) return 0;
+    if (nt.Signature != IMAGE_NT_SIGNATURE) return 0;
+
+    const IMAGE_DATA_DIRECTORY& dir =
+        nt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+    if (!dir.VirtualAddress || !dir.Size) return 0;
+
+    IMAGE_EXPORT_DIRECTORY exp{};
+    if (!NpReadRemote(proc, (uint64_t)modBase + dir.VirtualAddress, &exp, sizeof(exp))) return 0;
+    if (!exp.NumberOfNames || !exp.AddressOfNames || !exp.AddressOfFunctions ||
+        !exp.AddressOfNameOrdinals)
+        return 0;
+
+    for (DWORD i = 0; i < exp.NumberOfNames; ++i) {
+        uint32_t nameRva = 0;
+        if (!NpReadRemote(proc, (uint64_t)modBase + exp.AddressOfNames + i * 4, &nameRva, 4))
+            return 0;
+        if (!nameRva) continue;
+        char nm[64]{};
+        if (!NpReadRemote(proc, (uint64_t)modBase + nameRva, nm, sizeof(nm) - 1)) continue;
+        if (strcmp(nm, funcName) != 0) continue;
+        uint16_t ord = 0;
+        if (!NpReadRemote(proc, (uint64_t)modBase + exp.AddressOfNameOrdinals + i * 2, &ord, 2))
+            return 0;
+        uint32_t fnRva = 0;
+        if (!NpReadRemote(proc, (uint64_t)modBase + exp.AddressOfFunctions + (uint32_t)ord * 4,
+                          &fnRva, 4))
+            return 0;
+        if (!fnRva) return 0;
+        return modBase + fnRva;
+    }
+    return 0;
+}
+
+// 在 32 位目标进程里解析 LoadLibraryW 的地址；失败返回 0
+static uint32_t NpResolve32LoadLibraryW(HANDLE proc) {
+    static NpNtQueryInformationProcess_t ntq = nullptr;
+    if (!ntq) {
+        HMODULE nt = GetModuleHandleW(L"ntdll.dll");
+        if (nt) ntq = reinterpret_cast<NpNtQueryInformationProcess_t>(
+            GetProcAddress(nt, "NtQueryInformationProcess"));
+    }
+    if (!ntq) return 0;
+
+    // 1) 32 位 PEB 地址（ProcessWow64Information = 26）
+    ULONG_PTR peb32 = 0;
+    if (ntq(proc, 26, &peb32, sizeof(peb32), nullptr) != 0 || !peb32) return 0;
+
+    // 2) PEB->Ldr        —— 32 位 PEB 里 Ldr 在 +0x0C
+    uint32_t ldr = 0;
+    if (!NpReadRemote(proc, peb32 + 0x0C, &ldr, 4) || !ldr) return 0;
+
+    // 3) Ldr->InMemoryOrderModuleList —— 32 位 PEB_LDR_DATA 里在 +0x14
+    uint32_t head = 0;
+    if (!NpReadRemote(proc, (uint64_t)ldr + 0x14, &head, 4) || !head) return 0;
+
+    uint32_t cur = head;
+    for (int i = 0; i < 256; ++i) {
+        // LDR_DATA_TABLE_ENTRY：InMemoryOrderLinks 在 +0x08，DllBase 在 +0x18，
+        // BaseDllName（UNICODE_STRING）在 +0x2C（Length@+0x2C, Buffer@+0x30）
+        uint32_t entry = cur - 0x08;
+        uint32_t base = 0, nameBuf = 0;
+        uint16_t nameLen = 0;
+        if (!NpReadRemote(proc, (uint64_t)entry + 0x18, &base, 4)) return 0;
+        NpReadRemote(proc, (uint64_t)entry + 0x2C, &nameLen, 2);
+        NpReadRemote(proc, (uint64_t)entry + 0x30, &nameBuf, 4);
+
+        // "kernel32.dll" = 12 个字符 = 24 字节
+        if (base && nameBuf && nameLen >= 24 && nameLen < 260) {
+            wchar_t nm[130]{};
+            if (NpReadRemote(proc, nameBuf, nm, nameLen)) {
+                for (auto& ch : nm) ch = (wchar_t)towlower(ch);
+                if (wcscmp(nm, L"kernel32.dll") == 0)
+                    return NpExportAddr32(proc, base, "LoadLibraryW");
+            }
+        }
+        uint32_t next = 0;
+        if (!NpReadRemote(proc, cur, &next, 4) || !next || next == head) break;
+        cur = next;
+    }
+    return 0;
+}
+
 // 把 Win32 错误码翻译成人话 —— 用户看到 "err=5" 没有意义
 static const char* ExplainWin32(DWORD e) {
     switch (e) {
@@ -192,17 +307,31 @@ bool InjectInto(DWORD pid) {
         who += std::string(" (") + buf + ")";
     }
 
+    // ---- 按目标进程位数选 DLL
+    // 32 位进程**加载不了** 64 位 DLL（反之亦然），必须各用各的。
+    // 原来的行为是检测到 32 位目标就直接拒绝注入，现在两边都编了，改用 32 位那份。
+    if (ProcessIsWow64(pid)) {
+        size_t dot = dll.find_last_of(L'.');
+        std::wstring p32 = (dot == std::wstring::npos)
+                               ? dll + L"32"
+                               : dll.substr(0, dot) + L"32" + dll.substr(dot);
+        if (GetFileAttributesW(p32.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            dll = p32;
+            AppLog("inject %s: target is 32-bit, using 32-bit hook %ls", who.c_str(),
+                   dll.c_str());
+        } else {
+            AppLog("inject %s: target is 32-bit but NextPerfHook32.dll is missing",
+                   who.c_str());
+            SetNotice("目标是 32 位进程，但程序目录下没有 NextPerfHook32.dll，无法注入：" + who,
+                      1, 20000);
+            return false;
+        }
+    }
+
     DWORD attr = GetFileAttributesW(dll.c_str());
     if (attr == INVALID_FILE_ATTRIBUTES) {
         AppLog("inject %s: DLL not found at %ls", who.c_str(), dll.c_str());
         SetNotice("找不到 NextPerfHook.dll（应在 " + std::string("程序目录") + "），无法注入", 1);
-        return false;
-    }
-
-    // 32 位目标：本 DLL 是 64 位，LoadLibrary 必然失败，先直接说清楚
-    if (ProcessIsWow64(pid)) {
-        AppLog("inject %s: target is WOW64 (32-bit), 64-bit hook cannot load", who.c_str());
-        SetNotice("目标是 32 位进程，当前只有 64 位钩子，无法注入：" + who, 1);
         return false;
     }
 
@@ -250,6 +379,25 @@ bool InjectInto(DWORD pid) {
 
     HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
     FARPROC loadLib = GetProcAddress(k32, "LoadLibraryW");
+
+    // 32 位目标：我们自己的 LoadLibraryW 地址在它的地址空间里**不存在**，
+    // 必须换成目标进程里那份 32 位的 LoadLibraryW（走 PEB 解析，见上面）。
+    if (ProcessIsWow64(pid)) {
+        uint32_t a32 = NpResolve32LoadLibraryW(proc);
+        if (!a32) {
+            AppLog("inject %s: 32-bit target but could not resolve its LoadLibraryW", who.c_str());
+            SetNotice("注入失败：这是 32 位进程，但没能定位它内部的 LoadLibraryW（PEB 解析失败）：" +
+                          who,
+                      1, 20000);
+            VirtualFreeEx(proc, remote, 0, MEM_RELEASE);
+            CloseHandle(proc);
+            return false;
+        }
+        loadLib = reinterpret_cast<FARPROC>(static_cast<uintptr_t>(a32));
+        AppLog("inject %s: 32-bit target, using its LoadLibraryW at %08X", who.c_str(),
+               (unsigned)a32);
+    }
+
     HANDLE th = CreateRemoteThread(proc, nullptr, 0,
                                    reinterpret_cast<LPTHREAD_START_ROUTINE>(loadLib), remote, 0,
                                    nullptr);
