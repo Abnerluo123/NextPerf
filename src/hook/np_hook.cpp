@@ -192,9 +192,24 @@ LONG CALLBACK NpSeh(PEXCEPTION_POINTERS ei) {
     std::longjmp(gJmp, 1);
     return EXCEPTION_CONTINUE_SEARCH;   // 不会走到这里
 }
+// 保存 AddVectoredExceptionHandler 返回的句柄 —— **必须能注销**，见下面的说明。
+static PVOID gSehHandle = nullptr;
+
+// ⚠⚠ 注册 VEH 处理器时一定要记住句柄，并在卸载前注销。
+//
+// VEH 处理器挂在**进程级**链表上，而它的函数指针指向我们的 DLL。
+// 如果只注册不注销：DLL 一卸载，链表里就留下一个指向**已卸载内存**的处理器；
+// 下次注入又会注册一个新的，于是链表 = [野指针, 新指针]。
+// 之后任何异常（探测路径**本来就会触发异常**，这正是 SEH 机制存在的原因）
+// 都会先调到那个野指针 -> 跳进已卸载内存 -> 0xC0000005。
+//
+// 实测表现：注入过一次的进程再注入 -> **100% 闪退**；
+//           全新进程首次注入 -> 正常。崩溃地址 = 旧 DLL 基址 + 固定偏移
+//           （用 GetModuleHandleExA 按地址反查会得到「不属于任何模块」）。
 inline bool SehReady() {
     if (gSehReady.load(std::memory_order_acquire)) return true;
-    if (AddVectoredExceptionHandler(1, NpSeh)) {
+    gSehHandle = AddVectoredExceptionHandler(1, NpSeh);
+    if (gSehHandle) {
         gSehReady.store(true, std::memory_order_release);
         return true;
     }
@@ -2302,8 +2317,22 @@ static HANDLE gInjectedMutex = nullptr;
 static void RestoreAllHooks() {
     // 记一条：这样从日志就能确认**两条卸载路径**（SelfUnloadNow / DLL_PROCESS_DETACH）
     // 到底有没有真的还原。之前没有这条日志，所以无法判断还原是否发生。
-    Log("RestoreAllHooks: swapVt=%d factory=%d factory2=%d queue=%d cmdlist=%d", gSwapVtCount,
-        gFactoryVt ? 1 : 0, gFactory2Vt ? 1 : 0, gQueueVt ? 1 : 0, gClVt ? 1 : 0);
+    Log("RestoreAllHooks: swapVt=%d factory=%d factory2=%d queue=%d cmdlist=%d seh=%d",
+        gSwapVtCount, gFactoryVt ? 1 : 0, gFactory2Vt ? 1 : 0, gQueueVt ? 1 : 0,
+        gClVt ? 1 : 0, gSehHandle ? 1 : 0);
+
+    // ★★ 注销 VEH 处理器 —— 这是「重复注入 100% 闪退」的真正根因。
+    //
+    // 注册了却从不注销，DLL 卸载后进程的 VEH 链表里就留下一个指向**已卸载内存**
+    // 的处理器。下次注入再注册一个，链表变成 [野指针, 新指针]；而探测路径**本来
+    // 就会触发异常**（SEH 机制正是为此存在），于是 Windows 先调用那个野指针 ->
+    // 跳进已卸载内存 -> 0xC0000005。
+    // 实测：注入过一次的进程再注入必崩，全新进程首次注入正常 —— 完全吻合。
+    if (gSehHandle) {
+        RemoveVectoredExceptionHandler(gSehHandle);
+        gSehHandle = nullptr;
+        gSehReady.store(false, std::memory_order_release);
+    }
     // 交换链（这张表里的每一条都要还，blt / flip 可能是不同的 vtable）
     for (int i = 0; i < gSwapVtCount; ++i) {
         SwapVtEntry& e = gSwapVts[i];
