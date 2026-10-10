@@ -1216,36 +1216,14 @@ HRESULT PresentCommon(IDXGISwapChain* sc, UINT sync, UINT flags,
         gTel->simMs = (float)QpcMs(gSimEndQpc - gPresentRetQpc);
         gTel->submitMs = (float)QpcMs(now - gSimEndQpc);
     }
-    if (gPresentRetQpc && now > gPresentRetQpc) {
-        float busy = (float)QpcMs(now - gPresentRetQpc);
-        // 超过 1 秒的不是「一帧」，是切出去/加载留下的空档
-        if (busy > 0.0f && busy < 1000.0f) {
-            // 同值同时写进 cpuBusyMs：这是 PresentMon 的 CPUBusy 口径
-            gTel->cpuBusyMs = busy;
-        }
-    } else {
-        gTel->cpuFrameMs = gTel->frameMs;
-    }
-    // ★ CPU 帧时间 = CPUBusy + CPUWait（用户明确要求）。
+    // ⚠ CPU 帧时间（= CPUBusy + CPUWait）**不在这里算**。
     //
-    //   理由：这两个半边加起来才是「一帧里 CPU 侧的总时长」——
-    //     上一帧 Present 返回 --(CPUBusy)--> 本帧 Present 开始
-    //     本帧 Present 开始 --(CPUWait)--> Present 返回
-    //   单独看任何一个都不完整：Busy 在流水线渲染里接近 0，Wait 又随垂直同步变化。
-    //   两者之和恰好等于帧周期里的 CPU 部分，是玩家真正关心的那个数。
-    gTel->cpuFrameMs = gTel->cpuBusyMs + gTel->cpuWaitMs;
-    {
-        static np::Ema cpuEma(0.10f);
-        gTel->cpuFrameMsAvg = cpuEma.update(gTel->cpuFrameMs);
-    }
-    // CPUWait = 本帧在 Present 内部停留的时长（等垂直同步），复用已有的 msInPresent
-    gTel->cpuWaitMs = gLastInPresentMs;
-    {
-        static np::Ema busyEma(0.10f);
-        static np::Ema waitEma(0.10f);
-        gTel->cpuBusyAvg = busyEma.update(gTel->cpuBusyMs);
-        gTel->cpuWaitAvg = waitEma.update(gTel->cpuWaitMs);
-    }
+    //   原因：Busy 需要「本帧 Present 开始」(tPresent0)，Wait 需要「本帧 Present 返回」
+    //   (tPresent1) —— 而在 Present **调用之前**，tPresent1 还不存在。
+    //   之前在这里求和，Wait 用的是**上一帧**的值（而且赋值顺序还写在求和之后），
+    //   结果面板上 `CPU 帧时间 ≠ Busy + Wait`（实测 0.37 vs 0.24+5.95=6.19）。
+    //   正确的做法是在 Present 返回之后算，见本函数末尾的 CPU 段时间块。
+    if (!gPresentRetQpc) gTel->cpuFrameMs = gTel->frameMs;   // 首帧兜底
 
     // ---- Reflex 延迟标记：能读到就用它覆盖上面的启发式结果
     //
@@ -1485,6 +1463,48 @@ HRESULT PresentCommon(IDXGISwapChain* sc, UINT sync, UINT flags,
     uint64_t tPresent1 = NowQpc();
     gLastInPresentMs = (float)QpcMs(tPresent1 - tPresent0);
     if (gTel) gTel->msInPresent = gLastInPresentMs;
+
+    // ---- CPU 帧时间 = CPUBusy + CPUWait（**同一帧**的两个半边，在此处算）
+    //
+    //  之所以放在 Present 返回之后：Busy 要用「本帧 Present 开始」(tPresent0)，
+    //  Wait 要用「本帧 Present 返回」(tPresent1) —— 只有到这里两者才同时成立。
+    //
+    //  而且三项都由同一次减法导出，不存在「用了上一帧的值」这种错配：
+    //      Busy = tPresent0 − 上帧返回
+    //      Wait = tPresent1 − tPresent0
+    //      和   = tPresent1 − 上帧返回        <-- CPU 帧时间直接取这个
+    //
+    //  注意只用**真实呈现**计数：DXGI_PRESENT_TEST 不产生新帧，算进去会污染。
+    if (gTel && realPresent && gPresentRetQpc && tPresent1 > gPresentRetQpc) {
+        float waitMs = (float)QpcMs(tPresent1 - tPresent0);
+        float busyMs = (float)QpcMs(tPresent0 - gPresentRetQpc);
+        float totalMs = (float)QpcMs(tPresent1 - gPresentRetQpc);
+        if (busyMs < 0.0f) busyMs = 0.0f;
+        // 超过 1 秒的不是「一帧」，是切出去/加载留下的空档
+        if (totalMs > 0.0f && totalMs < 1000.0f) {
+            gTel->cpuBusyMs = busyMs;
+            gTel->cpuWaitMs = waitMs;
+            gTel->cpuFrameMs = totalMs;          // = busyMs + waitMs，同帧
+            static np::Ema busyEma(0.10f);
+            static np::Ema waitEma(0.10f);
+            static np::Ema cpuEma(0.10f);
+            gTel->cpuBusyAvg = busyEma.update(gTel->cpuBusyMs);
+            gTel->cpuWaitAvg = waitEma.update(gTel->cpuWaitMs);
+            gTel->cpuFrameMsAvg = cpuEma.update(gTel->cpuFrameMs);
+            // 诊断：把三个值一起打出来，方便核对 `帧时间 = Busy + Wait`（10 秒一条）
+            static uint32_t sLastCpuLog = 0;
+            uint32_t tkCpu = GetTickCount();
+            if (tkCpu - sLastCpuLog > 10000) {
+                sLastCpuLog = tkCpu;
+                Log("cpu split avg: busy=%.2f wait=%.2f sum=%.2f | instant busy=%.2f "
+                    "wait=%.2f sum=%.2f",
+                    (double)gTel->cpuBusyAvg, (double)gTel->cpuWaitAvg,
+                    (double)(gTel->cpuBusyAvg + gTel->cpuWaitAvg),
+                    (double)gTel->cpuBusyMs, (double)gTel->cpuWaitMs,
+                    (double)(gTel->cpuBusyMs + gTel->cpuWaitMs));
+            }
+        }
+    }
 
     // 记下渲染线程和「本帧 Present 返回的时刻」——它就是下一帧模拟阶段的起点
     gRenderTid = GetCurrentThreadId();

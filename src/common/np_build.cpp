@@ -270,7 +270,12 @@ void BuildPanelData(PanelData& out, const NPConfig& c, const NPSensors& s, const
     }
     if (c.counters & NP_C_CPU_FRAME) {
         // 金属 HUD 的 "Pre" 是蓝色 —— CPU 侧的时间类指标统一用蓝
-        acc.rowRange(L"CPU 帧时间", active ? Msv(t.cpuFrameMs) : L"—", PL_CPU, active,
+        // ★ 显示值 = Busy + Wait 的**平滑值之和**（与下面两行显示的正是同一对量）。
+        //   hook 里瞬时值也是 busy+wait，但面板上 Busy/Wait 显示的是 EMA，
+        //   若这里显示瞬时值，三行就永远加不上 —— 用户实测抓到过这个不一致。
+        float cpuShown = t.cpuBusyAvg + t.cpuWaitAvg;
+        if (cpuShown <= 0.0001f) cpuShown = t.cpuFrameMs;   // 平均值还没建立时的兜底
+        acc.rowRange(L"CPU 帧时间", active ? Msv(cpuShown) : L"—", PL_CPU, active,
                      h ? h->latCpu : nullptr, h, 1, -1e30f, 33.34f);
         if (showCharts && (c.counters & NP_C_CHART_LATENCY)) attach(acc.pending.back(), h->latCpu, 0);
 
