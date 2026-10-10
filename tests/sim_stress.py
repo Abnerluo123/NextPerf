@@ -46,34 +46,16 @@ k32.CreateRemoteThread.restype = ctypes.c_void_p
 
 
 def inject(pid, dll):
-    """标准 CreateRemoteThread + LoadLibraryW 注入（64 位）。"""
-    PROCESS_ALL = 0x1F0FFF
-    h = k32.OpenProcess(PROCESS_ALL, False, pid)
-    if not h:
-        raise OSError("OpenProcess 失败 err=%d" % ctypes.get_last_error())
-    buf = dll.encode("utf-16-le") + b"\x00\x00"
-    MEM_COMMIT_RESERVE, PAGE_RW = 0x3000, 0x04
-    remote = k32.VirtualAllocEx(h, None, len(buf), MEM_COMMIT_RESERVE, PAGE_RW)
-    if not remote:
-        raise OSError("VirtualAllocEx 失败")
-    written = ctypes.c_size_t(0)
-    if not k32.WriteProcessMemory(h, remote, buf, len(buf), ctypes.byref(written)):
-        raise OSError("WriteProcessMemory 失败")
-    k32.GetModuleHandleW.restype = ctypes.c_void_p
-    k32.GetModuleHandleW.argtypes = [ctypes.c_wchar_p]
-    k32.LoadLibraryW.restype = ctypes.c_void_p
-    k32.LoadLibraryW.argtypes = [ctypes.c_wchar_p]
-    local_k32 = k32.GetModuleHandleW("kernel32.dll")
-    load_lib = k32.GetProcAddress(local_k32, b"LoadLibraryW")
-    th = k32.CreateRemoteThread(h, None, 0, ctypes.c_void_p(load_lib), remote, 0, None)
-    if not th:
-        raise OSError("CreateRemoteThread 失败 err=%d" % ctypes.get_last_error())
-    k32.WaitForSingleObject(th, 15000)
-    code = ctypes.c_ulong(0)
-    k32.GetExitCodeThread(th, ctypes.byref(code))
-    k32.CloseHandle(th)
-    k32.CloseHandle(h)
-    return code.value
+    """复用 verify_inject.py 里**已经实测可用**的注入实现。
+
+    自己手写的那版 OpenProcess 会被拒（err=5 ACCESS_DENIED）—— 多半是
+    ctypes 的 argtypes/handle 声明细节问题。verify_inject.py 的 inject()
+    是反复实测过的，直接导入，不要在同一个坑里踩第二次。
+    """
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import verify_inject as vi
+    vi.inject(pid, dll)
+    return 1   # 成功（它会自己断言/抛异常，这里只表示没抛）
 
 
 def read_hook_log(pid):
@@ -89,7 +71,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--api", default="dx11")
     ap.add_argument("--no-inject", action="store_true", help="对照组：不注入钩子")
-    ap.add_argument("--seconds", type=int, default=25)
+    ap.add_argument("--seconds", type=int, default=90,
+                    help="模拟器时限；必须大于 12 步场景的耗时，否则会把「到时自动退出」误判成崩溃")
     args = ap.parse_args()
 
     if not os.path.exists(SIM):
@@ -101,10 +84,15 @@ def main():
         os.replace(HOOK_LOG, HOOK_LOG + ".bak")
 
     print("启动模拟器 api=%s，计划跑 %d 秒 ..." % (args.api, args.seconds))
+    # ⚠ 一定要抓 stderr：模拟器的诊断信息（SimLog）全走 stderr，
+    #   包括「ResizeBuffers 失败 -> 退回重建整条交换链」这类关键线索。
+    #   上一版把它丢进 DEVNULL，结果崩溃时完全没有诊断信息可看。
+    err_path = os.path.join(os.environ.get("TEMP", "."), "sim_stderr.txt")
+    err_f = open(err_path, "w", encoding="utf-8", errors="replace")
     p = subprocess.Popen([SIM, "--api=" + args.api, "--seconds=%d" % args.seconds,
                           "--json", "--json-every=30"],
                          stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                         stderr=subprocess.DEVNULL, text=True, bufsize=1)
+                         stderr=err_f, text=True, bufsize=1)
     time.sleep(3.0)
     if p.poll() is not None:
         print("模拟器提前退出（rc=%s）—— 环境问题，不是钩子的问题" % p.returncode)
@@ -200,6 +188,21 @@ def main():
             hits = [l for l in lines if key in l]
             if hits:
                 print("  %s：%d 条，例如 %s" % (key, len(hits), hits[0].strip()[:110]))
+    print("=" * 68)
+    # 模拟器自己的诊断（SimLog 走 stderr）—— 崩溃时全靠它定位
+    try:
+        err_f.flush()
+        err_f.close()
+        with open(err_path, "r", encoding="utf-8", errors="replace") as f:
+            err_lines = [l.rstrip() for l in f if l.strip()]
+        print("  模拟器 stderr 共 %d 行，下面是最关键的部分：" % len(err_lines))
+        key = [l for l in err_lines if any(k in l for k in
+               ("ResizeBuffers", "INVALID_CALL", "重建", "崩溃", "异常", "错误",
+                "失败", "错误码", "退出", "generation", "window", "borderless"))]
+        for l in (key[-10:] if key else err_lines[-10:]):
+            print("     %s" % l[:135])
+    except Exception as e:
+        print("  （读 stderr 失败：%s）" % e)
     print("=" * 68)
     return 0 if alive else 1
 
