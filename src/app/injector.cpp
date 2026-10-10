@@ -485,9 +485,17 @@ static std::vector<ProcEntry> EnumProcesses() {
 // 请求某个 pid 的钩子自卸载：置 cfg.detachPid，钩子在守卫线程（约 800ms 一轮）
 // 看到后会走 SelfUnloadNow —— 那套会 RestoreAllHooks（还原 vtable 补丁）、
 // 注销 VEH、FreeLibraryAndExitThread，正是「反复注入不闪退」用的干净卸载。
+// detachPid 的请求时间戳：约 2.5 秒后无条件清零。
+//
+// 为什么不能只在「pid 已退出」时清：游戏还活着的话 detachPid 会一直留着，
+// 下次再注入这个游戏，钩子一看 detachPid == 自己就**立刻又自卸载**。
+// 2.5 秒足够钩子（200ms 一轮）完成 SelfUnloadNow。
+static uint32_t gDetachAt = 0;
+
 void RequestHookDetach(DWORD pid) {
     if (!pid) return;
     gApp.cfg.detachPid = pid;
+    gDetachAt = GetTickCount() ? GetTickCount() : 1;
     AppLog("detach: 请求 pid=%lu 的钩子自卸载", (unsigned long)pid);
 }
 
@@ -499,11 +507,40 @@ void ForgetGameAt(int index) {
     DWORD pid = gApp.games[index].pid;
     std::wstring nm = gApp.games[index].name.empty() ? ExeNameOf(gApp.games[index].path)
                                                      : gApp.games[index].name;
-    if (pid) RequestHookDetach(pid);
-    {
+
+    // ★ pid 为 0 时**当场按名字查一遍进程**。
+    //   g.pid 是由 InjectorScanNow 填的，而它在 !monitoring 时直接 return，
+    //   所以监视关着、或条目刚学习完还没被扫过时 pid 都是 0 ——
+    //   原来 `if (pid)` 不成立就**根本没请求卸载**（用户报的「清空没有正确退出 hook」）。
+    if (!pid && !nm.empty()) {
+        for (auto& p : EnumProcesses()) {
+            if (p.pid == GetCurrentProcessId()) continue;
+            if (p.name == nm) { pid = p.pid; break; }
+        }
+    }
+
+    if (pid) {
+        RequestHookDetach(pid);
+
+        // ★ 摘掉「已注入」记录：否则 IsInjected 仍为真 -> 界面显示"已接管"、
+        //   而且自动注入不会再处理它（用户报的「接管状态没清空」）。
+        {
+            AppLock lk;
+            for (size_t i = gApp.injected.size(); i-- > 0;) {
+                if (gApp.injected[i] == pid) gApp.injected.erase(gApp.injected.begin() + i);
+            }
+            // ★ 遥测属于这个 pid 就清掉：否则 attached 仍为真，面板还以为钩子活着。
+            if (gApp.telemetry.pid == pid) {
+                NPClearTelemetry(&gApp.telemetry);
+                AppLog("forget: 已清空 pid=%lu 的遥测（接管状态）", (unsigned long)pid);
+            }
+            gApp.games.erase(gApp.games.begin() + index);
+        }
+    } else {
         AppLock lk;
         gApp.games.erase(gApp.games.begin() + index);
     }
+
     AppLog("forget: 已移除 %ls（pid=%lu，已请求卸载钩子）", nm.c_str(), (unsigned long)pid);
     SettingsSave();
 }
@@ -550,17 +587,25 @@ void InjectorScanNow() {
                 if (p.pid == GetCurrentProcessId()) continue;
                 if (p.name == want) { pid = p.pid; break; }
             }
-            // detachPid 用完就清：pid 会被系统复用，不清的话将来某个恰好复用
-            // 该 pid 的进程会一注入就被卸载。这里本来就每轮枚举进程，零额外成本。
+            // detachPid 用完就清，两种情况都清：
+            //   a) 目标 pid 已退出
+            //   b) 请求发出超过 2.5 秒（卸载早就完成了）—— 这一条是必须的：
+            //      只在退出时清的话，游戏还活着时 detachPid 会一直留着，
+            //      下次再注入它会立刻又被卸载。
+            //   pid 复用的问题也由此解决（清掉之后就不会误伤新进程）。
             if (gApp.cfg.detachPid != 0) {
                 bool stillAlive = false;
                 for (auto& p : procs) {
                     if (p.pid == gApp.cfg.detachPid) { stillAlive = true; break; }
                 }
-                if (!stillAlive) {
-                    AppLog("detach: pid=%lu 已退出，清除 detachPid",
-                           (unsigned long)gApp.cfg.detachPid);
+                uint32_t tnow = GetTickCount();
+                bool timeout = gDetachAt && tnow - gDetachAt >= 2500;
+                if (!stillAlive || timeout) {
+                    AppLog("detach: 清除 detachPid（pid=%lu %s）",
+                           (unsigned long)gApp.cfg.detachPid,
+                           stillAlive ? "已超时 2.5s，卸载应已完成" : "已退出");
                     gApp.cfg.detachPid = 0;
+                    gDetachAt = 0;
                 }
             }
             if (pid != g.pid) {
