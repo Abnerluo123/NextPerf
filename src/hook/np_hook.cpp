@@ -970,6 +970,22 @@ void UpdateTelemetryCommon(const NPConfig& cfg, uint64_t nowQpc, bool realPresen
                 }
                 line[off] = 0;
                 Log("recent ft(%u): %s", (unsigned)got, line);
+
+            // ★ Low 帧口径对照：三种算法同时打出来，用实机数据判断驱动面板用的是哪种。
+            //   现在面板用的是 raw（口径 3，与 PresentMon/Intel 一致）。
+            //   若 win500 对得上驱动的数字，说明驱动是在**平滑后的序列**上取百分位。
+            //   自己算一份窗口：lowWin 在主流程里声明得更晚，这里用不到它。
+            uint32_t lw = (uint32_t)(t.fpsAvg > 1.0f ? t.fpsAvg : 60.0f);
+            if (lw < 30) lw = 30;
+            if (lw > 480) lw = 480;
+            Log("low compare: raw1=%.1f raw01=%.1f | win500_1=%.1f win500_01=%.1f "
+                "| win1000_1=%.1f | avg=%.1f",
+                (double)gStats.lowPercentileFps(99.0f, lw),
+                (double)gStats.lowPercentileFps(99.9f, lw),
+                (double)gStats.lowWindowed(1.0f, 500.0f, 1200),
+                (double)gStats.lowWindowed(0.1f, 500.0f, 1200),
+                (double)gStats.lowWindowed(1.0f, 1000.0f, 1800),
+                (double)gStats.avgFps(600));
             }
         }
     }

@@ -127,6 +127,44 @@ public:
         return (float)n / (float)take;
     }
 
+    // Low 帧（**口径 4：窗口平均**）—— 先把帧时间按 windowMs 分组求平均，
+    // 再取最差 pct% 的那些「窗口平均」求平均并换算成 FPS。
+    //
+    // 与口径 3 的区别：
+    //   口径 3 看的是**单帧**最差 -> 抓的是一次卡顿
+    //   本口径看的是**一个时间窗的平均** -> 抓的是「持续半秒的低帧率」
+    // 游戏内 overlay 显示的 FPS 本来就是窗口平均值，NVIDIA 驱动面板的 1% Low
+    // 很可能也是在平滑后的序列上取的百分位 —— 提供本口径便于对照。
+    float lowWindowed(float pct, float windowMs, uint32_t lookback = kCap) const {
+        uint32_t take = std::min<uint32_t>(count_, std::min<uint32_t>(lookback, kCap));
+        if (take < 60) return 0.0f;
+        thread_local float tmp[kCap];
+        take = recent(tmp, take);
+
+        // 从**最新**往回切窗口：每凑够 windowMs 就得到一个「窗口平均帧时间」
+        thread_local float avgs[256];
+        int n = 0;
+        double acc = 0;
+        int cnt = 0;
+        for (int i = (int)take - 1; i >= 0 && n < 256; --i) {
+            acc += tmp[i];
+            ++cnt;
+            if (acc >= (double)windowMs) {
+                avgs[n++] = (float)(acc / cnt);
+                acc = 0;
+                cnt = 0;
+            }
+        }
+        if (n < 4) return 0.0f;   // 样本太少，百分位没有意义
+        std::sort(avgs, avgs + n, std::greater<float>());
+        uint32_t k = (uint32_t)std::ceil(n * pct / 100.0);
+        if (k < 1) k = 1;
+        double s = 0;
+        for (uint32_t i = 0; i < k; ++i) s += avgs[i];
+        double ms = s / k;
+        return ms > 0.0001 ? (float)(1000.0 / ms) : 0.0f;
+    }
+
     // Low 帧（**口径 3：百分位**，与 NVIDIA 驱动面板 / FrameView 一致）
     //
     // pct 传 99 表示 1% Low，99.9 表示 0.1% Low。
