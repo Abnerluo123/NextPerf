@@ -165,6 +165,45 @@ public:
         return ms > 0.0001 ? (float)(1000.0 / ms) : 0.0f;
     }
 
+    // 最近 window 个样本的**均值**（ms）。
+    //
+    // ⚠ 这里**不能用中位数**：帧内合并要处理的正是「8.4 / 24.9 各占一半」这种
+    //   **50/50 双峰**分布，而中位数在双峰上会随样本数奇偶而振荡
+    //   （偶数长度取中间两值平均 = 16.65；奇数长度取中间那一个 = 8.4 或 24.9），
+    //   导致阈值在 9.99 / 5.04 之间跳 —— 数值模拟实测到过，表现就是
+    //   「该合并的时而不合并」= 用户上次看到的帧时间忽高忽低。
+    //   均值在双峰上恒定（(8.4+24.9)/2 = 16.65），所以基准稳定。
+    //
+    //   均值对真卡顿敏感，靠**长窗口**（240 个样本 ≈ 4 秒）摊薄，
+    //   并在调用处把阈值夹在合理区间。
+    float meanMs(uint32_t window = kCap) const {
+        uint32_t take = std::min<uint32_t>(count_, std::min<uint32_t>(window, kCap));
+        if (take < 8) return 0.0f;
+        thread_local float tmp[kCap];
+        take = recent(tmp, take);
+        double s = 0;
+        for (uint32_t i = 0; i < take; ++i) s += tmp[i];
+        return (float)(s / take);
+    }
+
+    // 最近 window 个样本的**中位数**（ms）。保留给其它用途；
+    // ⚠ 不要拿它做帧内合并的基准，理由见上面的 meanMs。
+    //
+    // 用途：作为「帧内合并」的基准。**必须用中位数而不是平均值**：
+    //   * 对离群值免疫 —— 一半间隔是 8.4、一半是 24.9 时，中位数仍稳在 16.6
+    //   * 不受合并影响 —— 只要喂给它的是**从未合并过**的原始序列，
+    //     就不会出现「合并抬高统计量 -> 阈值变大 -> 合并更多」的正反馈
+    //     （上一版正是用 fpsAvg 做基准，才导致帧时间忽高忽低）。
+    float medianMs(uint32_t window = kCap) const {
+        uint32_t take = std::min<uint32_t>(count_, std::min<uint32_t>(window, kCap));
+        if (take < 8) return 0.0f;
+        thread_local float tmp[kCap];
+        take = recent(tmp, take);
+        std::sort(tmp, tmp + take);
+        if (take & 1u) return tmp[take / 2];
+        return (tmp[take / 2 - 1] + tmp[take / 2]) * 0.5f;
+    }
+
     // Low 帧（**口径 3：百分位**，与 NVIDIA 驱动面板 / FrameView 一致）
     //
     // pct 传 99 表示 1% Low，99.9 表示 0.1% Low。

@@ -314,6 +314,26 @@ uint64_t gLastPresentQpc = 0;
 // （min 间隔只有 2.17ms，而帧周期是 16.7ms），不合并就会造出假的短帧+长帧。
 bool     gAbsorbThisPresent = false;
 
+// ★ 独立的**原始**间隔序列：每个真实 Present 都记，**永不合并**。
+//
+// 为什么必须独立：帧内合并的阈值不能用「合并后序列」的统计量来定 ——
+//   合并 -> 间隔被抬高 -> fpsAvg 变小 -> 阈值变大 -> 合并更多 = 正反馈。
+//   （上一版就是用 fpsAvg 做基准，结果「帧时间」忽高忽低。）
+// gStats  = 合并后的序列（面板的 fps / Low / 帧时间都用它）
+// gRawStats = 原始序列（只用来求合并阈值的中位数）
+np::FrameStats gRawStats;
+uint32_t       gMergedCount = 0;   // 被合并掉的呈现数（诊断用）
+
+// 「上一次**呈现**」的时刻 —— **无论那一次有没有被合并，都要推进**。
+//
+// ⚠ 这个变量是整套合并方案能成立的前提：
+//   gLastPresentQpc 是「上一次**记账**」的时刻，被合并时**不推进**（这正是合并的机制：
+//   下一次的间隔自然覆盖整个帧）。所以 now - gLastPresentQpc 是**合并口径**的间隔，
+//   拿它去喂原始序列就等于让合并污染基准 -> 中位数被抬高 -> 阈值漂移 -> 正反馈。
+//   （数值模拟抓到过：形态 A 只吸收了 80 次而非约 200 次，合并后均值 20.81 而非 33.3。）
+//   真正的原始间隔只能从"上一次呈现"算，因此单独记一个。
+uint64_t gPrevPresentQpc = 0;
+
 // ---- Reflex 延迟标记
 //  游戏若启用 Reflex，会自己打 sim/submit/present 的标记，我们直接读它，
 //  这才是权威的 CPU 帧时间拆分（我们原来的公式只能算 Present 之间的残差）。
@@ -1012,14 +1032,19 @@ void UpdateTelemetryCommon(const NPConfig& cfg, uint64_t nowQpc, bool realPresen
             uint32_t lw = (uint32_t)(t.fpsAvg > 1.0f ? t.fpsAvg : 60.0f);
             if (lw < 30) lw = 30;
             if (lw > 480) lw = 480;
-            Log("low compare: raw1=%.1f raw01=%.1f | win500_1=%.1f win500_01=%.1f "
-                "| win1000_1=%.1f | avg=%.1f",
+            // merged* = 面板实际显示的口径（gStats，已做帧内合并）
+            // raw*    = 老口径（gRawStats，未合并）—— 两者一起打，便于判断合并是否
+            //           把 Low 帧修正到了驱动面板的量级、以及有没有误合并。
+            Log("low compare: merged1=%.1f merged01=%.1f | raw1=%.1f raw01=%.1f | "
+                "win500_1=%.1f | med=%.2fms merged=%u avg=%.1f",
                 (double)gStats.lowPercentileFps(99.0f, lw),
                 (double)gStats.lowPercentileFps(99.9f, lw),
+                (double)gRawStats.lowPercentileFps(99.0f, lw),
+                (double)gRawStats.lowPercentileFps(99.9f, lw),
                 (double)gStats.lowWindowed(1.0f, 500.0f, 1200),
-                (double)gStats.lowWindowed(0.1f, 500.0f, 1200),
-                (double)gStats.lowWindowed(1.0f, 1000.0f, 1800),
+                (double)gRawStats.meanMs(240), (unsigned)gMergedCount,
                 (double)gStats.avgFps(600));
+            gMergedCount = 0;
             }
         }
     }
@@ -1193,24 +1218,38 @@ HRESULT PresentCommon(IDXGISwapChain* sc, UINT sync, UINT flags,
         //   24% 的帧落进 20~30ms 区间、却在 30ms 处被硬生生切断（over30≈0%）。
         //   真抖动会有长尾（掉垂直同步 33.3ms、加载几百 ms），不会这样齐刷刷截断。
         //
-        //   阈值取**半个帧周期**（自适应）：合并后 gLastPresentQpc 不推进，
-        //   下一次的间隔自然覆盖整个帧，得到正确的 16.7ms。
-        //   夹在 2~40ms，保证 120fps（8.3ms 帧）与 30fps（33ms 帧）都不会被误合并。
-        // ★★ 已回退（用户实测：开启后「帧时间」本身变得忽高忽低）★★
+        //   ★ 基准**绝不能**用 fpsAvg —— 那是从**合并后**的序列算出来的：
+        //       合并 -> 间隔被抬高 -> fpsAvg 变小 -> 阈值变大 -> 合并更多 = **正反馈**。
+        //     上一版就是这么翻车的（用户实测「帧时间」本身变得忽高忽低）。
         //
-        //  原意：实测真实 Present 的最小间隔只有 2.17ms（帧周期 16.7ms），
-        //        怀疑游戏在一帧内多次调用 Present，于是想把过近的呈现并成一帧。
-        //  为什么回退：这个假设**在本地验证不了**（测试宿主 32fps、不会拆分帧），
-        //        而用户实机反馈它把帧时间读数弄得不稳定了 —— 说明判定条件
-        //        在某些真实时序下会误吞正常帧。**不该在验证不了的情况下改核心路径。**
-        //
-        //  正确做法：先看 `recent ft(40)` 打出来的**原始序列**，确认到底是不是
-        //  「密集的短帧+长帧配对」。确认了再按实际间隔分布设计条件，而不是拍脑袋。
-        //  下面保留 halfFrame 的计算与字段，方便有证据后一行打开。
-        float halfFrame = (gTel && gTel->fpsAvg > 1.0f) ? (1000.0f / gTel->fpsAvg) * 0.5f : 8.0f;
-        (void)halfFrame;
-        if (false && gStats.count() > 0 && fm < halfFrame) {
-            gAbsorbThisPresent = true;   // 已停用，理由见上
+        //     改用 **gRawStats 的中位数** —— 那是**从未被合并过**的原始序列，
+        //     而且中位数对离群值免疫：
+        //       8.4/24.9 交替  -> 中位数 16.6 -> 阈值 9.96 -> 8.4 被合并 -> 得 33.3 ✓
+        //       RE8 干净 16.6  -> 16.6 > 9.96 -> **不动** ✓
+        //       60fps 轻微抖动 -> 14~20 全部 > 9.96 -> **不动** ✓
+        //     三种情形都安全 —— 这正是上一版拍脑袋取「半个帧周期」做不到的。
+        // ★ 真正的原始间隔：与「上一次**呈现**」的距离，**不受合并影响**。
+        //   （用 fm 是不行的 —— 那是距上一次**记账**的间隔，已经被合并污染了。）
+        float fmRaw = 0.0f;
+        if (gPrevPresentQpc && now > gPrevPresentQpc)
+            fmRaw = (float)QpcMs(now - gPrevPresentQpc);
+        gPrevPresentQpc = now;
+        if (fmRaw > 0.02f && fmRaw < 1000.0f) gRawStats.push(fmRaw);
+
+        // 基准用**长窗口均值**（不是中位数 —— 双峰分布上中位数会振荡，
+        // 数值模拟实测到过，会导致该合并的时而不合并）。
+        float meanMs = gRawStats.meanMs(240);
+        float mergeThresh = 0.0f;
+        if (meanMs > 1.0f) {
+            mergeThresh = meanMs * 0.6f;
+            if (mergeThresh < 2.0f) mergeThresh = 2.0f;      // 夹紧：别把 120fps 的帧吞了
+            if (mergeThresh > 30.0f) mergeThresh = 30.0f;    // 夹紧：真卡顿时别乱合并
+        }
+        // 判定用**原始**间隔（这一次呈现离上一次呈现多远）；
+        // 记账仍然用 fm（距上一次记账 —— 被合并时它自然覆盖整个帧）。
+        if (mergeThresh > 0.0f && fmRaw > 0.0f && fmRaw < mergeThresh) {
+            gAbsorbThisPresent = true;   // 并入同一帧：不记账、不推进时间戳
+            ++gMergedCount;
         }
         // 超过 1 秒的间隔不是「一帧」，是切出去/加载/挂起留下的空档。
         // 把它塞进统计会把 1% Low / 0.1% Low 直接拖到个位数 ——

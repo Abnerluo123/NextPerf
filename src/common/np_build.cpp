@@ -270,11 +270,10 @@ void BuildPanelData(PanelData& out, const NPConfig& c, const NPSensors& s, const
     }
     if (c.counters & NP_C_CPU_FRAME) {
         // 金属 HUD 的 "Pre" 是蓝色 —— CPU 侧的时间类指标统一用蓝
-        // ★ 显示值 = Busy + Wait 的**平滑值之和**（与下面两行显示的正是同一对量）。
-        //   hook 里瞬时值也是 busy+wait，但面板上 Busy/Wait 显示的是 EMA，
-        //   若这里显示瞬时值，三行就永远加不上 —— 用户实测抓到过这个不一致。
-        float cpuShown = t.cpuBusyAvg + t.cpuWaitAvg;
-        if (cpuShown <= 0.0001f) cpuShown = t.cpuFrameMs;   // 平均值还没建立时的兜底
+        // ★ 用户要求：用**老的**口径 —— hook 里算好的瞬时值（同帧的 busy + wait）。
+        //   注意 Busy / Wait 两行下面也显示**瞬时值**（cpuBusyMs / cpuWaitMs），
+        //   三者是同一时刻的量，所以相加依然成立。
+        float cpuShown = t.cpuFrameMs;
         acc.rowRange(L"CPU 帧时间", active ? Msv(cpuShown) : L"—", PL_CPU, active,
                      h ? h->latCpu : nullptr, h, 1, -1e30f, 33.34f);
         if (showCharts && (c.counters & NP_C_CHART_LATENCY)) attach(acc.pending.back(), h->latCpu, 0);
@@ -287,13 +286,11 @@ void BuildPanelData(PanelData& out, const NPConfig& c, const NPSensors& s, const
     // **默认不显示**（用户要求：保留但默认关），而且它们之和已经作为「CPU 帧时间」
     // 显示出来了，所以只在用户主动勾选时才单独列出。颜色与 CPU 其他参数一致（PL_CPU）。
     if (c.counters & NP_C_CPU_BUSY) {
-        acc.row(L"CPU Busy", active && t.cpuBusyAvg > 0.0001f ? Msv(t.cpuBusyAvg) : L"—",
-                PL_CPU);
+        acc.row(L"CPU Busy", active && t.cpuBusyMs > 0.0f ? Msv(t.cpuBusyMs) : L"—", PL_CPU);
         if (showCharts && (c.counters & NP_C_CHART_LATENCY)) attach(acc.pending.back(), h->latBusy, 0);
     }
     if (c.counters & NP_C_CPU_WAIT) {
-        acc.row(L"CPU Wait", active && t.cpuWaitAvg > 0.0001f ? Msv(t.cpuWaitAvg) : L"—",
-                PL_CPU);
+        acc.row(L"CPU Wait", active && t.cpuWaitMs > 0.0f ? Msv(t.cpuWaitMs) : L"—", PL_CPU);
         if (showCharts && (c.counters & NP_C_CHART_LATENCY)) attach(acc.pending.back(), h->latWait, 0);
     }
     acc.flush(L"CPU", false, 9.0f);      // FPS 组 -> CPU 组：9px
