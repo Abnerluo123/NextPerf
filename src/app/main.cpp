@@ -471,99 +471,24 @@ static uint32_t gAutoCandSince = 0;
 static std::vector<DWORD> gAutoTried;
 static uint32_t gAutoScanMs = 0;
 
+// ---------------------------------------------------------------------------
+// 「靠窗口特征猜是不是游戏」的自动注入 —— **已停用**。
+//
+// 停用理由（调研 + 用户实测，见提交信息）：
+//   「是不是游戏」没有可靠的启发式判据。窗口化游戏与普通窗口在窗口属性上
+//   没有任何区别；主界面可能不做 3D 渲染；商店(UWP)应用的前台窗口是
+//   ApplicationFrameHost 的壳；而枚举目标进程的模块既打不开 UWP、
+//   也可能把游戏搞崩。主流工具（RTSS / Steam / Game Bar / Playnite）
+//   清一色靠**游戏数据库**，没有靠启发式猜的。
+//
+// 而且本项目本来就有可靠答案：**「添加游戏 exe」** ——
+// 用户添加一次，之后该进程一启动就自动注入（见 InjectorScanNow）。
+// 确定性、可解释、业界标准做法。**想做自动钩子，就用那条路。**
+// ---------------------------------------------------------------------------
 static void AppAutoInjectTick() {
-    using namespace npa;
-    if (!gApp.cfg.autoInject) {   // 开关默认关闭
-        gAutoCand = 0;
-        return;
-    }
-
-    // ★ 反作弊：直接放弃整轮（不做任何绕过尝试）
-    if (AnyAntiCheatRunning()) {
-        static bool warned = false;
-        if (!warned) {
-            warned = true;
-            AppLog("auto-inject: 检测到反作弊进程在运行 -> 放弃自动注入"
-                   "（反作弊阻止注入是其设计目标，不会尝试绕过）");
-        }
-        gAutoCand = 0;
-        return;
-    }
-
-    // ★★ 只考虑**前台窗口**所属进程。
-    //
-    //   之前的写法是扫描**所有进程**，只判断「有没有可见的大窗口」——
-    //   结果把用户的梯子、微信、甚至 NextPerf 自己都注入了，而这些应用
-    //   全都跑在后台、用户根本没点过它们。**那是设计错误，不是判据不够细。**
-    //   正在玩的游戏必然是前台窗口，所以这一条既足够又安全。
-    DWORD pid = gApp.forePid;
-    if (!pid || pid == GetCurrentProcessId()) { gAutoCand = 0; return; }
-    if (IsInjected(pid)) return;
-
-    HWND fg = GetForegroundWindow();
-    if (!fg || !IsWindowVisible(fg)) { gAutoCand = 0; return; }
-    DWORD fgPid = 0;
-    GetWindowThreadProcessId(fg, &fgPid);
-    if (fgPid != pid) { gAutoCand = 0; return; }   // 它已经不是前台了
-
-    RECT rc{};
-    if (!GetWindowRect(fg, &rc)) { gAutoCand = 0; return; }
-    if ((rc.right - rc.left) < 640 || (rc.bottom - rc.top) < 360) { gAutoCand = 0; return; }
-
-    // ★ UWP（商店）应用要先剥掉 ApplicationFrameHost 的壳，拿到**真实应用窗口**，
-    //   否则壳上既没有 DirectComposition 标记、尺寸也不对，必然被误判
-    //   （生化危机8 实测就是这样被跳过的）。注意**不能**再把
-    //   ApplicationFrameWindow 当成「非游戏窗口」直接跳过。
-    HWND gameWnd = RealGameWindow(fg);
-    wchar_t cls[128]{};
-    GetClassNameW(gameWnd, cls, 128);
-    if (_wcsicmp(cls, L"Progman") == 0 || _wcsicmp(cls, L"Shell_TrayWnd") == 0 ||
-        _wcsicmp(cls, L"WorkerW") == 0) {
-        gAutoCand = 0;
-        return;
-    }
-    if (NameLooksNonGame(gApp.foreName)) { gAutoCand = 0; return; }
-
-    // ★ 窗口特征判定：WS_EX_NOREDIRECTIONBITMAP（DX12 flip / UWP，最强信号）、
-    //   或窗口矩形与某个显示器完全一致（独占/无边框全屏）。
-    //   命中不了就认为「不像游戏」——宁可不注入，也不要乱注入
-    //   （上一版正因判据太宽，把用户的梯子、微信都注入了）。
-    if (!WindowLooksLikeGame(gameWnd)) {
-        static DWORD sLoggedPid = 0;
-        if (sLoggedPid != pid) {
-            sLoggedPid = pid;
-            AppLog("auto-inject: pid=%lu (%ls) 窗口无游戏特征"
-                   "（非 DirectComposition 合成、且尺寸不等于任何显示器；窗口类=%ls）-> 跳过",
-                   (unsigned long)pid, gApp.foreName.c_str(), cls);
-        }
-        gAutoCand = 0;
-        return;
-    }
-
-    // ⚠ 这里**不再去枚举目标进程的模块**判断「是不是 D3D 游戏」。
-    //   实测后果有两个：① 微软商店/UWP 应用（如生化危机8）OpenProcess 打不开，
-    //   一律被误判成「不是游戏」而不注入；② 枚举受保护进程的模块可能把它搞崩
-    //   （用户实测「游戏待机一会闪退」很可能就是它）。
-    //   而且有的游戏主界面根本不做 3D 渲染，「用没用 3D」也不能当判据。
-    //   => 判断依据回到「前台 + 窗口特征 + 拒绝清单」，全部不需要碰目标进程。
-
-    for (DWORD t : gAutoTried) {
-        if (t == pid) return;   // 同一个 pid 只试一次
-    }
-
-    uint32_t now32 = GetTickCount();
-    if (gAutoCand != pid) {
-        gAutoCand = pid;
-        gAutoCandSince = now32;
-        return;   // 先观察 1.5 秒
-    }
-    if (now32 - gAutoCandSince < 1500) return;
-
-    gAutoTried.push_back(pid);
-    if (gAutoTried.size() > 64) gAutoTried.erase(gAutoTried.begin());
-    AppLog("auto-inject: 前台 pid=%lu (%ls) 加载了 D3D 且连续前台 1.5s -> 注入",
-           (unsigned long)pid, gApp.foreName.c_str());
-    InjectInto(pid);
+    // 故意留空：不再根据窗口特征猜测并注入任何进程。
+    // 之前几版这里先后把用户的梯子、微信、甚至 NextPerf 自己当成游戏注入过，
+    // 也误判过商店版的生化危机8 —— 这条路不可靠，不做。
 }
 
 void AppTrackForeground() {
