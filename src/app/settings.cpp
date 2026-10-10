@@ -52,6 +52,8 @@ bool SettingsLoad() {
 
     auto get = [&](const char* k) -> np::Json::Value* { return v.find(k); };
     if (auto* p = get("counters")) gApp.cfg.counters = (uint64_t)p->numOr((double)gApp.cfg.counters);
+    // 自动注入开关（默认关闭）。旧配置没有这个键 -> 保持 0（关）。
+    if (auto* p = get("autoInject")) gApp.cfg.autoInject = (uint32_t)p->numOr(0.0);
     // 旧配置升级：v2 新增的图表计数器默认勾选一次；v3 改为行内小图开关
     {
         int ver = 1;
@@ -106,6 +108,7 @@ void SettingsSave() {
     Json::Value root = Json::mkObj();
     root.obj["cfgVersion"] = Json::mkNum(5);
     root.obj["counters"] = Json::mkNum((double)gApp.cfg.counters);
+    root.obj["autoInject"] = Json::mkNum((double)gApp.cfg.autoInject);
     root.obj["bgColor"] = Json::mkNum(gApp.cfg.bgColor);
     root.obj["textColor"] = Json::mkNum(gApp.cfg.textColor);
     root.obj["accentColor"] = Json::mkNum(gApp.cfg.accentColor);

@@ -179,7 +179,11 @@ struct NPConfig {
                             //   （游戏已经在跑的时候，工厂钩子不会再被调用，只能靠这个）
     uint32_t quit;          // 1=主程序正在退出，钩子收到后自行卸载
     uint32_t simulate;      // 1=模拟数据（开发预览用，正式版删除）
-    uint32_t reserved[8];
+    // ---- 自动注入开关（用户要求：默认关闭，为了安全）
+    // 复用原来的 reserved[0] 槽位 —— NPConfig 的**大小完全不变**，
+    // 共享内存的 version(=sizeof) 自检不受影响，旧钩子 DLL 也不会失配。
+    uint32_t autoInject;     // 0 = 关（默认）  1 = 检测到 3D 窗口时自动注入
+    uint32_t reserved[7];
 };
 
 // 历史采样环形缓冲：图表曲线的数据源。

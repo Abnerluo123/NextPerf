@@ -306,6 +306,86 @@ static void AppEnsureForegroundHook() {
                               WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
 }
 
+// ---------------------------------------------------------------------------
+// 3D 窗口自动注入
+//
+// 用户要求：检测到 3D 窗口就自动注入，省得每次手动操作；但**要给开关**，
+// 所以默认关闭（cfg.autoInject），由用户在界面上主动打开。
+//
+// 判据刻意保守 —— 误注入会打扰无关程序（浏览器、聊天工具），
+// 宁可漏掉也不乱来：
+//   * 前台窗口可见且面积 >= 640x360（排除对话框、工具条）
+//   * 窗口类名不在已知 shell/系统类里
+//   * 进程名不在拒绝清单里
+//   * **连续前台 >= 1.5 秒**（ALT+TAB 扫过不算）
+//   * 每个 pid 只尝试一次
+// ---------------------------------------------------------------------------
+
+static bool NameLooksNonGame(const std::wstring& raw) {
+    static const wchar_t* kDeny[] = {
+        L"explorer",   L"nextperf",   L"applicationframehost", L"searchhost",
+        L"startmenuexperiencehost",    L"shellexperiencehost",  L"chrome",
+        L"msedge",     L"firefox",    L"opera",     L"brave",     L"iexplore",
+        L"discord",    L"spotify",    L"telegram",  L"wechat",    L"dingtalk",
+        L"code",       L"devenv",     L"windowsterminal",       L"powershell",
+        L"pwsh",       L"taskmgr",    L"regedit",   L"systemsettings",
+    };
+    std::wstring nm = raw;
+    for (auto& c : nm) c = (wchar_t)towlower(c);
+    for (auto* d : kDeny) {
+        if (nm.find(d) != std::wstring::npos) return true;
+    }
+    return false;
+}
+
+static DWORD    gAutoCand = 0;
+static uint32_t gAutoCandSince = 0;
+static std::vector<DWORD> gAutoTried;
+
+static void AppAutoInjectTick() {
+    using namespace npa;
+    if (!gApp.cfg.autoInject) {   // 开关默认关闭
+        gAutoCand = 0;
+        return;
+    }
+    DWORD pid = gApp.forePid;
+    if (!pid || pid == GetCurrentProcessId()) { gAutoCand = 0; return; }
+    if (IsInjected(pid)) return;
+
+    HWND fg = GetForegroundWindow();
+    if (!fg || !IsWindowVisible(fg)) { gAutoCand = 0; return; }
+
+    RECT rc{};
+    if (!GetWindowRect(fg, &rc)) { gAutoCand = 0; return; }
+    if ((rc.right - rc.left) < 640 || (rc.bottom - rc.top) < 360) { gAutoCand = 0; return; }
+
+    wchar_t cls[128]{};
+    GetClassNameW(fg, cls, 128);
+    if (_wcsicmp(cls, L"Progman") == 0 || _wcsicmp(cls, L"Shell_TrayWnd") == 0 ||
+        _wcsicmp(cls, L"WorkerW") == 0 || _wcsicmp(cls, L"ApplicationFrameWindow") == 0) {
+        gAutoCand = 0;
+        return;
+    }
+    if (NameLooksNonGame(gApp.foreName)) { gAutoCand = 0; return; }
+    for (DWORD t : gAutoTried) {
+        if (t == pid) return;   // 同一个 pid 只试一次
+    }
+
+    uint32_t now = GetTickCount();
+    if (gAutoCand != pid) {
+        gAutoCand = pid;
+        gAutoCandSince = now;
+        return;   // 先观察 1.5 秒
+    }
+    if (now - gAutoCandSince < 1500) return;
+
+    gAutoTried.push_back(pid);
+    if (gAutoTried.size() > 64) gAutoTried.erase(gAutoTried.begin());
+    AppLog("auto-inject: pid=%lu (%ls) 连续前台 1.5s，判定为 3D 窗口",
+           (unsigned long)pid, gApp.foreName.c_str());
+    InjectInto(pid);
+}
+
 void AppTrackForeground() {
     AppEnsureForegroundHook();
     HWND fg = GetForegroundWindow();
@@ -815,6 +895,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdLine, int cmdShow) {
         if (now - lastTick >= 120) {
             lastTick = now;
             AppTrackForeground();
+            AppAutoInjectTick();   // 3D 窗口自动注入（默认关闭，见 cfg.autoInject）
             if (gApp.monitoring) {
                 AppPollSensors();
                 AppPublish();
