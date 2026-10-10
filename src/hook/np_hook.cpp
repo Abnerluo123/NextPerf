@@ -1689,9 +1689,26 @@ bool PatchSwapChainVtable(IDXGISwapChain* sc) {
 
 // 注入时游戏往往已经在跑了，CreateSwapChain* 永远不会再被调用 ——
 // 那就自己造一条最小交换链，把 vtable 拿到手，补丁打完立刻销毁。
+//
+// ⚠ 这条探测路径是**有风险**的：见 ProbeSwapChainVtable 里关于驱动崩溃的说明。
+//   gProbePoisoned 一旦置位就永久不再探测。
+static bool gProbePoisoned = false;
 // 补丁作用在共享 vtable 上，所以游戏那条**已经存在的**交换链马上就被接管了。
 bool ProbeSwapChainVtable() {
     if (PresentHooked()) return true;
+    // ★ 探测一旦撞过 SEH 就**永久停手**，不再重试。
+    //
+    // 为什么：每次探测都会在**运行中的游戏进程**里创建一个 D3D11 设备 + 交换链。
+    // 实测证据（re8.exe）：
+    //     SEH: code=0xc0000005 at nvwgf2umx.dll+0x330124     <- NVIDIA 用户态驱动
+    //     SEH: code=0xc0000005 at ?+00007FFCBB59A040          <- 非模块内存（同为驱动分配区）
+    //   两次的模块内偏移**完全相同**（...9A040）=> 同一个确定的驱动代码位置。
+    //   也就是说：在一个已经跑起来（很可能已独占全屏）的游戏里创建交换链，
+    //   会打到驱动的这个位置 -> 游戏闪退。
+    //   而重试上限是 3 次 —— 那就是**三次把游戏打崩的机会**，绝不能留。
+    //   （「先启动 NextPerf」不会触发，因为工厂钩子已经抓住游戏自己的交换链，
+    //     PresentHooked() 成立，探测根本不会跑 —— 这与用户实测完全吻合。）
+    if (gProbePoisoned) return false;
     if (!GetModuleHandleW(L"dxgi.dll")) return false;
     if (!SehReady()) { Log("ProbeSwapChainVtable: no SEH handler"); return false; }
     Log("ProbeSwapChainVtable: probing");
@@ -1701,7 +1718,10 @@ bool ProbeSwapChainVtable() {
     // 所以这里宁可泄漏这一次的 COM 引用，也不去 Release。
     if (setjmp(gJmp) != 0) {
         gJmpArmed = false;
-        Log("ProbeSwapChainVtable: SEH during probe, abandoned");
+        // 撞过 SEH 就永久停手：见函数开头的长注释 —— 重试等于多几次把游戏打崩的机会。
+        gProbePoisoned = true;
+        Log("ProbeSwapChainVtable: SEH during probe, abandoned AND disabled "
+            "(不再重试，避免反复触发驱动崩溃)");
         return PresentHooked();
     }
     gJmpArmed = true;
@@ -1717,15 +1737,40 @@ bool ProbeSwapChainVtable() {
                                D3D11_SDK_VERSION, &dev, &fl, &ctx);
     }
     if (SUCCEEDED(hr) && dev) {
-        // 一个 8x8 的隐藏窗口，够 CreateSwapChainForHwnd 用
+        // 一个 8x8 的隐藏窗口，够 CreateSwapChainForHwnd 用。
+        //
+        // ⚠⚠ 两处关键加固（用户怀疑「上次没清理干净，再次注入就闪退」时查到的）：
+        //
+        //  1) **延迟创建**：只有 composition 不可用的回退路径才真的需要窗口。
+        //     主路径是 CreateSwapChainForComposition（不绑窗口、不碰显示模式），
+        //     所以绝大多数情况下根本不会走到这里 —— 也就不留任何痕迹。
+        //
+        //  2) **类注册用宿主 exe 模块，而不是我们的 DLL**。
+        //     窗口类是**按进程**注册的，绑 gSelf（本 DLL）的话，DLL 一卸载这个类
+        //     就成了指向**已卸载模块**的野类，而且会**永久留在游戏进程里**
+        //     （自卸载里没有 UnregisterClass，也不该去注销别人的进程状态）。
+        //     于是「上次注入过、这次再注入」时 CreateWindowExW 就会碰到它。
+        //     宿主 exe 永远不会卸载，用它的模块句柄就没有这个问题。
+        //
+        //     顺带这也消掉了一个全局副作用：类名不再残留在用户的游戏进程里。
+        // ⚠ 这个窗口**必须即时创建**：下面的工厂创建被 `hwnd` 门控着
+        //   （`if (hwnd && SUCCEEDED(CreateDXGIFactory1(...)))`），
+        //   曾经改成延迟创建 -> hwnd 为 null -> f2 永远为 null -> 探测什么都不做，
+        //   实测表现是 probe attempt 1..3 全部 "no vtable obtained"。
+        //
+        // 真正要保留的改进是**类注册用宿主 exe 模块**（而不是 gSelf）：
+        // 窗口类是**按进程**注册的，绑本 DLL 的话 DLL 一卸载这个类就成了指向
+        // 已卸载模块的野类，还会永久残留在用户的游戏进程里。
+        // 宿主 exe 永远不会卸载，用它的模块句柄就没有这个问题。
+        HMODULE hostExe = GetModuleHandleW(nullptr);
         WNDCLASSEXW wc{};
         wc.cbSize = sizeof(wc);
         wc.lpfnWndProc = DefWindowProcW;
-        wc.hInstance = gSelf;
+        wc.hInstance = hostExe;          // 宿主 exe，不会卸载
         wc.lpszClassName = L"NextPerfProbeWnd";
-        RegisterClassExW(&wc);   // 已注册过也没关系
-        HWND hwnd = CreateWindowExW(0, L"NextPerfProbeWnd", L"", WS_POPUP, 0, 0, 8, 8,
-                                    nullptr, nullptr, gSelf, nullptr);
+        RegisterClassExW(&wc);           // 已注册过也没关系
+        HWND hwnd = CreateWindowExW(0, L"NextPerfProbeWnd", L"", WS_POPUP, 0, 0, 8, 8, nullptr,
+                                    nullptr, hostExe, nullptr);
 
         IDXGIFactory1* f1 = nullptr;
         IDXGIFactory2* f2 = nullptr;
@@ -1770,6 +1815,21 @@ bool ProbeSwapChainVtable() {
     return PresentHooked();
 }
 
+// 指针是否落在**我们自己**的 DLL 里。
+// 用途：InstallDxgi 读到的「原函数」若在这里，说明上一次卸载没能还原，
+// 那读到的是上一份 DLL 的钩子 —— 当成原函数用就会调用自己（无限递归 -> 栈溢出）。
+// 用 PE 头算模块范围，不依赖 psapi。
+static bool PointsIntoOurDll(const void* p) {
+    if (!p || !gSelf) return false;
+    uintptr_t base = reinterpret_cast<uintptr_t>(gSelf);
+    auto dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
+    auto nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
+    uintptr_t a = reinterpret_cast<uintptr_t>(p);
+    return a >= base && a < base + nt->OptionalHeader.SizeOfImage;
+}
+
 bool InstallDxgi() {
     IDXGIFactory1* factory1 = nullptr;
     if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory1))) || !factory1) {
@@ -1794,6 +1854,13 @@ bool InstallDxgi() {
         orig = nullptr;
         Patch(gFactory2Vt, Vt::Factory2::CreateSwapChainForHwnd, (void*)&NpCreateSwapChainHwnd,
               &orig);
+        if (orig && PointsIntoOurDll((void*)orig)) {
+            // 上一次卸载没还干净，这个"原函数"其实是上一份 DLL 的钩子。
+            // 拿它当原函数用 -> 调用自己 -> 无限递归 -> 栈溢出。所以宁可**不装**。
+            Log("InstallDxgi: CreateSwapChainForHwnd slot still points into our own DLL "
+                "(previous unload did NOT restore). Skipping this hook to avoid self-recursion.");
+            orig = nullptr;
+        }
         if (orig) gOrigCreateSCHwnd = (FnCreateSwapChainHwnd)orig;
         orig = nullptr;
         Patch(gFactory2Vt, Vt::Factory2::CreateSwapChainForComposition,
@@ -2220,11 +2287,24 @@ static HANDLE gInjectedMutex = nullptr;
 // 主程序已退出：摘掉全部钩子、释放资源、从宿主进程卸载本 DLL。
 // 顺序不能乱——先让跳板直通（gUnloading），再还原 vtable，
 // 短暂等待在途调用排空后才允许 FreeLibrary。
-static void SelfUnloadNow() {
-    gUnloading = true;
-    Sleep(150);
-
-    // 还原交换链补丁（这张表里的每一条都要还，blt / flip 可能是不同的 vtable）
+// ---------------------------------------------------------------------------
+// 还原所有 vtable 补丁。**幂等**，可以安全地重复调用。
+//
+// ⚠ 必须从两个地方都调用：
+//      SelfUnloadNow()            —— 优雅自卸载路径
+//      NpHookDetach()             —— DllMain 的 DLL_PROCESS_DETACH
+//   只写在 SelfUnloadNow 里是不够的：只要卸载不是走那条路径，
+//   补丁就会留在原地指向**即将被卸载的代码**，下次注入时读到「原函数」其实是
+//   上一次的钩子 -> 钩子调用自己 -> 无限递归 -> 栈溢出（实测 0xC0000005，
+//   崩溃地址正好是 DLL 基址 + 0xA040）。
+//   DLL_PROCESS_DETACH 是**唯一**保证「在代码被卸载前执行」的位置。
+// ---------------------------------------------------------------------------
+static void RestoreAllHooks() {
+    // 记一条：这样从日志就能确认**两条卸载路径**（SelfUnloadNow / DLL_PROCESS_DETACH）
+    // 到底有没有真的还原。之前没有这条日志，所以无法判断还原是否发生。
+    Log("RestoreAllHooks: swapVt=%d factory=%d factory2=%d queue=%d cmdlist=%d", gSwapVtCount,
+        gFactoryVt ? 1 : 0, gFactory2Vt ? 1 : 0, gQueueVt ? 1 : 0, gClVt ? 1 : 0);
+    // 交换链（这张表里的每一条都要还，blt / flip 可能是不同的 vtable）
     for (int i = 0; i < gSwapVtCount; ++i) {
         SwapVtEntry& e = gSwapVts[i];
         if (!e.vt) continue;
@@ -2236,7 +2316,8 @@ static void SelfUnloadNow() {
         Patch(gFactoryVt, Vt::Factory::CreateSwapChain, (void*)gOrigCreateSC, nullptr);
     if (gFactory2Vt) {
         if (gOrigCreateSCHwnd)
-            Patch(gFactory2Vt, Vt::Factory2::CreateSwapChainForHwnd, (void*)gOrigCreateSCHwnd, nullptr);
+            Patch(gFactory2Vt, Vt::Factory2::CreateSwapChainForHwnd, (void*)gOrigCreateSCHwnd,
+                  nullptr);
         if (gOrigCreateSCComp)
             Patch(gFactory2Vt, Vt::Factory2::CreateSwapChainForComposition,
                   (void*)gOrigCreateSCComp, nullptr);
@@ -2244,16 +2325,36 @@ static void SelfUnloadNow() {
     if (gQueueVt && gOrigECL)
         Patch(gQueueVt, Vt::CommandQueue::ExecuteCommandLists, (void*)gOrigECL, nullptr);
     if (gClVt) {
-        if (gOrigDR)       Patch(gClVt, Vt::CommandList::DispatchRays, (void*)gOrigDR, nullptr);
+        if (gOrigDR)
+            Patch(gClVt, Vt::CommandList::DispatchRays, (void*)gOrigDR, nullptr);
         if (gOrigBAS)
             Patch(gClVt, Vt::CommandList::BuildRaytracingAccelerationStructure, (void*)gOrigBAS,
-                 nullptr);
+                  nullptr);
         if (gOrigDispatch) Patch(gClVt, Vt::CommandList::Dispatch, (void*)gOrigDispatch, nullptr);
-        if (gOrigDrawInst) Patch(gClVt, Vt::CommandList::DrawInstanced, (void*)gOrigDrawInst, nullptr);
+        if (gOrigDrawInst)
+            Patch(gClVt, Vt::CommandList::DrawInstanced, (void*)gOrigDrawInst, nullptr);
         if (gOrigDrawIdx)
             Patch(gClVt, Vt::CommandList::DrawIndexedInstanced, (void*)gOrigDrawIdx, nullptr);
-        if (gOrigVP)       Patch(gClVt, Vt::CommandList::RSSetViewports, (void*)gOrigVP, nullptr);
+        if (gOrigVP) Patch(gClVt, Vt::CommandList::RSSetViewports, (void*)gOrigVP, nullptr);
     }
+    gFactoryVt = nullptr;
+    gFactory2Vt = nullptr;
+    gQueueVt = nullptr;
+    gClVt = nullptr;
+}
+
+// 指针是否落在**我们自己**的 DLL 里。
+// 用途：InstallDxgi 读到的「原函数」若在这里，说明上一次卸载没能还原，
+// 那读到的是上一份 DLL 的钩子 —— 当成原函数用就会调用自己（无限递归 -> 栈溢出）。
+// 用 PE 头算模块范围，不依赖 psapi。
+
+// 用 PE 头算模块范围，不依赖 psapi。
+
+static void SelfUnloadNow() {
+    gUnloading = true;
+    Sleep(150);
+
+    RestoreAllHooks();
     Sleep(250);   // 在途调用排空窗口
 
     // 图形与采集资源
@@ -2443,6 +2544,17 @@ void NpHookAttach(HMODULE self) {
 
 void NpHookDetach() {
     gReady = false;
+    // ★★ 关键：把 vtable 补丁还回去。
+    //
+    // 这里原来是**没有**还原的 —— 还原只写在 SelfUnloadNow() 里，而 DllMain 的
+    // DLL_PROCESS_DETACH 分支完全不碰补丁。于是只要卸载没走「优雅自卸载」那条路，
+    // 补丁就留在原地指向即将被卸载的代码；下次注入时 InstallDxgi 读到的「原函数」
+    // 其实是上一次的钩子 -> 钩子调用自己 -> 无限递归 -> 栈溢出
+    // （实测 0xC0000005，崩溃地址正好是 DLL 基址 + 0xA040）。
+    //
+    // DLL_PROCESS_DETACH 是**唯一**保证「在代码被卸载前执行」的位置，所以必须在这里还。
+    // RestoreAllHooks 是幂等的：SelfUnloadNow 已经还过一遍也没关系。
+    RestoreAllHooks();
     if (gWorker) {
         // 自卸载路径下 detach 发生在 worker 线程自己身上，不能等自己
         if (GetThreadId(gWorker) != GetCurrentThreadId())
