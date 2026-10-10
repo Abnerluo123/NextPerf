@@ -1483,14 +1483,26 @@ HRESULT PresentCommon(IDXGISwapChain* sc, UINT sync, UINT flags,
         Ts11Tick(seq);
     }
 
-    UpdateTelemetryCommon(cfg, now, realPresent);
+    // ★ 主程序停止监视时会置 pauseHook -> 不再绘制、也不再更新遥测。
+    //   原来停止监视只关掉桌面 HUD，游戏内面板照旧在画、数据照旧在读。
+    const bool paused = (cfg.pauseHook != 0);
+
+    // ★ 暂停时**不再更新遥测** = 停止读取游戏数据。
+    //   ⚠ 只跳过更新，**绝不能提前 return** —— PresentCommon 尾部还有一整套收尾
+    //     （gInPresent / gFrameStarted / gLastPresentQpc / gLastInPresentMs …），
+    //     从中间返回会让 gInPresent 永远为 true，之后每帧都走「已在 Present 中」
+    //     直通原函数，叠加与时间戳**永久失效**（这个坑踩过一次，下面也有注释）。
+    if (!paused) UpdateTelemetryCommon(cfg, now, realPresent);
 
     // ---- 叠加
     // 交换链刚重建过就让叠加层静默几帧：那段窗口期录屏障/绘制会踩到
     // NVIDIA 驱动的崩溃点（见 np_draw.cpp 里 settle_ 置位处的说明）。
     gOv12.tickSettle();
     bool settling = gOv12.settlePending();
-    bool wantOverlay = (cfg.overlayMode != 2) && (gDev11 || gDev12) &&
+    // ★ 主程序停止监视时会置 pauseHook -> **不再绘制游戏内叠加**。
+    //   原来停止监视只关掉桌面 HUD，游戏内 HUD 照旧在画：
+    //   用户点了「退出监视」，画面里却还挂着一个面板在更新，很怪。
+    bool wantOverlay = !paused && (cfg.overlayMode != 2) && (gDev11 || gDev12) &&
                        !(gDev12 && !d12ok) && !settling;
     bool panelOk = false, drawnOk = false;
     // ★ 原来这里（后台缓冲属于别的设备时）是 `bb->Release(); return CallOriginal();`

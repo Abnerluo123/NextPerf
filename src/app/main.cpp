@@ -8,6 +8,8 @@
 
 #include "np_app.h"
 
+#include <tlhelp32.h>   // CreateToolhelp32Snapshot（扫描进程，用于自动注入 + 反作弊检测）
+#include <psapi.h>      // EnumProcessModules / GetModuleFileNameExW（查目标进程加载的反作弊模块）
 #include <shellapi.h>
 #include <algorithm>
 #include <cstdarg>
@@ -338,9 +340,117 @@ static bool NameLooksNonGame(const std::wstring& raw) {
     return false;
 }
 
+// ---------------------------------------------------------------------------
+// 反作弊检测
+//
+// 用户要求：遇到反作弊**自动放弃**。
+// 反作弊主动阻止外部注入是它们的**设计目标**，硬上既有封号风险、也不符合工具定位，
+// 所以这里只做检测 + 放弃，**绝不尝试绕过**。
+//
+// 两道判据（任一命中就放弃）：
+//   1) 目标进程自身加载了反作弊模块
+//      （跨位数时枚举不到 —— 所以还有第 2 条兜底）
+//   2) **当前有反作弊进程在运行** —— 保守起见，此时整轮都不自动注入
+// ---------------------------------------------------------------------------
+static const wchar_t* kAntiCheatKw[] = {
+    L"easyanticheat", L"easyanticheat_eos", L"eac_",        // EasyAntiCheat（含 EOS）
+    L"beservice", L"battleye", L"becld",                     // BattlEye
+    L"vgc", L"vgtray", L"vanguard",                          // Riot Vanguard
+    L"denuvo",                                               // Denuvo Anti-Cheat
+    L"gamemon", L"npggnt", L"npkcrypt", L"nprotect",         // nProtect GameGuard
+    L"xigncode", L"x3.xem",                                  // XignCode3
+    L"pnkbstr",                                              // PunkBuster
+    L"fairfight", L"equ8", L"anticheat", L"anti-cheat",
+};
+
+static bool NameIsAntiCheat(const std::wstring& raw) {
+    std::wstring nm = raw;
+    for (auto& c : nm) c = (wchar_t)towlower(c);
+    for (auto* k : kAntiCheatKw) {
+        if (nm.find(k) != std::wstring::npos) return true;
+    }
+    return false;
+}
+
+// 目标进程自身是否加载了反作弊模块（跨位数枚举不到，返回 false，由第 2 条兜底）
+static bool ProcessHasAntiCheatModule(DWORD pid) {
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, FALSE, pid);
+    if (!h) return false;
+    typedef BOOL(WINAPI * EnumMods_t)(HANDLE, HMODULE*, DWORD, LPDWORD);
+    static EnumMods_t enumMods = nullptr;
+    static bool tried = false;
+    if (!tried) {
+        tried = true;
+        HMODULE ps = GetModuleHandleW(L"psapi.dll");
+        if (!ps) ps = LoadLibraryW(L"psapi.dll");
+        if (ps) enumMods = reinterpret_cast<EnumMods_t>(GetProcAddress(ps, "EnumProcessModules"));
+    }
+    bool hit = false;
+    if (enumMods) {
+        HMODULE mods[256]{};
+        DWORD need = 0;
+        if (enumMods(h, mods, sizeof(mods), &need)) {
+            DWORD n = need / sizeof(HMODULE);
+            if (n > 256) n = 256;
+            for (DWORD i = 0; i < n && !hit; ++i) {
+                wchar_t path[MAX_PATH]{};
+                if (GetModuleFileNameExW(h, mods[i], path, MAX_PATH)) {
+                    const wchar_t* base = wcsrchr(path, L'\\');
+                    if (NameIsAntiCheat(base ? base + 1 : path)) hit = true;
+                }
+            }
+        }
+    }
+    CloseHandle(h);
+    return hit;
+}
+
+// 当前是否有反作弊进程在运行（进程名匹配；5 秒缓存，不必每帧扫）
+static bool AnyAntiCheatRunning() {
+    static uint32_t sLastScan = 0;
+    static bool sCached = false;
+    uint32_t tk = GetTickCount();
+    if (sLastScan && tk - sLastScan < 5000) return sCached;
+    sLastScan = tk ? tk : 1;
+    sCached = false;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return false;
+    PROCESSENTRY32W pe{};
+    pe.dwSize = sizeof(pe);
+    if (Process32FirstW(snap, &pe)) {
+        do {
+            if (NameIsAntiCheat(pe.szExeFile)) { sCached = true; break; }
+        } while (Process32NextW(snap, &pe));
+    }
+    CloseHandle(snap);
+    return sCached;
+}
+
+// 某进程是否有「像游戏」的可见大窗口（不依赖前台）
+static bool ProcessLooksLikeGame(DWORD pid) {
+    struct Ctx { DWORD pid; bool ok; } ctx{pid, false};
+    EnumWindows(
+        [](HWND hw, LPARAM lp) -> BOOL {
+            auto* x = reinterpret_cast<Ctx*>(lp);
+            DWORD p = 0;
+            GetWindowThreadProcessId(hw, &p);
+            if (p != x->pid || !IsWindowVisible(hw)) return TRUE;
+            RECT rc{};
+            if (!GetWindowRect(hw, &rc)) return TRUE;
+            if ((rc.right - rc.left) >= 640 && (rc.bottom - rc.top) >= 360) {
+                x->ok = true;
+                return FALSE;
+            }
+            return TRUE;
+        },
+        reinterpret_cast<LPARAM>(&ctx));
+    return ctx.ok;
+}
+
 static DWORD    gAutoCand = 0;
 static uint32_t gAutoCandSince = 0;
 static std::vector<DWORD> gAutoTried;
+static uint32_t gAutoScanMs = 0;
 
 static void AppAutoInjectTick() {
     using namespace npa;
@@ -348,42 +458,72 @@ static void AppAutoInjectTick() {
         gAutoCand = 0;
         return;
     }
-    DWORD pid = gApp.forePid;
-    if (!pid || pid == GetCurrentProcessId()) { gAutoCand = 0; return; }
-    if (IsInjected(pid)) return;
 
-    HWND fg = GetForegroundWindow();
-    if (!fg || !IsWindowVisible(fg)) { gAutoCand = 0; return; }
-
-    RECT rc{};
-    if (!GetWindowRect(fg, &rc)) { gAutoCand = 0; return; }
-    if ((rc.right - rc.left) < 640 || (rc.bottom - rc.top) < 360) { gAutoCand = 0; return; }
-
-    wchar_t cls[128]{};
-    GetClassNameW(fg, cls, 128);
-    if (_wcsicmp(cls, L"Progman") == 0 || _wcsicmp(cls, L"Shell_TrayWnd") == 0 ||
-        _wcsicmp(cls, L"WorkerW") == 0 || _wcsicmp(cls, L"ApplicationFrameWindow") == 0) {
+    // ★ 反作弊：直接放弃整轮自动注入（不做任何绕过尝试）
+    if (AnyAntiCheatRunning()) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            AppLog("auto-inject: 检测到反作弊进程在运行 -> 放弃自动注入"
+                   "（反作弊阻止注入是其设计目标，不会尝试绕过）");
+        }
         gAutoCand = 0;
         return;
     }
-    if (NameLooksNonGame(gApp.foreName)) { gAutoCand = 0; return; }
-    for (DWORD t : gAutoTried) {
-        if (t == pid) return;   // 同一个 pid 只试一次
-    }
 
-    uint32_t now = GetTickCount();
-    if (gAutoCand != pid) {
-        gAutoCand = pid;
-        gAutoCandSince = now;
-        return;   // 先观察 1.5 秒
-    }
-    if (now - gAutoCandSince < 1500) return;
+    // ★ 扫描**所有进程**找「像游戏」的（不再只看前台窗口）。
+    //   每 3 秒一轮：注入本身要花时间，扫太勤没意义。
+    uint32_t now32 = GetTickCount();
+    if (gAutoScanMs && now32 - gAutoScanMs < 3000) return;
+    gAutoScanMs = now32 ? now32 : 1;
 
-    gAutoTried.push_back(pid);
+    DWORD me = GetCurrentProcessId();
+    DWORD best = 0;
+    std::wstring bestName;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap != INVALID_HANDLE_VALUE) {
+        PROCESSENTRY32W pe{};
+        pe.dwSize = sizeof(pe);
+        if (Process32FirstW(snap, &pe)) {
+            do {
+                DWORD pid = pe.th32ProcessID;
+                if (!pid || pid == me || pid == 4) continue;
+                std::wstring nm = pe.szExeFile;
+                if (NameLooksNonGame(nm)) continue;
+                bool triedAlready = false;
+                for (DWORD t : gAutoTried) {
+                    if (t == pid) { triedAlready = true; break; }
+                }
+                if (triedAlready || IsInjected(pid)) continue;
+                if (!ProcessLooksLikeGame(pid)) continue;
+                if (ProcessHasAntiCheatModule(pid)) {
+                    gAutoTried.push_back(pid);
+                    AppLog("auto-inject: pid=%lu (%ls) 加载了反作弊模块 -> 放弃",
+                           (unsigned long)pid, nm.c_str());
+                    continue;
+                }
+                best = pid;
+                bestName = nm;
+                break;   // 找到一个就先处理它，下一轮再看别的
+            } while (Process32NextW(snap, &pe));
+        }
+        CloseHandle(snap);
+    }
+    if (!best) { gAutoCand = 0; return; }
+
+    // 连续存在 >= 1.5 秒才动手（避免抓到刚启动就退出的进程）
+    if (gAutoCand != best) {
+        gAutoCand = best;
+        gAutoCandSince = now32;
+        return;
+    }
+    if (now32 - gAutoCandSince < 1500) return;
+
+    gAutoTried.push_back(best);
     if (gAutoTried.size() > 64) gAutoTried.erase(gAutoTried.begin());
-    AppLog("auto-inject: pid=%lu (%ls) 连续前台 1.5s，判定为 3D 窗口",
-           (unsigned long)pid, gApp.foreName.c_str());
-    InjectInto(pid);
+    AppLog("auto-inject: 扫描发现疑似游戏 pid=%lu (%ls) -> 注入", (unsigned long)best,
+           bestName.c_str());
+    InjectInto(best);
 }
 
 void AppTrackForeground() {
@@ -404,6 +544,10 @@ void AppTrackForeground() {
 }
 
 void AppPublish() {
+    // ★ 「退出监视」要连**游戏内的钩子**一起停：钩子据 pauseHook 跳过叠加绘制与
+    //   遥测更新（= 停止读取）。原来只关了桌面 HUD，游戏内面板照旧在画、
+    //   数据照旧在读 —— 用户点退出监视后还能看到它在更新。
+    gApp.cfg.pauseHook = gApp.monitoring ? 0u : 1u;
     if (gApp.shmCfg) {
         NPConfig c = gApp.cfg;
         memcpy(gApp.shmCfg, &c, sizeof(NPConfig));
@@ -896,6 +1040,14 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdLine, int cmdShow) {
             lastTick = now;
             AppTrackForeground();
             AppAutoInjectTick();   // 3D 窗口自动注入（默认关闭，见 cfg.autoInject）
+            // ★ 每个 tick 都同步一次配置（含 cfg.pauseHook）。
+            //
+            // 为什么加在这里而不是 monitoring 块里：原来 AppPublish() 只在
+            // monitoring 为真时调用，于是用户点「退出监视」后配置**再也不发布**，
+            // 钩子永远收不到 pauseHook —— 游戏内面板照旧在画、数据照旧在读，
+            // 只有桌面 HUD 被关掉了（用户报的第三个问题）。
+            // AppPublish 是幂等的、开销极小（几十字节的 memcpy），无条件调用最稳。
+            AppPublish();
             if (gApp.monitoring) {
                 AppPollSensors();
                 AppPublish();
@@ -935,23 +1087,39 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdLine, int cmdShow) {
                 }
                 InjectorTick();
 
-                bool attached = gApp.telemetry.attached &&
-                                (now - gApp.telemetry.tickMs) < 2500;
+                // ★ 「钩子是否接管」不要用**跨进程的时钟差**来判断。
+                //   实测诊断日志：age=4294967265ms（32 位下的 -31，即 tickMs 落在"未来"）
+                //   -> `age < 2500` 永远为假 -> attached 永远为假
+                //   -> **桌面 HUD 永不关闭**（用户报的那个 bug）。
+                //   时钟跨进程比较本来就不该作为依据：旧钩子实例残留、时钟回绕、
+                //   共享内存里的历史值，任何一样都会让它变成垃圾。
+                //
+                //   改成看**帧计数是否在增长**：与时钟无关，而且是「钩子活着并且真的
+                //   在计数」的直证。守护线程停摆、Present 没挂上、
+                //   监控已暂停（不再更新遥测），都会让它自然变假。
+                static uint64_t sLastFt = 0;
+                static uint64_t sLastGrowMs = 0;
+                uint64_t ft = gApp.telemetry.frameTotal;
+                if (ft != sLastFt) {
+                    sLastFt = ft;
+                    sLastGrowMs = now;
+                }
+                bool attached = gApp.telemetry.attached && sLastGrowMs != 0 &&
+                                (now - sLastGrowMs) < 2500;
                 bool wantDesktop = !gOverlayOff && gApp.monitoring &&
                                    (gApp.cfg.overlayMode == 2 ||
                                     (!attached && gApp.cfg.overlayMode != 1));
-                // 诊断：无边框下「桌面 HUD 与游戏内 HUD 同时存在」的问题定位用。
-                // 每 5 秒一条，把判定依据全部打出来，免得再靠猜。
+                // 诊断：每 5 秒一条，把判定依据全部打出来（帧计数版）
                 {
                     static uint32_t sLastOvLog = 0;
                     uint32_t tk = GetTickCount();
                     if (tk - sLastOvLog > 5000) {
                         sLastOvLog = tk;
-                        AppLog("overlay mode: mode=%u attached=%d (tele=%d age=%ums pid=%lu) "
-                               "monitoring=%d off=%d -> wantDesktop=%d",
+                        AppLog("overlay mode: mode=%u attached=%d (tele=%d ft=%llu growAge=%llums "
+                               "pid=%lu) monitoring=%d off=%d -> wantDesktop=%d",
                                gApp.cfg.overlayMode, attached ? 1 : 0,
-                               gApp.telemetry.attached ? 1 : 0,
-                               (unsigned)(now - gApp.telemetry.tickMs),
+                               gApp.telemetry.attached ? 1 : 0, (unsigned long long)ft,
+                               (unsigned long long)(sLastGrowMs ? now - sLastGrowMs : 0),
                                (unsigned long)gApp.telemetry.pid,
                                gApp.monitoring ? 1 : 0, gOverlayOff ? 1 : 0,
                                wantDesktop ? 1 : 0);
