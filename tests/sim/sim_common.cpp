@@ -105,21 +105,32 @@ const char* SimWindowModeName(SimWindowMode m) {
 
 bool SimWindowModeParse(const char* s, SimWindowMode* out) {
     if (!s || !out) return false;
-    if (!EqNoCase(s, "windowed") || !EqNoCase(s, "window")) { *out = SimWindowMode::Windowed; return true; }
-    if (!EqNoCase(s, "borderless") || !EqNoCase(s, "noborder")) { *out = SimWindowMode::Borderless; return true; }
-    if (!EqNoCase(s, "fullscreen") || !EqNoCase(s, "exclusive") || !EqNoCase(s, "fs")) {
-        *out = SimWindowMode::Fullscreen; return true;
+    // 注意语义差别（这里踩过坑）：_stricmp(a,b)==0 才表示相等，
+    // 而 EqNoCase(a,b) 直接返回 bool，所以**不能**写成 !EqNoCase(...)。
+    if (EqNoCase(s, "windowed") || EqNoCase(s, "window")) {
+        *out = SimWindowMode::Windowed;
+        return true;
+    }
+    if (EqNoCase(s, "borderless") || EqNoCase(s, "noborder")) {
+        *out = SimWindowMode::Borderless;
+        return true;
+    }
+    if (EqNoCase(s, "fullscreen") || EqNoCase(s, "exclusive") || EqNoCase(s, "fs")) {
+        *out = SimWindowMode::Fullscreen;
+        return true;
     }
     return false;
 }
 
 static bool ParseBool(const char* s, bool* out) {
     if (!s || !out) return false;
-    if (!EqNoCase(s, "on") || !EqNoCase(s, "1") || !EqNoCase(s, "true") || !EqNoCase(s, "yes")) {
-        *out = true; return true;
+    if (EqNoCase(s, "on") || EqNoCase(s, "1") || EqNoCase(s, "true") || EqNoCase(s, "yes")) {
+        *out = true;
+        return true;
     }
-    if (!EqNoCase(s, "off") || !EqNoCase(s, "0") || !EqNoCase(s, "false") || !EqNoCase(s, "no")) {
-        *out = false; return true;
+    if (EqNoCase(s, "off") || EqNoCase(s, "0") || EqNoCase(s, "false") || EqNoCase(s, "no")) {
+        *out = false;
+        return true;
     }
     return false;
 }
@@ -255,6 +266,9 @@ SimConfig SimParseArgs(int argc, char** argv) {
         } else if (key == "json-every") {
             if (!Atoll(val, &n) || n <= 0) { c.error = "--json-every 需要正整数"; return c; }
             c.json_every = (int)n;
+            // 给了 --json-every 就说明想要 JSON 行输出，顺手把 --json 打开。
+            // 不这样做的话 `--json-every=100` 会静默什么都不输出，很难查。
+            c.json = true;
         } else if (key == "warmup") {
             if (!Atoll(val, &n) || n < 0) { c.error = "--warmup 需要非负整数"; return c; }
             c.warmup_frames = (int)n;
@@ -290,6 +304,11 @@ SimConfig SimParseArgs(int argc, char** argv) {
     // 没给 --seconds / --frames 就是「跑到被要求退出为止」（quit 命令或关窗）。
     // 这是有意的默认：手动观察画面时不想每次都算时间。
     if (c.warmup_frames < 0) c.warmup_frames = 0;
+    // 帧数比 warmup 还少的话统计会永远是空的（旧宿主那种「跑 3 帧没数据」
+    // 的困惑就是这么来的），所以把 warmup 夹到 frames/2。
+    if (c.frames_set && c.warmup_frames >= c.frames) {
+        c.warmup_frames = (int)(c.frames / 2);
+    }
     return c;
 }
 
@@ -371,13 +390,73 @@ static LRESULT CALLBACK SimWndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     return DefWindowProcW(h, m, w, l);
 }
 
+// 窗口客户区的真实像素尺寸。
+//
+// **不要用 GetSystemMetrics(SM_CXSCREEN) 来当「全屏该有多大」**：在开启
+// 显示缩放的机器上（例如 150%），进程不是 DPI 感知时 Windows 会把窗口坐标
+// 虚拟化，SM_CXSCREEN 给的是物理像素而 SetWindowPos 收的是逻辑像素，两者
+// 混用会得到一个奇怪尺寸的窗口（实测：2560x1440 的屏幕 + 125% 缩放，
+// 最终客户区变成 1707x1067）。交换链分辨率必须和客户区一致，否则 DWM 会
+// 拉伸画面、present 时机失真。
+//
+// 所以统一按「样式设好之后量一次客户区」来决定交换链尺寸 —— 这样无论
+// DPI 缩放、显示器尺寸、任务栏位置怎么变，拿到的都是真实值。
+void SimClientSize(HWND hwnd, int* w, int* h) {
+    RECT rc{};
+    if (!hwnd || !GetClientRect(hwnd, &rc)) {
+        if (w) *w = 1280;
+        if (h) *h = 720;
+        return;
+    }
+    int cw = rc.right - rc.left;
+    int ch = rc.bottom - rc.top;
+    if (cw <= 0) cw = 1280;
+    if (ch <= 0) ch = 720;
+    if (w) *w = cw;
+    if (h) *h = ch;
+}
+
 void SimPrimaryMonitorSize(int* w, int* h) {
+    // 进程已经在 SimEnableDpiAwareness() 里声明了 DPI 感知，所以窗口坐标
+    // 不再被虚拟化，GetSystemMetrics(SM_CXSCREEN) 就是真实像素 —— 可以放心
+    // 拿它当「铺满全屏该多大」。
     int mw = GetSystemMetrics(SM_CXSCREEN);
     int mh = GetSystemMetrics(SM_CYSCREEN);
     if (mw <= 0) mw = 1280;
     if (mh <= 0) mh = 720;
     if (w) *w = mw;
     if (h) *h = mh;
+}
+
+void SimEnableDpiAwareness() {
+    // 为什么要管 DPI 感知：默认（不感知）的进程里，Windows 会把窗口 API 的
+    // 坐标做 DPI 虚拟化，而 GetSystemMetrics / DXGI 走的是物理像素。
+    // 两者混用的后果实测过：2560x1440（125% 缩放）上请求「铺满屏幕」，
+    // 拿到的是 1707x1019 的客户区，交换链尺寸和窗口尺寸对不上，
+    // DWM 会把画面拉伸，present 时机也就跟着失真。
+    //
+    // 声明为 DPI 感知之后所有坐标统一为物理像素，全屏尺寸就准了。
+    // SetProcessDpiAwarenessContext 是 Win10 1703+ 才有的，而 zig 自带的
+    // MinGW 头里可能没有声明 —— 所以这里手写函数指针 + LoadLibrary 动态取，
+    // 和 src/sensors/np_vendor.h 里的手法一致，取不到就退到老的
+    // SetProcessDPIAware()（Vista+ 一直都有）。
+    typedef BOOL(WINAPI * PfnSetCtx)(void* value);
+    typedef BOOL(WINAPI * PfnSetAware)(void);
+
+    HMODULE user32 = GetModuleHandleW(L"user32.dll");
+    if (!user32) user32 = LoadLibraryW(L"user32.dll");
+    if (user32) {
+        PfnSetCtx set_ctx = (PfnSetCtx)GetProcAddress(user32, "SetProcessDpiAwarenessContext");
+        if (set_ctx) {
+            // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = (HANDLE)-4
+            if (set_ctx((void*)(INT_PTR)-4)) return;
+            // DPI_AWARENESS_CONTEXT_SYSTEM_AWARE = (HANDLE)-2
+            if (set_ctx((void*)(INT_PTR)-2)) return;
+        }
+        PfnSetAware set_aware = (PfnSetAware)GetProcAddress(user32, "SetProcessDPIAware");
+        if (set_aware && set_aware()) return;
+    }
+    // 全失败也没关系：只是全屏尺寸可能不准，功能不受影响。
 }
 
 HWND SimCreateWindow(HINSTANCE inst, const SimConfig& cfg, int w, int h, SimWindowMode mode) {
@@ -444,6 +523,10 @@ void SimApplyWindowMode(HWND hwnd, SimWindowMode mode, int w, int h) {
         SetWindowPos(hwnd, HWND_TOP, sx < 0 ? 0 : sx, sy < 0 ? 0 : sy, sw, sh,
                      SWP_FRAMECHANGED | SWP_SHOWWINDOW);
     } else {
+        // borderless / fullscreen：铺满整个显示器。
+        // 这里用 SM_CXSCREEN/SM_CYSCREEN（物理像素）定窗口尺寸，然后由调用方
+        // **量一次客户区**作为交换链分辨率 —— 两者不混用，任何 DPI 缩放比例下
+        // 都不会算出奇怪尺寸。
         int mw, mh;
         SimPrimaryMonitorSize(&mw, &mh);
         SetWindowLongPtrW(hwnd, GWL_STYLE, WS_POPUP);
@@ -527,6 +610,16 @@ void SimPacer::WaitForFrameStart() {
 // 控制命令
 // ============================================================================
 
+// 命令解析的诊断开关：环境变量 SIM_DEBUG_CMDS=1 时把读到的原始字节、
+// 切出来的 token、以及关键字段的解析结果打到 stderr。
+// 排查「管道里传过来的到底是什么」这类问题时离不了 —— 行尾 CR、空行、
+// 多条命令粘在一行都很难从现象上猜出来。
+static bool SimDebugCmds() {
+    static int cached = -1;
+    if (cached < 0) cached = getenv("SIM_DEBUG_CMDS") ? 1 : 0;
+    return cached == 1;
+}
+
 // 空白切分。
 //
 // 必须把 '\n' 也算作空白：管道 / 文件重定向过来的行尾可能是裸 LF（Python 的
@@ -554,10 +647,7 @@ SimCommand SimParseCommand(const std::string& line) {
     SplitWs(line, &t);
 
     // 诊断：SIM_DEBUG_CMDS=1 时把读到的原始字节和切出来的 token 都打出来。
-    // 排查「管道里传过来的到底是什么」这类问题时离不了（行尾 CR、空行、
-    // 多个命令粘在一行都很难从现象上猜）。
-    static const bool dbg = getenv("SIM_DEBUG_CMDS") != nullptr;
-    if (dbg) {
+    if (SimDebugCmds()) {
         fprintf(stderr, "[sim] cmd raw bytes:");
         for (unsigned char ch : line) fprintf(stderr, " %02X", ch);
         fprintf(stderr, "   tokens=%llu", (unsigned long long)t.size());
@@ -604,6 +694,9 @@ SimCommand SimParseCommand(const std::string& line) {
         c.on = b;   // 注意：这里必须先解析到局部变量再赋值回来，
                     // 早期版本漏了这一行，导致 "vsync off" 被当成 on（默认值）。
         c.kind = SimCommand::Vsync;
+        if (SimDebugCmds()) {
+            fprintf(stderr, "[sim]   vsync parse: tok=<%s> -> on=%d\n", t[1].c_str(), (int)b);
+        }
     } else if (k == "fpscap" || k == "fps-cap" || k == "cap") {
         if (!need(1, "fpscap N")) return c;
         c.n = atoi(t[1].c_str());
@@ -636,6 +729,51 @@ SimCommand SimParseCommand(const std::string& line) {
     return c;
 }
 
+// ---------------------------------------------------------------- 最近帧率
+
+// 「最近约 1 秒的实测帧率」。给 status 命令用。
+//
+// 为什么不直接在 status 里算：处理命令的代码在 SimApplyCommand 里，拿不到
+// 主循环的统计序列。这里放一个很小的环形缓冲，主循环每帧塞一次帧间隔；
+// 问的时候求和换算即可 —— 是真测出来的值，不是编的。
+static const int kRecentSlots = 240;
+static double g_recent_delta[kRecentSlots] = {0};
+static int g_recent_pos = 0;
+static int g_recent_count = 0;
+static CRITICAL_SECTION g_recent_cs;
+static bool g_recent_cs_ready = false;
+
+void SimRecentPushFrame(double delta_ms) {
+    if (!g_recent_cs_ready) {
+        InitializeCriticalSection(&g_recent_cs);
+        g_recent_cs_ready = true;
+    }
+    EnterCriticalSection(&g_recent_cs);
+    g_recent_delta[g_recent_pos] = delta_ms;
+    g_recent_pos = (g_recent_pos + 1) % kRecentSlots;
+    if (g_recent_count < kRecentSlots) ++g_recent_count;
+    LeaveCriticalSection(&g_recent_cs);
+}
+
+static double RecentFps() {
+    if (!g_recent_cs_ready) return 0.0;
+    EnterCriticalSection(&g_recent_cs);
+    double sum = 0.0;
+    int n = 0;
+    // 从最新往回累加到约 1 秒
+    for (int i = 1; i <= g_recent_count; ++i) {
+        int idx = (g_recent_pos - i + kRecentSlots * 2) % kRecentSlots;
+        double d = g_recent_delta[idx];
+        if (d <= 0.0) continue;
+        sum += d;
+        ++n;
+        if (sum >= 1000.0) break;
+    }
+    LeaveCriticalSection(&g_recent_cs);
+    if (sum <= 0.0 || n == 0) return 0.0;
+    return (double)n * 1000.0 / sum;
+}
+
 void SimApplyCommand(const SimCommand& cmd, SimControlContext& ctx) {
     switch (cmd.kind) {
         case SimCommand::Resize: {
@@ -644,6 +782,11 @@ void SimApplyCommand(const SimCommand& cmd, SimControlContext& ctx) {
             if (ctx.engine->Resize(cmd.w, cmd.h, &err)) {
                 *ctx.width = cmd.w;
                 *ctx.height = cmd.h;
+                // 记住窗口化时的尺寸：从 borderless/fullscreen 切回 windowed
+                // 时要还原成这个尺寸，而不是停在显示器尺寸上（那样就不是
+                // 「切回窗口模式」了，脚本也会以为没生效）。
+                if (ctx.windowed_w) *ctx.windowed_w = cmd.w;
+                if (ctx.windowed_h) *ctx.windowed_h = cmd.h;
                 if (ctx.resize_events) ++*ctx.resize_events;
             } else {
                 SimLog("Resize 失败：%s", err.c_str());
@@ -652,25 +795,56 @@ void SimApplyCommand(const SimCommand& cmd, SimControlContext& ctx) {
         }
         case SimCommand::WindowMode: {
             SimLog("命令 window %s", SimWindowModeName(cmd.mode));
+            // 切到窗口化时用记住的窗口尺寸；切到 borderless/fullscreen 时
+            // 传当前尺寸（SimApplyWindowMode 内部会铺满显示器）。
+            int target_w = *ctx.width, target_h = *ctx.height;
+            if (cmd.mode == SimWindowMode::Windowed && ctx.windowed_w && ctx.windowed_h) {
+                target_w = *ctx.windowed_w;
+                target_h = *ctx.windowed_h;
+            }
             *ctx.mode = cmd.mode;
-            int mw = 0, mh = 0;
-            SimPrimaryMonitorSize(&mw, &mh);
             if (cmd.mode == SimWindowMode::Fullscreen && ctx.engine->WantsExclusiveFullscreen()) {
-                // 独占全屏前必须回到 windowed：flip 模型不允许从 borderless
-                // 直接跳 exclusive，中间必须经过窗口化状态。
-                SimApplyWindowMode(ctx.hwnd, SimWindowMode::Windowed, *ctx.width, *ctx.height);
+                // 独占全屏前必须回到窗口化：flip 模型不允许从 borderless 直接
+                // 跳到 exclusive，中间必须经过一次窗口化状态。
+                SimApplyWindowMode(ctx.hwnd, SimWindowMode::Windowed, target_w, target_h);
                 SimPumpMessages();
             }
-            SimApplyWindowMode(ctx.hwnd, cmd.mode, *ctx.width, *ctx.height);
+            SimApplyWindowMode(ctx.hwnd, cmd.mode, target_w, target_h);
             SimPumpMessages();
-            if (cmd.mode != SimWindowMode::Windowed) {
-                // 全屏 / 无边框都铺满桌面：分辨率跟着变，交换链也要重建尺寸。
-                *ctx.width = mw;
-                *ctx.height = mh;
+            // 交换链分辨率一律以「样式设好之后的真实客户区」为准。
+            // 这样 borderless / fullscreen 自动跟着显示器走，windowed 回到
+            // 记住的尺寸，两种模式都不需要外部再补一次 resize 命令。
+            int cw = 0, ch = 0;
+            SimClientSize(ctx.hwnd, &cw, &ch);
+            const int prev_w = *ctx.width, prev_h = *ctx.height;
+            if (cw != prev_w || ch != prev_h) {
                 std::string err;
-                if (!ctx.engine->Resize(mw, mh, &err)) SimLog("全屏 Resize 失败：%s", err.c_str());
+                if (!ctx.engine->Resize(cw, ch, &err)) {
+                    SimLog("窗口状态切换后 Resize 到 %dx%d 失败：%s", cw, ch, err.c_str());
+                } else {
+                    *ctx.width = cw;
+                    *ctx.height = ch;
+                    if (ctx.resize_events) ++*ctx.resize_events;
+                }
             }
-            ctx.engine->OnWindowModeChanged(cmd.mode);
+            // 最后才让后端做它自己那步（DX11 是 SetFullscreenState）。
+            // 顺序不能反：必须在窗口已经变成无边框全屏尺寸之后再进独占全屏，
+            // 否则 DXGI 会返回 E_FAIL。
+            if (!ctx.engine->OnWindowModeChanged(cmd.mode)) {
+                // 后端做不到就回退到最接近的可用模式，并且**如实自报**。
+                // 明明还在无边框却自报 fullscreen 会让所有对照结论失效。
+                if (cmd.mode == SimWindowMode::Fullscreen) {
+                    SimLog("后端未能进入独占全屏，回退为 borderless（自报数据也改成 borderless）");
+                    *ctx.mode = SimWindowMode::Borderless;
+                    ctx.engine->OnWindowModeChanged(SimWindowMode::Borderless);
+                } else {
+                    SimLog("后端切换窗口状态失败，自报数据仍按请求的模式记录");
+                }
+            }
+            if (*ctx.mode == SimWindowMode::Windowed) {
+                if (ctx.windowed_w) *ctx.windowed_w = *ctx.width;
+                if (ctx.windowed_h) *ctx.windowed_h = *ctx.height;
+            }
             SimFocusWindow(ctx.hwnd);
             SimPumpMessages();
             SimLog("当前分辨率 %dx%d 窗口状态 %s", *ctx.width, *ctx.height,
@@ -705,8 +879,11 @@ void SimApplyCommand(const SimCommand& cmd, SimControlContext& ctx) {
             break;
         case SimCommand::Status: {
             // 状态行也走 stdout 的 JSON，脚本可以随时问「你现在什么设置」。
+            // fps_recent 给的是最近约 1 秒的实测帧率（不是编的数字）：
+            // 每帧往一个小环形缓冲里塞一次帧间隔，问的时候求和换算。
             SimLogRaw("%s", SimStatusJson(*ctx.cfg, ctx.frame_index, *ctx.width, *ctx.height,
-                                          *ctx.mode, ctx.cfg->vsync, ctx.cfg->fps_cap, 0.0)
+                                          *ctx.mode, ctx.cfg->vsync, ctx.cfg->fps_cap,
+                                          RecentFps())
                                  .c_str());
             break;
         }
@@ -1008,6 +1185,7 @@ std::string SimFrameJson(const SimFrameReport& r, const SimConfig& cfg) {
     JBool(o, "hidden", r.hidden);
     JInt(o, "swapchain_generation", r.swapchain_generation);
     JBool(o, "resize_event", r.resize_event);
+    JInt(o, "resize_events_since_last", r.resize_events_since_last);
     JBool(o, "present_failed", r.present_failed);
     JInt(o, "present_hr", r.present_hr);
     if (o.back() == ',') o.pop_back();

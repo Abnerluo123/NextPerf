@@ -120,6 +120,12 @@ struct SimFrameReport {
     bool hidden = false;
 
     bool resize_event = false;         // 本帧发生了 ResizeBuffers / 重建交换链
+    // 自上一行 JSON 输出以来累计发生的重建次数。
+    // 为什么需要它：--json-every=100 时，重建发生在两次输出之间的某帧上，
+    // 那一帧的 resize_event=true 根本不会被打印出来；只靠本帧的布尔量会让
+    // 脚本「明明改了分辨率却看不到事件」。所以额外给一个累计值，
+    // 脚本按帧号求差就能定位到区间。见 readme「resize_event 的坑」。
+    int resize_events_since_last = 0;
     int swapchain_generation = 0;      // 交换链代数（每次重建 +1，叠加层可据此判断换对象了）
     bool present_failed = false;       // 本帧 Present 返回失败
     long present_hr = 0;               // Present 的 HRESULT
@@ -233,9 +239,12 @@ public:
     // 开关垂直同步（运行中可切换）。
     virtual void SetVsync(bool on) = 0;
 
-    // 切窗口状态：公共代码负责改窗口样式 / 调 SetFullscreenState，
-    // 后端只做「交换链自己需要跟着做的事」（例如 ResizeBuffers 到新尺寸）。
-    virtual void OnWindowModeChanged(SimWindowMode mode) = 0;
+    // 切窗口状态：公共代码负责改窗口样式，后端只做「交换链自己需要跟着做的事」
+    // （例如 DX11 的 SetFullscreenState）。
+    // 返回 false 表示后端**没能**完成这个模式（例如 DXGI 拒绝独占全屏）。
+    // 公共代码据此回退到最接近的可用模式并如实写进自报数据 —— 绝不能
+    // 「切失败了还自报 fullscreen」，那会让对照结论全错。
+    virtual bool OnWindowModeChanged(SimWindowMode mode) = 0;
 
     // 是否使用 DXGI 独占全屏。只有 DX11 后端需要（它的 flip 模型在切换前后
     // 必须显式 ResizeBuffers；而 DX12 常用现代 flip 模型 + 无边框窗口来模拟全屏）。
@@ -248,6 +257,11 @@ public:
     virtual int SwapchainGeneration() const = 0;
     virtual int BufferCount() const = 0;
     virtual const char* BackendName() const = 0;
+
+    // 后端**实际**处于哪个窗口状态。可能和请求的不一样：DXGI 可能拒绝独占
+    // 全屏，此时后端会降级为 borderless。自报数据必须以这个为准，绝不能
+    // 「请求了 fullscreen 就自报 fullscreen」。
+    virtual SimWindowMode CurrentWindowMode() const = 0;
 
     // 取本帧对应的 GPU 帧时间（ms）。返回 false 表示「这一帧还没有可用的
     // GPU 时间戳样本」——两个后端的时间戳都是**异步回读**的（延迟几帧才拿得到
@@ -277,8 +291,16 @@ HWND SimCreateWindow(HINSTANCE inst, const SimConfig& cfg, int w, int h, SimWind
 // 按模式调整窗口样式 / 位置。fullscreen 由调用方另外调 SetFullscreenState。
 void SimApplyWindowMode(HWND hwnd, SimWindowMode mode, int w, int h);
 
-// 桌面（主显示器）分辨率 —— borderless / fullscreen 时要铺满它。
+// 桌面（主显示器）分辨率 —— borderless / fullscreen 时用来定窗口尺寸。
 void SimPrimaryMonitorSize(int* w, int* h);
+
+// 声明进程 DPI 感知。必须在创建窗口之前调用：不声明的话窗口坐标会被 DPI
+// 虚拟化，和 GetSystemMetrics / DXGI 的物理像素口径打架，全屏尺寸会算错。
+void SimEnableDpiAwareness();
+
+// 窗口客户区的真实像素尺寸。交换链分辨率必须以它为准（见 sim_common.cpp
+// 里关于 DPI 缩放的注释：SM_CXSCREEN 和 SetWindowPos 用的不是同一套坐标）。
+void SimClientSize(HWND hwnd, int* w, int* h);
 
 // 把窗口拉回前台（fullscreen 切换后 Windows 可能把焦点丢掉）。
 void SimFocusWindow(HWND hwnd);
@@ -373,6 +395,10 @@ struct SimControlContext {
     SimPacer* pacer = nullptr;
     int* width = nullptr;
     int* height = nullptr;
+    // 「窗口化模式下的尺寸」备忘。从 borderless / fullscreen 切回 windowed 时
+    // 要还原成它，否则会停在显示器尺寸上（看起来像切换没生效）。
+    int* windowed_w = nullptr;
+    int* windowed_h = nullptr;
     SimWindowMode* mode = nullptr;
     bool* quit = nullptr;
     bool* stats_requested = nullptr;
@@ -404,3 +430,6 @@ struct SimStdinThread {
 void SimLog(const char* fmt, ...);          // 带时间戳打到 stdout，自动 flush
 void SimLogRaw(const char* fmt, ...);       // 不打时间戳，用于 JSON 行
 const char* SimHrName(long hr);             // 常见 DXGI HRESULT 的可读名
+
+// 把本帧的帧间隔记进「最近帧率」环形缓冲（status 命令的 fps_recent 用它）。
+void SimRecentPushFrame(double delta_ms);

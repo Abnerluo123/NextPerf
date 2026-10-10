@@ -9,12 +9,13 @@
 //    时间戳 A = 本帧命令列表开头
 //    时间戳 B = 本帧命令列表结尾（Present 之前）
 //    gpu_frame_ms = (B - A) / 频率 * 1000   —— 本帧的 GPU 工作量，不含 Present 阻塞
-//  另外还多打一对时间戳 C/D 夹住 Present，得到 gpu_present_interval_ms
-//  （GPU 侧看到的两次 Present 之间隔了多久，反映 GPU 实际在出帧的节奏）。
+//  （Present 本身的耗时由 present_ms 覆盖：它是 CPU 侧的阻塞时长，
+//    才是「这一帧到底等了多久」的答案。）
 //
-//  频率换算用 ID3D12CommandQueue::GetClockCalibration：它同时给出 GPU 时间戳
-//  和对应的 CPU QPC 计数，两者相除就是 GPU 时间戳频率。这是 DX12 里唯一
-//  **保证可用**的换算办法（D3D12 没有暴露独立的 GetTimestampFrequency）。
+//  频率换算用 ID3D12CommandQueue::GetClockCalibration：它一次调用同时给出
+//  GPU 时间戳和对应的 CPU QPC 计数，两次采样求差就是 GPU 时间戳频率。
+//  这是 DX12 里**唯一保证可用**的换算办法（D3D12 没有暴露独立的
+//  GetTimestampFrequency）。
 //
 //  【这个文件里没有的东西，如实说明】
 //    * 没有 PS 常量/顶点缓冲：DX12 的 PSO 需要序列化好的 DXIL，本项目只有
@@ -79,13 +80,19 @@ public:
     void EndFrame(SimFrameReport& r) override;
     bool Resize(int w, int h, std::string* err) override;
     void SetVsync(bool on) override { vsync_ = on; }
-    void OnWindowModeChanged(SimWindowMode mode) override { mode_ = mode; }
+    bool OnWindowModeChanged(SimWindowMode mode) override {
+        // DX12 后端不走 DXGI 独占全屏（WantsExclusiveFullscreen() = false），
+        // 所以这里只需要记下模式；公共代码已经把窗口调成无边框全屏尺寸，
+        // 交换链也跟着 ResizeBuffers 过了 —— 这就是「borderless 全屏」。
+        mode_ = mode;
+        return true;
+    }
     void SetGpuLoadMs(double ms) override { gpu_load_ms_ = ms; }
     int SwapchainGeneration() const override { return generation_; }
     int BufferCount() const override { return buffer_count_; }
+    SimWindowMode CurrentWindowMode() const override { return mode_; }
     const char* BackendName() const override { return "dx12"; }
-    const char* Note() const override;
-    bool TakeLastGpuMs(double* out) override;
+    const char* Note() const override;    bool TakeLastGpuMs(double* out) override;
     double GpuTimestampFreqHz() const override { return gpu_freq_hz_; }
     const char* GpuTimestampFreqSource() const override { return gpu_freq_source_; }
     bool GpuTimeAvailable() const override { return gpu_available_; }
@@ -94,9 +101,8 @@ public:
 
 private:
     static const int kMaxBuffers = 4;   // 交换链 buffer 上限
-    static const int kFrameRing = 3;    // 每帧资源环大小
-    static const int kQPerFrame = 4;    // 每帧 4 个时间戳：帧首/渲染末/Present前/Present后
-    static const int kLatency = 2;      // 延迟 2 帧回读，避免等待 GPU
+    static const int kFrameRing = 3;    // 每帧资源环大小（也是时间戳回读的延迟帧数）
+    static const int kQPerFrame = 2;    // 每帧 2 个时间戳：命令列表开头 / 结尾
 
     struct FrameRes {
         Com<ID3D12CommandAllocator> alloc;
@@ -146,9 +152,8 @@ private:
     bool gpu_available_ = false;
     double gpu_freq_hz_ = 0.0;
     const char* gpu_freq_source_ = "none";
-    struct GpuSample { int64_t frame; double render_ms; double present_interval_ms; bool taken; };
+    struct GpuSample { int64_t frame; double render_ms; bool taken; };
     std::vector<GpuSample> gpu_samples_;
-    bool dbg_layer_ = false;
 
     int generation_ = 0;
     std::string note_;
@@ -490,13 +495,11 @@ void Dx12Engine::ReadSlotTimestamps(int slot) {
     }
     const UINT64* ts = (const UINT64*)((const unsigned char*)mapped + off);
     ts_read_attempt_++;
-    // ts[0]=帧首 ts[1]=渲染末 ts[2]=Present 前 ts[3]=Present 后
+    // ts[0] = 命令列表开头，ts[1] = 命令列表结尾（Present 之前）
     if (gpu_freq_hz_ > 0.0 && ts[1] >= ts[0] && ts[0] != 0) {
         GpuSample s;
         s.frame = f.gpu_frame;
         s.render_ms = (double)(ts[1] - ts[0]) * 1000.0 / gpu_freq_hz_;
-        s.present_interval_ms =
-            (ts[3] >= ts[2] && ts[2] != 0) ? (double)(ts[3] - ts[2]) * 1000.0 / gpu_freq_hz_ : 0.0;
         s.taken = false;
         gpu_samples_.push_back(s);
         gpu_available_ = true;
@@ -504,9 +507,8 @@ void Dx12Engine::ReadSlotTimestamps(int slot) {
     } else {
         ts_read_bad_++;
         if (ts_read_bad_ <= 3) {
-            SimLog("时间戳回读异常：t0=%llu t1=%llu t2=%llu t3=%llu freq=%.0f", (unsigned long long)ts[0],
-                   (unsigned long long)ts[1], (unsigned long long)ts[2],
-                   (unsigned long long)ts[3], gpu_freq_hz_);
+            SimLog("时间戳回读异常：t0=%llu t1=%llu freq=%.0f", (unsigned long long)ts[0],
+                   (unsigned long long)ts[1], gpu_freq_hz_);
         }
     }
     D3D12_RANGE empty{0, 0};
@@ -624,9 +626,6 @@ void Dx12Engine::EndFrame(SimFrameReport& r) {
 
     // 渲染结束时间戳
     if (ts_heap_) list_->EndQuery(ts_heap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, base + 1);
-
-    // Present 前 / 后各打一个时间戳：中间夹的就是 Present 在 GPU 侧占用的时间。
-    if (ts_heap_) list_->EndQuery(ts_heap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, base + 2);
     list_->Close();
 
     ID3D12CommandList* lists[1] = {list_.Get()};
@@ -644,17 +643,19 @@ void Dx12Engine::EndFrame(SimFrameReport& r) {
     r.present_failed = FAILED(hr);
     if (FAILED(hr)) SimLog("Present 失败 hr=%08lX(%s)", (unsigned long)hr, SimHrName((long)hr));
 
-    // Present 之后的时间戳必须开一条新的命令列表（上一条已经 Close 并提交）。
-    // 它是 GPU 侧「Present 返回之后」的时刻，配合 base+2 得到 GPU 看到的
-    // 两次 Present 间隔 —— 这个值比 CPU 侧的帧间隔更接近真实出帧节奏。
+    // 把这一帧的 2 个时间戳 Resolve 到 DEFAULT 缓冲，再拷到 READBACK 缓冲。
+    // 必须用一条**新的**命令列表（上一条已经 Close 并提交），并且让 Resolve
+    // 和这 2 个时间戳在同一条列表里，才能保证 Resolve 一定发生在它们之后。
+    //
+    // 为什么放在 Present 之后而不是之前：Resolve 要读时间戳，而 Present 之前
+    // 那条列表必须尽量"干净"（真实游戏的渲染列表就是这个样子，叠加层也是在
+    // 这个位置插自己的时间戳）。把 Resolve/回读的开销挪到 Present 之后，
+    // 我们测到的 CPU 帧时间就不会被自己的测量代码污染。
     if (ts_heap_ && f.list_post) {
         f.alloc_post->Reset();
         if (SUCCEEDED(f.list_post->Reset(f.alloc_post.Get(), nullptr))) {
             ID3D12GraphicsCommandList* l2 = f.list_post.Get();
-            l2->EndQuery(ts_heap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, base + 3);
 
-            // 把这一帧的 4 个时间戳 Resolve 到 DEFAULT 缓冲，再拷到 READBACK 缓冲。
-            // 放在同一条命令列表里，保证 Resolve 一定发生在这 4 个时间戳之后。
             D3D12_RESOURCE_BARRIER b{};
             b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
             b.Transition.pResource = ts_resolve_.Get();

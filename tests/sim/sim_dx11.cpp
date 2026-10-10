@@ -139,10 +139,11 @@ public:
     void EndFrame(SimFrameReport& r) override;
     bool Resize(int w, int h, std::string* err) override;
     void SetVsync(bool on) override { vsync_ = on; }
-    void OnWindowModeChanged(SimWindowMode mode) override;
+    bool OnWindowModeChanged(SimWindowMode mode) override;
     void SetGpuLoadMs(double ms) override { gpu_load_ms_ = ms; }
     int SwapchainGeneration() const override { return generation_; }
     int BufferCount() const override { return buffer_count_; }
+    SimWindowMode CurrentWindowMode() const override { return mode_; }
     const char* BackendName() const override { return "dx11"; }
     const char* Note() const override { return note_.c_str(); }
     bool TakeLastGpuMs(double* out) override;
@@ -163,7 +164,6 @@ private:
     int width_ = 1280, height_ = 720;
     int buffer_count_ = 2;
     bool vsync_ = true;
-    bool hidden_ = false;
     SimWindowMode mode_ = SimWindowMode::Windowed;
     double gpu_load_ms_ = 0.0;
 
@@ -177,7 +177,6 @@ private:
     Com<ID3D11Buffer> vb_;
     Com<ID3D11Buffer> cb_;
     bool shaded_ = false;   // 着色器路径可用？
-    int fallback_ticks_ = 0;
 
     // ---------- GPU 时间戳 ----------
     // D3D11 的时间戳是异步的：End 之后要隔几帧才能 GetData 拿到结果
@@ -204,7 +203,6 @@ private:
     std::vector<GpuSample> gpu_samples_;
 
     int generation_ = 0;
-    float angle_ = 0.0f;
     std::string note_;
 };
 
@@ -307,13 +305,23 @@ bool Dx11Engine::Init(HWND hwnd, const SimConfig& cfg, std::string* err) {
     width_ = cfg.width;
     height_ = cfg.height;
     vsync_ = cfg.vsync;
-    hidden_ = cfg.hidden;
     mode_ = cfg.window_mode;
     gpu_load_ms_ = cfg.gpu_load_ms;
 
     if (!CreateDeviceAndSwapChain(err)) return false;
     if (!CreateSizeDependentResources(err)) return false;
 
+    // 启动时就是 fullscreen 的话，这里补上「进独占全屏」这一步。
+    // 控制命令走的是 SimApplyCommand -> OnWindowModeChanged，但启动路径不过
+    // 那里；漏掉这一步的后果是「自报 fullscreen 其实还在窗口化」——
+    // 一个会让所有对照结论失效的谎报（实测踩到过）。
+    if (mode_ == SimWindowMode::Fullscreen && WantsExclusiveFullscreen()) {
+        if (!OnWindowModeChanged(SimWindowMode::Fullscreen)) {
+            // 后端进不去，如实把模式降级成 borderless（窗口已经是无边框全屏了）。
+            mode_ = SimWindowMode::Borderless;
+            SimLog("启动时未能进入独占全屏，降级为 borderless（自报数据也是 borderless）");
+        }
+    }
     // ---- 着色器（拿不到 d3dcompiler 就退化成 ClearView 渲染）----
     PFN_D3DCompile compile = LoadD3DCompile();
     if (!compile) {
@@ -424,13 +432,15 @@ void Dx11Engine::DrawShaded(int64_t frame_index) {
     ID3D11Buffer* cbs[1] = {cb_.Get()};
     ctx_->VSSetConstantBuffers(0, 1, cbs);
 
-    // 本帧旋转角：按帧号推进（黄金角的小步长），每帧角度都不同。
-    angle_ = (float)((double)(frame_index % 1000000) * 0.03141592653589793);
+    // 本帧旋转角：按帧号推进，每帧角度都不同。
+    // 用局部变量而不是成员：它只在这一次 DrawShaded 里用，没必要跨帧保留。
+    const float angle = (float)((double)(frame_index % 1000000) * 0.03141592653589793);
+    const float ca = cosf(angle), sa = sinf(angle);
 
     auto update_cb = [&](float scale, const float col[3]) {
         D3D11_MAPPED_SUBRESOURCE ms{};
         if (FAILED(ctx_->Map(cb_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &ms))) return false;
-        float data[8] = {cosf(angle_), sinf(angle_), scale, 0.0f, col[0], col[1], col[2], 1.0f};
+        float data[8] = {ca, sa, scale, 0.0f, col[0], col[1], col[2], 1.0f};
         memcpy(ms.pData, data, sizeof(data));
         ctx_->Unmap(cb_.Get(), 0);
         return true;
@@ -481,7 +491,6 @@ void Dx11Engine::DrawFallback(int64_t frame_index) {
     if (passes > 2000) passes = 2000;
     const float fg4[4] = {fg[0], fg[1], fg[2], 1.0f};
     for (int i = 1; i < passes; ++i) ctx_->ClearRenderTargetView(rtv_.Get(), fg4);
-    fallback_ticks_++;
 }
 
 void Dx11Engine::DrawFrame(int64_t frame_index) {
@@ -638,26 +647,37 @@ bool Dx11Engine::Resize(int w, int h, std::string* err) {
     return true;
 }
 
-void Dx11Engine::OnWindowModeChanged(SimWindowMode mode) {
+bool Dx11Engine::OnWindowModeChanged(SimWindowMode mode) {
     mode_ = mode;
-    if (!swap_) return;
+    if (!swap_) return false;
     if (mode == SimWindowMode::Fullscreen) {
-        // 独占全屏：flip 模型要求先回到窗口化再切（调用方已经做了），
-        // 且切换之后必须立刻 ResizeBuffers —— 调用方紧接着就会调 Resize()。
+        // 独占全屏的顺序很重要：必须**先**把窗口设成无边框全屏尺寸、
+        // 再调 SetFullscreenState(TRUE)。反过来的话 DXGI 在自己的窗口还带
+        // 边框、尺寸不对的时候会直接返回 E_FAIL（实测踩过）。
+        // 注意 flip 模型也不允许从 borderless 直接跳 exclusive，所以调用方
+        // 已经先经过了一次窗口化状态。
         HRESULT hr = swap_->SetFullscreenState(TRUE, nullptr);
         if (FAILED(hr)) {
-            SimLog("SetFullscreenState(TRUE) 失败 hr=%08lX(%s) —— 保持窗口化",
-                   (unsigned long)hr, SimHrName((long)hr));
-        } else {
-            SimLog("已进入 DXGI 独占全屏");
-        }
-    } else {
-        HRESULT hr = swap_->SetFullscreenState(FALSE, nullptr);
-        if (FAILED(hr)) {
-            SimLog("SetFullscreenState(FALSE) 失败 hr=%08lX(%s)", (unsigned long)hr,
+            SimLog("SetFullscreenState(TRUE) 失败 hr=%08lX(%s)", (unsigned long)hr,
                    SimHrName((long)hr));
+            return false;
         }
+        // 让 DXGI 把显示模式也切到交换链的尺寸（很多驱动上不调也能进全屏，
+        // 但调了更稳，尤其是分辨率与桌面不同的时候）。
+        DXGI_MODE_DESC md{};
+        md.Width = (UINT)width_;
+        md.Height = (UINT)height_;
+        md.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        swap_->ResizeTarget(&md);
+        SimLog("已进入 DXGI 独占全屏 %dx%d", width_, height_);
+        return true;
     }
+    HRESULT hr = swap_->SetFullscreenState(FALSE, nullptr);
+    if (FAILED(hr)) {
+        SimLog("SetFullscreenState(FALSE) 失败 hr=%08lX(%s)", (unsigned long)hr, SimHrName((long)hr));
+        return false;
+    }
+    return true;
 }
 
 // ---------------------------------------------------------------- 工厂

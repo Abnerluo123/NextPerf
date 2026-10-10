@@ -173,12 +173,27 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int) {
     // 窗口先建：交换链创建需要 HWND。
     // --hidden 只是不 ShowWindow，窗口本身必须存在且客户区尺寸有效 ——
     // flip 模型的交换链在零尺寸窗口上不能 Present。
+    // DPI 感知必须在建窗口之前声明（见函数注释里的尺寸错乱实测）。
+    SimEnableDpiAwareness();
     HWND hwnd = SimCreateWindow(inst, cfg, cfg.width, cfg.height, cfg.window_mode);
     if (!hwnd) {
         fprintf(stderr, "[sim] 创建窗口失败\n");
         return 1;
     }
     SimApplyWindowMode(hwnd, cfg.window_mode, cfg.width, cfg.height);
+
+    // 交换链分辨率一律以**真实客户区**为准，不用命令行里那个值直接建。
+    // 原因：borderless / fullscreen 会把窗口拉成整个显示器，DPI 缩放环境下
+    // GetSystemMetrics 与 SetWindowPos 的坐标口径还不一致；只有量客户区
+    // 才拿得到「Present 真正要填的那块像素」。客户区与交换链尺寸不一致时
+    // DWM 会拉伸画面，present 时机就失真了。
+    int width = cfg.width, height = cfg.height;
+    SimClientSize(hwnd, &width, &height);
+    // 窗口化时的尺寸（切回 windowed 用）：取命令行给的值（客户区语义），
+    // 这样即使启动就是 borderless，也能切回一个正常的窗口尺寸。
+    int windowed_w = cfg.width, windowed_h = cfg.height;
+    cfg.width = width;
+    cfg.height = height;
 
     SimEngine* engine = cfg.use_dx12 ? SimCreateEngineDx12() : SimCreateEngineDx11();
     std::string err;
@@ -190,8 +205,14 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int) {
     }
     if (cfg.buffers == 0) cfg.buffers = engine->BufferCount();  // 记下实际值，写进汇总
 
-    int width = cfg.width, height = cfg.height;
-    SimWindowMode mode = cfg.window_mode;
+    // 以后端**实际**的窗口状态为准：DXGI 可能拒绝独占全屏，后端会降级成
+    // borderless（见 Dx11Engine::Init）。自报数据必须反映真实情况。
+    SimWindowMode mode = engine->CurrentWindowMode();
+    if (mode != cfg.window_mode) {
+        SimLog("注意：请求的窗口状态 %s 未生效，实际是 %s",
+               SimWindowModeName(cfg.window_mode), SimWindowModeName(mode));
+    }
+    cfg.window_mode = mode;
 
     // 控制通道：stdin 逐行命令。后台线程只读 + 解析 + 入队。
     SimStdinThread stdin_thread;
@@ -213,6 +234,10 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int) {
     int64_t total_frames = 0;
     int64_t resize_events = 0;
     int64_t present_failures = 0;
+    int64_t last_reported_resizes = 0;  // 上一次输出 JSON 行时的 resize_events
+    // 「上一帧结束时的交换链代数」。控制命令在两帧之间执行，所以拿它和
+    // 当前值比较就能准确标出「这一帧紧跟在交换链重建之后」。
+    int last_generation = engine->SwapchainGeneration();
     double prev_start_ms = 0.0;
     const ULONGLONG t0_ticks = GetTickCount64();
     const int64_t t0_qpc = SimQpcNow();  // 所有 t_ms 的 0 点
@@ -252,6 +277,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int) {
                 ctx.pacer = &pacer;
                 ctx.width = &width;
                 ctx.height = &height;
+                ctx.windowed_w = &windowed_w;
+                ctx.windowed_h = &windowed_h;
                 ctx.mode = &mode;
                 ctx.quit = &quit;
                 ctx.stats_requested = &stats_requested;
@@ -291,7 +318,6 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int) {
 
         const int64_t f0 = SimQpcNow();
         const double f0_ms = SimQpcToMs(f0 - t0_qpc);
-        const int gen_before = engine->SwapchainGeneration();
 
         engine->BeginFrame(total_frames);
 
@@ -309,9 +335,17 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int) {
         r.frame_delta_ms = total_frames > 0 ? (f0_ms - prev_start_ms) : 0.0;
         r.cpu_frame_ms = SimQpcToMs(f1 - f0);
         r.cpu_render_ms = r.cpu_frame_ms;  // 单线程模拟：录制+提交就是整段 CPU 开销
+        // 交换链代数：把**上一次循环结束时的代数**带下来和现在比。
+        // 控制命令在这两者之间执行，所以命令引起的重建一定被算进本帧 ——
+        // 这正是脚本需要知道的「这一帧是不是紧跟在交换链重建之后」。
         r.swapchain_generation = engine->SwapchainGeneration();
-        r.resize_event = r.swapchain_generation != gen_before;
-        if (r.resize_event) ++resize_events;
+        r.resize_event = r.swapchain_generation != last_generation;
+        last_generation = r.swapchain_generation;
+        if (r.resize_event) {
+            ++resize_events;
+            SimLog("帧 %lld：交换链发生重建（generation -> %d）", (long long)total_frames,
+                   r.swapchain_generation);
+        }
         if (r.present_failed) ++present_failures;
 
         // GPU 时间戳是异步回读的，这一帧可能还拿不到 —— 拿不到就标 invalid，
@@ -325,8 +359,16 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int) {
         prev_start_ms = f0_ms;
         ++total_frames;
 
+        // 记进「最近帧率」环形缓冲：status 命令会用到（只统计有间隔的帧）。
+        if (r.frame_delta_ms > 0.0) SimRecentPushFrame(r.frame_delta_ms);
+
         // 5) 输出
         if (cfg.json && (total_frames % cfg.json_every == 0)) {
+            // 「自上一行输出以来发生过几次重建」：累计值求差。这样即使
+            // --json-every=N（N>1）把重建那一帧采样掉了，脚本也能从下一行
+            // 看出「这中间重建过」。只靠本帧的 resize_event 布尔量会漏事件。
+            r.resize_events_since_last = (int)(resize_events - last_reported_resizes);
+            last_reported_resizes = resize_events;
             SimLogRaw("%s", SimFrameJson(r, cfg).c_str());
         }
 
