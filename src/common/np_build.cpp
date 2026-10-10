@@ -279,19 +279,8 @@ void BuildPanelData(PanelData& out, const NPConfig& c, const NPSensors& s, const
                      h ? h->latCpu : nullptr, h, 1, -1e30f, 33.34f);
         if (showCharts && (c.counters & NP_C_CHART_LATENCY)) attach(acc.pending.back(), h->latCpu, 0);
 
-        // ---- 「低延迟」提示
-        // CPUBusy 是「上一帧 Present 返回 → 本帧 Present 开始」的间隙。
-        // 流水线渲染下它本来接近 0；开了 Reflex 这类低延迟技术后，等待被从
-        // Present 内部挪到 Present 之前（NvAPI_D3D_Sleep），那段睡眠落进间隙，
-        // 数值明显变大。所以「CPUBusy 偏大」就是低延迟技术生效的旁证。
-        // 阈值 2ms 是按实测定的（关 Reflex ~0.x ms、开 Reflex 大 1~2ms），偏低或
-        // 偏高都可以直接调这个数。
-        //  判据有两条，优先用**直证**：
-        //    1) 钩子读到了 Reflex 的延迟标记（NP_HOOK_REFLEX）—— 游戏自己在用低延迟技术
-        //    2) 读不到时的旁证：CPUBusy 偏大（等待被移出 Present）
-        float busyRef = t.cpuBusyAvg > 0.0001f ? t.cpuBusyAvg : t.cpuBusyMs;
-        bool lowLatency = (t.hookFlags & NP_HOOK_REFLEX) != 0 || busyRef > 2.0f;
-        if (active && lowLatency) acc.pending.back().hint = L" 低延迟";
+        // 低延迟状态不再作为本行的黄色后缀显示 —— 已改为系统分组里的独立一行
+        // 「低延迟 On/Off」，判据也换成了 CPU Wait（见系统分组处）。
     }
 
     // ---- CPU Busy / CPU Wait 两个半边（PresentMon 口径，二者之和 = 帧周期）
@@ -439,6 +428,22 @@ void BuildPanelData(PanelData& out, const NPConfig& c, const NPSensors& s, const
     acc.flush(L"GPU", false, 3.0f);      // CPU 组 -> GPU 组：3px
 
     // ---------------- 系统 ----------------
+    //
+    // 低延迟状态（用户要求放这里，显示成 On/Off，不用黄色）
+    //
+    // 判据：**CPU Wait < 1.6ms**。
+    //   CPU Wait = 本帧卡在 Present 内部等垂直同步的时长。
+    //   开了 Reflex 这类低延迟技术后，等待被**移出** Present（挪到 Present 之前），
+    //   Wait 随之变小 —— 所以「Wait 小」是低延迟生效的**直证**，
+    //   比原来的旁证（CPUBusy 偏大）可靠。
+    //   阈值 1.6ms 按用户实测指定，想调直接改这个数。
+    //   用平滑值 cpuWaitAvg 判定，避免临界值来回翻。
+    if (c.counters & NP_C_CPU_FRAME) {
+        float waitRef = t.cpuWaitAvg > 0.0001f ? t.cpuWaitAvg : t.cpuWaitMs;
+        bool lowLatency = active && waitRef < 1.6f;
+        acc.row(L"低延迟", lowLatency ? L"On" : L"Off",
+                lowLatency ? PL_NORMAL : PL_DIM);
+    }
     if (!resText.empty()) acc.row(L"分辨率", resText);   // 用户要求：归到系统分组
     if (c.counters & NP_C_RAM) {
         std::wstring v = GBv(s.ramUsedGB);

@@ -61,6 +61,10 @@ bool SettingsLoad() {
         // v4 新增「CPU 频率」「CPU 功耗」——旧配置默认勾选一次，
         // 否则新开关对老用户是关的，会让人以为功能没做出来。
         if (ver < 4) gApp.cfg.counters |= NP_C_CPU_CLOCK | NP_C_CPU_POWER;
+        // v5：CPU Busy / CPU Wait 是「高级」项，**默认不显示**（用户要求）。
+        // 这里显式清位而不是把它们踢出复选框 —— 用户仍可手动勾选启用；
+        // 清位只在 ver<5 时执行一次，不会把用户的勾选反复抹掉。
+        if (ver < 5) gApp.cfg.counters &= ~(NP_C_CPU_BUSY | NP_C_CPU_WAIT);
     }
     // 背景固定纯黑（用户明确要求），旧配置里的蓝黑色一律丢弃
     gApp.cfg.bgColor = 0xFF000000u;
@@ -100,7 +104,7 @@ bool SettingsLoad() {
 void SettingsSave() {
     using np::Json;
     Json::Value root = Json::mkObj();
-    root.obj["cfgVersion"] = Json::mkNum(4);
+    root.obj["cfgVersion"] = Json::mkNum(5);
     root.obj["counters"] = Json::mkNum((double)gApp.cfg.counters);
     root.obj["bgColor"] = Json::mkNum(gApp.cfg.bgColor);
     root.obj["textColor"] = Json::mkNum(gApp.cfg.textColor);
