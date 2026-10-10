@@ -27,7 +27,9 @@ static const COLORREF kText = RGB(0xF2, 0xF4, 0xF6);
 static const COLORREF kDim = RGB(0x8A, 0x91, 0x99);
 
 static const int kWinW = 1000;
-static const int kWinH = 690;
+// 730 = 原来的 690 + 38：「自动注入 3D 窗口」那一行是后加的，
+// 当时忘了同步加高窗口，结果把「退出监视」等按钮挤到窗口外面去了（用户实测）。
+static const int kWinH = 730;
 // 计数器列表高度。只在这里定义一次 —— 原来 Layout() 和 WM_PAINT 里各写了一遍
 // S(452)，改一处漏一处就会让列表和游戏区对不上。
 // 400 是给「游戏进程」下面两行按钮腾出来的（状态栏固定在 S(658)，不能压）。

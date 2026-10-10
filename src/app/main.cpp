@@ -426,25 +426,45 @@ static bool AnyAntiCheatRunning() {
     return sCached;
 }
 
-// 某进程是否有「像游戏」的可见大窗口（不依赖前台）
-static bool ProcessLooksLikeGame(DWORD pid) {
-    struct Ctx { DWORD pid; bool ok; } ctx{pid, false};
-    EnumWindows(
-        [](HWND hw, LPARAM lp) -> BOOL {
-            auto* x = reinterpret_cast<Ctx*>(lp);
-            DWORD p = 0;
-            GetWindowThreadProcessId(hw, &p);
-            if (p != x->pid || !IsWindowVisible(hw)) return TRUE;
-            RECT rc{};
-            if (!GetWindowRect(hw, &rc)) return TRUE;
-            if ((rc.right - rc.left) >= 640 && (rc.bottom - rc.top) >= 360) {
-                x->ok = true;
-                return FALSE;
+// 目标进程是否**真的加载了 D3D/DXGI**。
+//
+// 这是「像不像游戏」的核心判据 —— 光看「有可见的大窗口」是不够的：
+// 微信、浏览器、梯子客户端全都有大窗口，实测**都被误注入了**（用户反馈）。
+// 真 D3D 游戏必然加载 d3d11 / d3d12 / dxgi 之一。
+// ⚠ 跨位数时枚举不到模块，此时返回 false（宁可不注入，也不要乱注入）。
+static bool ProcessLoadsD3D(DWORD pid) {
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, FALSE, pid);
+    if (!h) return false;
+    typedef BOOL(WINAPI * EnumMods_t)(HANDLE, HMODULE*, DWORD, LPDWORD);
+    static EnumMods_t enumMods = nullptr;
+    static bool tried = false;
+    if (!tried) {
+        tried = true;
+        HMODULE ps = GetModuleHandleW(L"psapi.dll");
+        if (!ps) ps = LoadLibraryW(L"psapi.dll");
+        if (ps) enumMods = reinterpret_cast<EnumMods_t>(GetProcAddress(ps, "EnumProcessModules"));
+    }
+    bool hit = false;
+    if (enumMods) {
+        HMODULE mods[512]{};
+        DWORD need = 0;
+        if (enumMods(h, mods, sizeof(mods), &need)) {
+            DWORD n = need / sizeof(HMODULE);
+            if (n > 512) n = 512;
+            for (DWORD k = 0; k < n && !hit; ++k) {
+                wchar_t path[MAX_PATH]{};
+                if (!GetModuleFileNameExW(h, mods[k], path, MAX_PATH)) continue;
+                const wchar_t* base = wcsrchr(path, L'\\');
+                if (!base) base = path;
+                if (_wcsicmp(base, L"d3d11.dll") == 0 || _wcsicmp(base, L"d3d12.dll") == 0 ||
+                    _wcsicmp(base, L"dxgi.dll") == 0) {
+                    hit = true;
+                }
             }
-            return TRUE;
-        },
-        reinterpret_cast<LPARAM>(&ctx));
-    return ctx.ok;
+        }
+    }
+    CloseHandle(h);
+    return hit;
 }
 
 static DWORD    gAutoCand = 0;
@@ -459,7 +479,7 @@ static void AppAutoInjectTick() {
         return;
     }
 
-    // ★ 反作弊：直接放弃整轮自动注入（不做任何绕过尝试）
+    // ★ 反作弊：直接放弃整轮（不做任何绕过尝试）
     if (AnyAntiCheatRunning()) {
         static bool warned = false;
         if (!warned) {
@@ -471,59 +491,64 @@ static void AppAutoInjectTick() {
         return;
     }
 
-    // ★ 扫描**所有进程**找「像游戏」的（不再只看前台窗口）。
-    //   每 3 秒一轮：注入本身要花时间，扫太勤没意义。
-    uint32_t now32 = GetTickCount();
-    if (gAutoScanMs && now32 - gAutoScanMs < 3000) return;
-    gAutoScanMs = now32 ? now32 : 1;
+    // ★★ 只考虑**前台窗口**所属进程。
+    //
+    //   之前的写法是扫描**所有进程**，只判断「有没有可见的大窗口」——
+    //   结果把用户的梯子、微信、甚至 NextPerf 自己都注入了，而这些应用
+    //   全都跑在后台、用户根本没点过它们。**那是设计错误，不是判据不够细。**
+    //   正在玩的游戏必然是前台窗口，所以这一条既足够又安全。
+    DWORD pid = gApp.forePid;
+    if (!pid || pid == GetCurrentProcessId()) { gAutoCand = 0; return; }
+    if (IsInjected(pid)) return;
 
-    DWORD me = GetCurrentProcessId();
-    DWORD best = 0;
-    std::wstring bestName;
-    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (snap != INVALID_HANDLE_VALUE) {
-        PROCESSENTRY32W pe{};
-        pe.dwSize = sizeof(pe);
-        if (Process32FirstW(snap, &pe)) {
-            do {
-                DWORD pid = pe.th32ProcessID;
-                if (!pid || pid == me || pid == 4) continue;
-                std::wstring nm = pe.szExeFile;
-                if (NameLooksNonGame(nm)) continue;
-                bool triedAlready = false;
-                for (DWORD t : gAutoTried) {
-                    if (t == pid) { triedAlready = true; break; }
-                }
-                if (triedAlready || IsInjected(pid)) continue;
-                if (!ProcessLooksLikeGame(pid)) continue;
-                if (ProcessHasAntiCheatModule(pid)) {
-                    gAutoTried.push_back(pid);
-                    AppLog("auto-inject: pid=%lu (%ls) 加载了反作弊模块 -> 放弃",
-                           (unsigned long)pid, nm.c_str());
-                    continue;
-                }
-                best = pid;
-                bestName = nm;
-                break;   // 找到一个就先处理它，下一轮再看别的
-            } while (Process32NextW(snap, &pe));
-        }
-        CloseHandle(snap);
-    }
-    if (!best) { gAutoCand = 0; return; }
+    HWND fg = GetForegroundWindow();
+    if (!fg || !IsWindowVisible(fg)) { gAutoCand = 0; return; }
+    DWORD fgPid = 0;
+    GetWindowThreadProcessId(fg, &fgPid);
+    if (fgPid != pid) { gAutoCand = 0; return; }   // 它已经不是前台了
 
-    // 连续存在 >= 1.5 秒才动手（避免抓到刚启动就退出的进程）
-    if (gAutoCand != best) {
-        gAutoCand = best;
-        gAutoCandSince = now32;
+    RECT rc{};
+    if (!GetWindowRect(fg, &rc)) { gAutoCand = 0; return; }
+    if ((rc.right - rc.left) < 640 || (rc.bottom - rc.top) < 360) { gAutoCand = 0; return; }
+
+    wchar_t cls[128]{};
+    GetClassNameW(fg, cls, 128);
+    if (_wcsicmp(cls, L"Progman") == 0 || _wcsicmp(cls, L"Shell_TrayWnd") == 0 ||
+        _wcsicmp(cls, L"WorkerW") == 0 || _wcsicmp(cls, L"ApplicationFrameWindow") == 0) {
+        gAutoCand = 0;
         return;
+    }
+    if (NameLooksNonGame(gApp.foreName)) { gAutoCand = 0; return; }
+
+    // ★ 必须**真的加载了 D3D/DXGI** —— 光有大窗口会把微信/浏览器/梯子全放进来。
+    if (!ProcessLoadsD3D(pid)) {
+        static DWORD sLoggedPid = 0;
+        if (sLoggedPid != pid) {
+            sLoggedPid = pid;
+            AppLog("auto-inject: pid=%lu (%ls) 未加载 d3d11/d3d12/dxgi -> 判定不是 D3D 游戏，跳过",
+                   (unsigned long)pid, gApp.foreName.c_str());
+        }
+        gAutoCand = 0;
+        return;
+    }
+
+    for (DWORD t : gAutoTried) {
+        if (t == pid) return;   // 同一个 pid 只试一次
+    }
+
+    uint32_t now32 = GetTickCount();
+    if (gAutoCand != pid) {
+        gAutoCand = pid;
+        gAutoCandSince = now32;
+        return;   // 先观察 1.5 秒
     }
     if (now32 - gAutoCandSince < 1500) return;
 
-    gAutoTried.push_back(best);
+    gAutoTried.push_back(pid);
     if (gAutoTried.size() > 64) gAutoTried.erase(gAutoTried.begin());
-    AppLog("auto-inject: 扫描发现疑似游戏 pid=%lu (%ls) -> 注入", (unsigned long)best,
-           bestName.c_str());
-    InjectInto(best);
+    AppLog("auto-inject: 前台 pid=%lu (%ls) 加载了 D3D 且连续前台 1.5s -> 注入",
+           (unsigned long)pid, gApp.foreName.c_str());
+    InjectInto(pid);
 }
 
 void AppTrackForeground() {
