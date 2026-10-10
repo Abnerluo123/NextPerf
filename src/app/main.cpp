@@ -436,6 +436,36 @@ static bool WindowLooksLikeGame(HWND fg) {
     return false;
 }
 
+// UWP（商店）应用的前台窗口是 ApplicationFrameHost 的**壳**，
+// 真正的应用窗口是它的子窗口。
+//
+// 判定「像不像游戏」时必须用**真实窗口**：壳上既没有 WS_EX_NOREDIRECTIONBITMAP、
+// 尺寸也不是显示器尺寸 —— 拿壳去判必然误判（生化危机8 就这样被跳过过，
+// 日志：pid=33404 (re8.exe) 窗口无游戏特征 ... -> 跳过）。
+static HWND RealGameWindow(HWND fg) {
+    if (!fg) return fg;
+    wchar_t cls[128]{};
+    if (!GetClassNameW(fg, cls, 128)) return fg;
+    if (_wcsicmp(cls, L"ApplicationFrameWindow") != 0) return fg;
+    struct Ctx { DWORD host; HWND found; } ctx{0, nullptr};
+    GetWindowThreadProcessId(fg, &ctx.host);
+    EnumChildWindows(
+        fg,
+        [](HWND c, LPARAM lp) -> BOOL {
+            auto* x = reinterpret_cast<Ctx*>(lp);
+            DWORD cp = 0;
+            GetWindowThreadProcessId(c, &cp);
+            // 取第一个 pid 与壳不同、且可见的子窗口 —— 那就是被托管的应用
+            if (cp && cp != x->host && IsWindowVisible(c)) {
+                x->found = c;
+                return FALSE;
+            }
+            return TRUE;
+        },
+        reinterpret_cast<LPARAM>(&ctx));
+    return ctx.found ? ctx.found : fg;
+}
+
 static DWORD    gAutoCand = 0;
 static uint32_t gAutoCandSince = 0;
 static std::vector<DWORD> gAutoTried;
@@ -480,10 +510,15 @@ static void AppAutoInjectTick() {
     if (!GetWindowRect(fg, &rc)) { gAutoCand = 0; return; }
     if ((rc.right - rc.left) < 640 || (rc.bottom - rc.top) < 360) { gAutoCand = 0; return; }
 
+    // ★ UWP（商店）应用要先剥掉 ApplicationFrameHost 的壳，拿到**真实应用窗口**，
+    //   否则壳上既没有 DirectComposition 标记、尺寸也不对，必然被误判
+    //   （生化危机8 实测就是这样被跳过的）。注意**不能**再把
+    //   ApplicationFrameWindow 当成「非游戏窗口」直接跳过。
+    HWND gameWnd = RealGameWindow(fg);
     wchar_t cls[128]{};
-    GetClassNameW(fg, cls, 128);
+    GetClassNameW(gameWnd, cls, 128);
     if (_wcsicmp(cls, L"Progman") == 0 || _wcsicmp(cls, L"Shell_TrayWnd") == 0 ||
-        _wcsicmp(cls, L"WorkerW") == 0 || _wcsicmp(cls, L"ApplicationFrameWindow") == 0) {
+        _wcsicmp(cls, L"WorkerW") == 0) {
         gAutoCand = 0;
         return;
     }
@@ -493,13 +528,13 @@ static void AppAutoInjectTick() {
     //   或窗口矩形与某个显示器完全一致（独占/无边框全屏）。
     //   命中不了就认为「不像游戏」——宁可不注入，也不要乱注入
     //   （上一版正因判据太宽，把用户的梯子、微信都注入了）。
-    if (!WindowLooksLikeGame(fg)) {
+    if (!WindowLooksLikeGame(gameWnd)) {
         static DWORD sLoggedPid = 0;
         if (sLoggedPid != pid) {
             sLoggedPid = pid;
             AppLog("auto-inject: pid=%lu (%ls) 窗口无游戏特征"
-                   "（非 DirectComposition 合成、且尺寸不等于任何显示器）-> 跳过",
-                   (unsigned long)pid, gApp.foreName.c_str());
+                   "（非 DirectComposition 合成、且尺寸不等于任何显示器；窗口类=%ls）-> 跳过",
+                   (unsigned long)pid, gApp.foreName.c_str(), cls);
         }
         gAutoCand = 0;
         return;
