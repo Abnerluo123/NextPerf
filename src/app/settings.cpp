@@ -56,6 +56,8 @@ bool SettingsLoad() {
     if (auto* p = get("autoInject")) gApp.cfg.autoInject = (uint32_t)p->numOr(0.0);
     // Low 帧口径（默认 0 = 窗口平均，与驱动面板对齐；1 = 严格的单帧百分位）
     if (auto* p = get("lowStrict")) gApp.cfg.lowStrict = (uint32_t)p->numOr(0.0);
+    // Low 帧回看长度（秒），默认 12
+    if (auto* p = get("lowLookbackSec")) gApp.cfg.lowLookbackSec = (uint32_t)p->numOr(12.0);
     // 旧配置升级：v2 新增的图表计数器默认勾选一次；v3 改为行内小图开关
     {
         int ver = 1;
@@ -112,6 +114,7 @@ void SettingsSave() {
     root.obj["counters"] = Json::mkNum((double)gApp.cfg.counters);
     root.obj["autoInject"] = Json::mkNum((double)gApp.cfg.autoInject);
     root.obj["lowStrict"] = Json::mkNum((double)gApp.cfg.lowStrict);
+    root.obj["lowLookbackSec"] = Json::mkNum((double)gApp.cfg.lowLookbackSec);
     root.obj["bgColor"] = Json::mkNum(gApp.cfg.bgColor);
     root.obj["textColor"] = Json::mkNum(gApp.cfg.textColor);
     root.obj["accentColor"] = Json::mkNum(gApp.cfg.accentColor);

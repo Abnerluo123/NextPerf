@@ -1085,7 +1085,19 @@ void UpdateTelemetryCommon(const NPConfig& cfg, uint64_t nowQpc, bool realPresen
         //                 语义：「最近 12 秒里最差的那个半秒」，卡顿十几秒内过期
         //     0.1% Low -> 保留全部样本（≈68 秒）—— 它本来就该是「极值」，
         //                 长历史在语义上合理，也避免 1%/0.1% 算出同一个数
-        t.fpsLow1 = gStats.lowWindowed(1.0f, 500.0f, 720);
+        // 回看长度由配置决定（默认 12 秒）。按当前帧率把秒换算成帧数：
+        //   回看越短 -> 最差半秒越可能被排除 -> 数值越贴近驱动面板、刷新越快；
+        //   越长   -> 越能抓到久远的卡顿，但会「钉住」很久。
+        uint32_t lookFrames = 720;
+        if (gCfg && gCfg->lowLookbackSec >= 2 && gCfg->lowLookbackSec <= 120) {
+            double fpsRef = t.fpsAvg > 1.0 ? (double)t.fpsAvg : 60.0;
+            lookFrames = (uint32_t)(fpsRef * (double)gCfg->lowLookbackSec);
+            if (lookFrames < 120) lookFrames = 120;
+            if (lookFrames > np::FrameStats::kCap) lookFrames = np::FrameStats::kCap;
+        }
+        t.fpsLow1 = gStats.lowWindowed(1.0f, 500.0f, lookFrames);
+        // 0.1% Low 保持长历史：它本来就该是「极值」，
+        // 而且两个口径用不同回看长度才不会算出同一个数。
         t.fpsLow01 = gStats.lowWindowed(0.1f, 500.0f, np::FrameStats::kCap);
         // 样本还不够（lowWindowed 少于 4 个窗口会返回 0）时先用严格口径兜底
         if (t.fpsLow1 <= 0.0f) t.fpsLow1 = gStats.lowPercentileFps(99.0f, lowWin);

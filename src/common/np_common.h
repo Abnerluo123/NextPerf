@@ -187,7 +187,12 @@ struct NPConfig {
     // 打开则用「最差 pct% 单帧」的严格口径，适合抓单帧卡顿。
     // 同样复用 reserved 槽位 —— NPConfig 大小不变。
     uint32_t lowStrict;
-    uint32_t reserved[6];
+    // Low 帧「窗口平均」口径的回看长度（秒）。
+    // 规律：回看越短 -> 越贴近驱动面板、刷新越快；越长 -> 越能抓到久远的卡顿。
+    // 用户实测：全部样本(≈68s)数值贴近驱动但一次卡顿钉住 70 秒；
+    //           只回看 1 秒刷新极快但数值偏低。默认 12 秒取折中。
+    uint32_t lowLookbackSec;
+    uint32_t reserved[5];
 };
 
 // 历史采样环形缓冲：图表曲线的数据源。
@@ -405,6 +410,7 @@ inline void NPDefaultConfig(NPConfig* c) {
     c->version = 1;
     c->size = (uint32_t)sizeof(NPConfig);
     c->counters = NP_ALL_COUNTERS;
+    c->lowLookbackSec = 12;   // Low 帧窗口回看长度（秒）的默认值
     c->bgColor = 0xFF000000u;   // 纯黑背景，透明度走 bgOpacity
     c->textColor = 0xFFFFFFFFu;
     c->accentColor = 0xFF5AC8FAu;
