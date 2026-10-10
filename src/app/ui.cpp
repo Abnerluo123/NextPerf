@@ -314,14 +314,8 @@ static void Layout() {
     // 3D 窗口自动注入：用户要求给开关，**默认关闭**（误注入会打扰无关程序）
     cycle(L"自动注入 3D 窗口", (int*)&gApp.cfg.autoInject, {L"关闭", L"开启"}, {0, 1},
           RX, ry, half);
-    // Low 帧口径：默认「窗口平均」——与驱动面板/游戏内 overlay 的口径一致
-    // （实测 RE8 锁 60：窗口平均 57.1 vs 严格 53.8，驱动显示 59）。
-    // 想抓单帧卡顿就切到「严格」。
-    cycle(L"Low 帧口径", (int*)&gApp.cfg.lowStrict, {L"窗口平均", L"严格"}, {0, 1}, RX, ry, half);
-    // 回看越短 -> 数值越贴近驱动面板、刷新越快；越长 -> 越能抓到久远的卡顿。
-    // （实测：全部样本≈68s 会一次卡顿钉住 70 秒；只回看 1 秒则数值偏低。）
-    cycle(L"Low 帧回看", (int*)&gApp.cfg.lowLookbackSec, {L"5 秒", L"12 秒", L"30 秒"},
-          {5, 12, 30}, RX, ry, half);
+    // Low 帧只用 Intel PresentMon 的权威口径（1 秒滑动窗口 + P1）。
+    // 不提供「窗口时间」等可调项 —— 用户要求用权威方法、不让用户改窗口时间。
     ry += S(38);
     cycle(L"模拟数据（预览）", (int*)&gApp.cfg.simulate, {L"关闭", L"开启"}, {0, 1}, RX, ry, half);
     // 游戏已经在跑时，Present 只能靠自己造一条临时交换链去挂（见 ProbeSwapChainVtable）。

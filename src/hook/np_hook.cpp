@@ -1033,15 +1033,14 @@ void UpdateTelemetryCommon(const NPConfig& cfg, uint64_t nowQpc, bool realPresen
             if (lw < 30) lw = 30;
             if (lw > 480) lw = 480;
             // merged* = 面板实际显示的口径（gStats，已做帧内合并）
-            // raw*    = 老口径（gRawStats，未合并）—— 两者一起打，便于判断合并是否
-            //           把 Low 帧修正到了驱动面板的量级、以及有没有误合并。
+            // merged* = 面板显示的值（gStats，已做帧内合并）
+            // raw*    = 未合并（gRawStats）—— 两者对比可判断帧内合并是否生效/误合并
             Log("low compare: merged1=%.1f merged01=%.1f | raw1=%.1f raw01=%.1f | "
-                "win500_1=%.1f | med=%.2fms merged=%u avg=%.1f",
+                "mean=%.2fms merged=%u avg=%.1f",
                 (double)gStats.lowPercentileFps(99.0f, lw),
                 (double)gStats.lowPercentileFps(99.9f, lw),
                 (double)gRawStats.lowPercentileFps(99.0f, lw),
                 (double)gRawStats.lowPercentileFps(99.9f, lw),
-                (double)gStats.lowWindowed(1.0f, 500.0f, 1200),
                 (double)gRawStats.meanMs(240), (unsigned)gMergedCount,
                 (double)gStats.avgFps(600));
             gMergedCount = 0;
@@ -1071,38 +1070,20 @@ void UpdateTelemetryCommon(const NPConfig& cfg, uint64_t nowQpc, bool realPresen
     // ⚠ 窗口数用**全部样本**（不是 lowWin）：lowWindowed 是在「一批窗口平均值」
     //   上取百分位，窗口太少时 1% 与 0.1% 会取到同一个窗口、两个数一样。
     //   全部样本（4096 帧 ≈ 60fps 下 68 秒 ≈ 136 个窗口）下 1% 取 2 个、0.1% 取 1 个。
-    bool strict = (gCfg && gCfg->lowStrict);
-    if (strict) {
-        t.fpsLow1 = gStats.lowPercentileFps(99.0f, lowWin);
-        t.fpsLow01 = gStats.lowPercentileFps(99.9f, lowWin);
-    } else {
-        // ★ 回看长度是这里的关键 —— 用户实测「切换窗口后 low 帧永远高不上去」：
-        //   日志里 win500_1 卡在 39.8 整整 15 秒（掉下去就回不来）。
-        //   根因是原来两个口径都用**全部样本**（≈68 秒）取最差，于是一次卡顿
-        //   会把数值钉住将近 70 秒。
-        //   现在：
-        //     1% Low   -> 约 12 秒（60fps 下 720 帧 ≈ 24 个窗口，最差 1% = 1 个窗口）
-        //                 语义：「最近 12 秒里最差的那个半秒」，卡顿十几秒内过期
-        //     0.1% Low -> 保留全部样本（≈68 秒）—— 它本来就该是「极值」，
-        //                 长历史在语义上合理，也避免 1%/0.1% 算出同一个数
-        // 回看长度由配置决定（默认 12 秒）。按当前帧率把秒换算成帧数：
-        //   回看越短 -> 最差半秒越可能被排除 -> 数值越贴近驱动面板、刷新越快；
-        //   越长   -> 越能抓到久远的卡顿，但会「钉住」很久。
-        uint32_t lookFrames = 720;
-        if (gCfg && gCfg->lowLookbackSec >= 2 && gCfg->lowLookbackSec <= 120) {
-            double fpsRef = t.fpsAvg > 1.0 ? (double)t.fpsAvg : 60.0;
-            lookFrames = (uint32_t)(fpsRef * (double)gCfg->lowLookbackSec);
-            if (lookFrames < 120) lookFrames = 120;
-            if (lookFrames > np::FrameStats::kCap) lookFrames = np::FrameStats::kCap;
-        }
-        t.fpsLow1 = gStats.lowWindowed(1.0f, 500.0f, lookFrames);
-        // 0.1% Low 保持长历史：它本来就该是「极值」，
-        // 而且两个口径用不同回看长度才不会算出同一个数。
-        t.fpsLow01 = gStats.lowWindowed(0.1f, 500.0f, np::FrameStats::kCap);
-        // 样本还不够（lowWindowed 少于 4 个窗口会返回 0）时先用严格口径兜底
-        if (t.fpsLow1 <= 0.0f) t.fpsLow1 = gStats.lowPercentileFps(99.0f, lowWin);
-        if (t.fpsLow01 <= 0.0f) t.fpsLow01 = gStats.lowPercentileFps(99.9f, lowWin);
-    }
+    // Low 帧：**只用 Intel PresentMon 的权威口径**（用户要求，不再提供可调开关）。
+    //
+    //   * 窗口：--window-size 默认 **1000 ms** 滑动时间窗
+    //           （SampleClient/CliOptions.h:49；
+    //            实现 PresentMonMiddleware/DynamicQuery.cpp:221
+    //                  oldest = newest - windowSize）
+    //   * 百分位：线性插值 index=(n-1)*p
+    //           （Core/source/pmon/StatisticsTracker.cpp:35，与我们的一致）
+    //   * 倒数指标排名反转（PresentMonMiddleware/DynamicStat.cpp:323）：
+    //     对 FPS 取 **P1**，等价于 1000 / P99(帧时间) —— 正是 lowPercentileFps(99) 做的事
+    //
+    // 1 秒窗口还有个附带好处：**卡顿约 1 秒后就被遗忘**，不会「钉住」很久。
+    t.fpsLow1 = gStats.lowPercentileFps(99.0f, lowWin);
+    t.fpsLow01 = gStats.lowPercentileFps(99.9f, lowWin);
     t.p99Ms = gStats.percentileMs(99.0f);
     t.p999Ms = gStats.percentileMs(99.9f);
 
