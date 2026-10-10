@@ -1088,6 +1088,17 @@ void UpdateTelemetryCommon(const NPConfig& cfg, uint64_t nowQpc, bool realPresen
                 (double)gRawStats.lowPercentileFps(99.9f, lw),
                 (double)gRawStats.meanMs(240), (unsigned)gMergedCount,
                 (double)gStats.avgFps(600));
+            // ★ SELFCHECK：1% Low 不可能高于平均帧率（定义如此）。
+            //   出现 low > avg 说明两个数取自**不同序列**（例如一个用合并后、
+            //   一个用原始），或窗口长度不一致，或算错了 —— 都是真 bug。
+            //   只在两者都是有效值时才判，避免启动初期样本不足造成误报。
+            {
+                double low1 = (double)t.fpsLow1;
+                double avg = (double)t.fpsAvg;
+                const char* verdict = "SKIP";
+                if (low1 > 1.0 && avg > 1.0) verdict = (low1 <= avg + 0.05) ? "OK" : "FAIL";
+                Log("SELFCHECK fpsLowLeAvg = %s (1%%Low=%.1f avg=%.1f)", verdict, low1, avg);
+            }
             gMergedCount = 0;
             }
         }

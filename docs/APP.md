@@ -2,8 +2,9 @@
 
 > **维护铁律（先读这一段）**
 >
-> 1. **每次改 `src/app` 下的任何代码，必须同步更新本文档（`docs/APP.md`）与
->    `docs/CATALOG.md`。** 文档写错了比没写更糟 —— 下一个人会按错的说明去改代码。
+> 1. **每次改 `src/app` 下的任何代码，必须同步更新本文档（[`APP.md`](APP.md) 与
+>    [`APP-FUNCTIONS.md`](APP-FUNCTIONS.md)）以及总目录 [`CATALOG.md`](CATALOG.md)。**
+>    文档写错了比没写更糟 —— 下一个人会按错的说明去改代码。
 > 2. 行号会漂移。本文档所有行号基于**当前工作区的文件内容**，各文件行数如下，
 >    行数对不上就说明代码已经改过，请先把受影响的条目核对一遍再继续：
 >
@@ -19,6 +20,11 @@
 >    （注意：任务书里给的 1000 / 813 / 587 / 158 / 111 行是**过期数字**，
 >     实际是上表这些。以 `read` 工具看到的行号为准。）
 > 3. 拿不准的结论写「未确认」，**不要编造**。本文档里已经这样标注了几处。
+> 4. 本文档偶尔会引用**其它层**的行号（`src/hook`、`src/sensors`、`src/common`）。
+>    那些文件不归本层维护、**会随别的改动漂移**（撰写期间 `src/hook/np_hook.cpp`
+>    就正在被并行修改，行号已经变过一次）。对不上时以
+>    `docs/HOOK.md`、`docs/SENSORS.md`、`docs/DATA-STRUCTS.md` 为准；
+>    `src/app` 自己的行号才是本文档负责的范围。
 
 ---
 
@@ -77,8 +83,9 @@
 ```
 EnableDpiAwareness()                        // 929-932，必须在建窗口之前
 NPClearSensors / NPClearTelemetry           // 934-935：把结构体置成「空但合法」（magic/version 已填）
-SettingsLoad()                              // 936：先加载配置，命令行分支也要用到 cfg/games
-  ├─ --selftest  -> RunSelfTest()           // 938
+SettingsLoad()                              // 936：加载配置（文件缺失/解析失败就静默保留默认值）
+  ├─ --selftest  -> RunSelfTest()           // 938（它自己会再 NPDefaultConfig 一次，见 807）
+
   ├─ --uismoke   -> RunUiSmoke()            // 939
   └─ --inject    -> RunInjectCli()          // 941（在 GfxInit 之前返回：注入不需要图形）
 npb::GfxInit()                              // 943：Direct2D/DirectWrite 工厂
@@ -117,6 +124,9 @@ UI 侧还有一份自己的缩放：`ui.cpp:40-41` 的 `gS = dpi/96` 与 `S(v)` 
 * **坑（源码注释里明写的）**：不能写成 `DllPath() + "\\..\\selftest.txt"` ——
   `DllPath()` 返回的是 `...\NextPerfHook.dll`，把 dll 当目录再退一级是非法路径，
   `_wfopen` 一直失败，报告只进了 stderr（`main.cpp:758-762`）。
+* ⚠ 上面那句 `DllPath();`（`main.cpp:762`）**不是废调用**：它的副作用是把
+  `gApp.exeDir` / `gApp.dllPath` 填好，紧接着的 `_wfopen` 用的就是 `gApp.exeDir`。
+  **删掉它会得到一个相对路径 `\..\selftest.txt`**（跟着当前工作目录走）。
 * **退出码** = 失败项数；且**必须 `ExitProcess(fails)` 硬退出**（`main.cpp:847-851`）：
   这条路径不进主消息循环、也不走 `CleanupAndExit`，直接 `return` 偶尔会把进程留在系统里
   （`--uismoke` 就会），**残留进程会锁住 `dist\NextPerf.exe` 让后续构建失败**。
@@ -175,7 +185,7 @@ UI 侧还有一份自己的缩放：`ui.cpp:40-41` 的 `gS = dpi/96` 与 `S(v)` 
 
 > `NP_MUTEX_SENSORS`（`np_common.h:24`）在**整个代码库里没有任何地方使用**，
 > 属于遗留常量。写传感器时**没有加锁**，靠的是「整块 memcpy + 读方整块拷贝」的约定
-> （读方见 `src/hook/np_hook.cpp:599-605`：先 `c = *gCfg;`、`s = *gSens;` 拷出来再用）。
+> （读方见 `src/hook/np_hook.cpp:636-642`：先 `c = *gCfg;`、`s = *gSens;` 拷出来再用）。
 
 ### 3.2 `CreateShm`（`main.cpp:38`）
 
@@ -195,7 +205,7 @@ TryOpenTelemetry(); PickTelemetry();
 
 * **`pauseHook` 的语义（用户报的第三个 bug 的修复）**：点「退出监视」如果只关桌面 HUD，
   游戏内面板照旧在画、数据照旧在读。现在 `pauseHook` 会让钩子**跳过叠加绘制与遥测更新
-  （= 停止读取）**，只保留最小心跳（`main.cpp:512-515`，钩子侧 `src/hook/np_hook.cpp:1486-1502`）。
+  （= 停止读取）**，只保留最小心跳（`main.cpp:512-515`，钩子侧 `src/hook/np_hook.cpp:1542-1558`）。
 * **为什么 `AppPublish` 要在每个 tick 都无条件调用**（`main.cpp:1017-1023`）：
   原来它只在 `monitoring` 为真时调用，于是用户「退出监视」后**配置再也不发布**，
   钩子永远收不到 `pauseHook`。`AppPublish` 幂等、开销极小（几十字节 memcpy），无条件调用最稳。
@@ -237,6 +247,11 @@ TryOpenTelemetry(); PickTelemetry();
   曾经往 `NPTelemetry` 中间插了一个字段而 Python 那边的 `ctypes` 结构体没同步，
   结果读到的全是错位字节（钩子明明工作正常却报「未挂上」）。
   `NPSensors` 原来是 `version = 1`，等于**完全没有自检**，后来补齐成 `sizeof`。
+* ⚠ **`version == sizeof` 只能抓「大小变了」，抓不到「字段顺序/宽度换了但总大小不变」**
+  （`tests/struct_check.py:1-11` 原话：两边字段总数相同、总大小也相同，只是排列不同，
+  所以 `version == sizeof(...)` 那道大小自检**抓不到**，结果读到的全是错位字节 ——
+  查了很久）。所以**动过结构体字段顺序/宽度之后，必须跑 `python tests/struct_check.py`**，
+  它按字段名、顺序、宽度逐项比对 C++ 头与 Python ctypes 镜像（目前只覆盖 `NPTelemetry`）。
 * `NPConfig` 的 `version` 是**配置格式版本**；`size = sizeof(NPConfig)` 才是它的自校验字段
   （`np_common.h:416`）。
 * 新增共享内存字段的铁律：**加在结构体末尾**（或复用 `reserved[]`），
@@ -480,7 +495,7 @@ void InjectorShutdown()  { gWatchRun = false; WaitForSingleObject(gWatchThread, 
 
 * 标志是 `volatile bool gWatchRun`（`injector.cpp:20`），**没有事件对象**：
   最坏情况下退出要多等 800ms，`WaitForSingleObject` 给了 2 秒余量。
-* 与钩子侧对 `detachPid` 的轮询周期（**200ms**，`src/hook/np_hook.cpp:2600`）不同，
+* 与钩子侧对 `detachPid` 的轮询周期（**200ms**，`src/hook/np_hook.cpp:2671`）不同，
   改动任何一侧的周期都要回头看 §6.4 的 2.5 秒契约。
 
 ### 5.6 进程信息小工具
@@ -524,7 +539,7 @@ AppLog("detach: 请求 pid=%lu 的钩子自卸载", pid);
 那需要解析远端导出地址（ASLR 下要自己算偏移），而且跨位数（32 位游戏）还得另做一套。
 **钩子本来每帧/每轮就在读 `NPConfig`，用这个字段既简单又天然支持跨位数。**
 
-钩子侧的响应链（`np_hook.cpp:2603-2611`，守卫线程 200ms 一轮）：
+钩子侧的响应链（`np_hook.cpp:2674-2682`，守卫线程 200ms 一轮）：
 `detachPid == GetCurrentProcessId()` → `SelfUnloadNow()` →
 `RestoreAllHooks`（还原 vtable 补丁）+ 注销 VEH + `FreeLibraryAndExitThread`，
 **这正是「反复注入不闪退」用的干净卸载**（`injector.cpp:485-487`）。
@@ -1039,8 +1054,14 @@ ShowWindow(h, SW_HIDE);                                                         
 ```
 gCleanedUp 幂等保护                       // 720-721
 ① np::Etw().Stop()                       // 724（不显式停会留下同名会话，系统里积垃圾）
-② cfg.quit = 1; AppPublish(); Sleep(900) // 727-729（钩子 worker 每 500ms 轮询一次 quit 标志；
-                                          //   900ms 等它完成自卸载，含 100ms 排空中窗）
+② cfg.quit = 1; AppPublish(); Sleep(900) // 727-729（**源码注释**写的是「钩子 worker 每 500ms
+                                          //   轮询一次 quit 标志；900ms 等它完成自卸载，
+                                          //   含 100ms 排空中窗」。⚠ 与钩子当前实现对不上：
+                                          //   守卫线程实际是 `Sleep(200)`（`np_hook.cpp:2671`），
+                                          //   自卸载是 `Sleep(150)` → `RestoreAllHooks()`
+                                          //   → `Sleep(250)` 排空（`np_hook.cpp:2535-2538`）。
+                                          //   900ms 对「200ms 轮询 + 400ms 排空」仍然够用，
+                                          //   但**改钩子侧周期/排空时长时，必须回头核这个 900**）
 ③ 删托盘图标 Shell_NotifyIconW(NIM_DELETE) // 732
 ④ InjectorShutdown() -> OverlayShutdown() -> UiDestroy()   // 735-737
 ⑤ TelemetryCloseAll()                    // 740
@@ -1050,7 +1071,7 @@ gCleanedUp 幂等保护                       // 720-721
 
 * **为什么必须先广播 `quit` 再 `Sleep(900)`**：钩子是别人进程里的线程，
   我们有句柄它就不会死；只有让它自己走 `SelfUnloadNow`（还原 vtable 补丁 + 注销 VEH）
-  才是干净退出。**这就是「反复注入不闪退」的前提**（`src/hook/np_hook.cpp:2602`）。
+  才是干净退出。**这就是「反复注入不闪退」的前提**（`src/hook/np_hook.cpp:2673`）。
 * 共享内存对象的本体随**最后一个句柄**关闭而销毁（`main.cpp:739`）——
   所以主程序退出后钩子还能读到旧配置（这也是为什么 `quit` 必须先广播）。
 * `WinMain` 退出路径：`CleanupAndExit(); SettingsSave(); return 0;`（`main.cpp:1223-1224`）。
@@ -1322,7 +1343,7 @@ AppLog("notice[%d]: %s", level, text.c_str());
 
 | # | 位置 | 现状 | 影响 | 建议 |
 | --- | --- | --- | --- | --- |
-| G1 | `np_common.h:438` vs `:200` | `NPDefaultConfig` 的循环写 `reserved[0..7]`，但数组只有 4 个元素 —— **越界写 16 字节** | 调用点全在本层：`SettingsLoad`（每次启动）、UI `A_DEFAULT`、`RunSelfTest`。`AppState` 里 `cfg` 紧跟 `sensors`，越界部分落在 `NPSensors` 头部（`magic`/`version`/`tickMs`） | 修数组大小或循环上界（**本次未改代码**）。属 common 层，改动需两侧回归 |
+| G1 | `np_common.h:438` vs `:200` | `NPDefaultConfig` 的循环写 `reserved[0..7]`，但数组只有 4 个元素 —— **越界写 16 字节** | 调用点全在本层：`SettingsLoad`（每次启动）、UI `A_DEFAULT`、`RunSelfTest`。按字段宽度推算 `sizeof(NPConfig) = 136` 且尾部无填充，`AppState` 里 `sensors` 正好从偏移 136 开始 → 越界写的正是 `gApp.sensors` 的 `magic`(136-139)、`version`(140-143)、`tickMs`(144-151)。后果：在下一轮 `NPClearSensors` 之前，发布出去的 Sensors 是 `magic = 0`（读方钩子按 `magic == NP_MAGIC` 判断，会忽略该帧）。**静默、无崩溃、但语义被破坏** | 修数组大小或循环上界（**本次未改代码**）。属 common 层，改动需两侧回归；顺带核对 `sizeof(NPConfig)` 是否仍等于 136 |
 | G2 | `main.cpp:1093-1107` | 学习成功的 `gApp.games.push_back` **没有 `AppLock`** | 与 `ui.cpp:483-488` 的规则自相矛盾；守护线程正在遍历 `games` 时会踩迭代器失效（崩主程序） | 补 `AppLock`（**本次未改**） |
 | G3 | `ui.cpp:631` | 游戏列表状态仍用 `(GetTickCount64() - t.tickMs) < 2500` **跨进程时钟比较** | 回到 §16.2 第 7 条那个 bug：状态可能永远显示不正确（32 位钩子 tickMs 落在「未来」） | 改用与 `main.cpp` 一致的帧计数判据（**本次未改**） |
 | G4 | `main.cpp:66` | 打开遥测块时**只校验 `magic`，没校验 `version`** | 结构体布局不一致时（旧 DLL 残留）会读到错位字节，且不会被发现 —— 这正是 `version = sizeof` 想防的事 | 加 `v->version == (uint32_t)sizeof(NPTelemetry)` 判断（**本次未改**） |
@@ -1342,9 +1363,16 @@ AppLog("notice[%d]: %s", level, text.c_str());
    本文档的每个「为什么」都是从源码注释里抠出来的，源码改了注释没改、或文档没跟，
    下一个接手的人就会按错的说明改代码 —— 这个项目已经因为「文档/构建时间对不上」
    白排查过一整轮（`np_app.h:14-18`）。
-   > `docs/CATALOG.md` 在当前工作区里**尚未存在**（`grep CATALOG` 无命中）。
-   > 若它由别的层/任务负责创建，请把本层的条目补进去；若确实还没有，**请建立它**，
-   > 并把 `src/app` 下的文件、函数、消息/命令 ID、共享内存字段、配置键登记进去。
+   > `docs/CATALOG.md` **已经存在**，而且它的「功能文档索引」里已经挂了
+   > [`APP.md`](APP.md) 与 [`APP-FUNCTIONS.md`](APP-FUNCTIONS.md) 两条 ——
+   > 也就是说：**本层再改任何东西，都必须在 [`CATALOG.md`](CATALOG.md) 里同步**
+   > （它的 §6 也是这么规定的）。要同步的是：新增文件（§3.1 文件清单）、
+   > 新增功能（§2.1 / §2.5 功能定位表）、以及血泪教训（§5）。
+   > ⚠ 另外：**[`CATALOG.md`](CATALOG.md) §3.1 里 `src/app` 各文件的行数是旧估值**
+   > （写成 ~1000 / ~813 / ~587 / ~158 / ~111 / ~125，本文档撰写时的真实值是
+   > 1226 / 939 / 728 / 184 / 135 / 177）。本次任务只被允许写 `APP.md` 与
+   > `APP-FUNCTIONS.md`，所以没有动它 —— **请后续维护者顺手把那张表更新掉**，
+   > 行数不对会直接毁掉「用行号定位」这件事。
 2. **改任何跨线程共享的数据结构，先问「另一边在哪个线程、有没有拿 `AppLock`」**，
    然后按 §4.3 的清单逐点核对。这类 bug 的表现是**随机崩溃**，最难查。
 3. **判活/判新鲜度一律不要用跨进程时间戳**，用帧计数增长（§8.4）。

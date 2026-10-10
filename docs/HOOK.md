@@ -34,7 +34,7 @@
 外置方案（ETW / 桌面叠加）拿不到「引擎在干什么」：draw call 数、光追 dispatch、
 AI 超分模块是否加载、渲染分辨率与输出分辨率的缩放比 —— 这些只有站在进程内部才能观测。
 代价是**宿主崩溃风险**，所以本层的代码风格到处是「宁可丢数据，也不能动游戏的命令流」
-（`np_hook.cpp:294-297`、`2211-2224`）。
+（`np_hook.cpp:331-334`、`2211-2224`）。
 
 ### 1.3 文件构成
 
@@ -42,7 +42,7 @@ AI 超分模块是否加载、渲染分辨率与输出分辨率的缩放比 —�
 | --- | --- | --- |
 | `src/hook/dllmain.cpp` | 26 | `DllMain`：`DLL_PROCESS_ATTACH` → `NpHookAttach`；`DLL_PROCESS_DETACH` → `NpHookDetach`（`dllmain.cpp:13-26`） |
 | `src/hook/np_hook.h` | 7 | 只有两个导出：`NpHookAttach(HMODULE)` / `NpHookDetach()` |
-| `src/hook/np_hook.cpp` | 2684 | 全部逻辑：vtable 下标表、SEH、IPC、时间戳、Present 主流程、绘制编排、钩子安装与卸载 |
+| `src/hook/np_hook.cpp` | 2744 | 全部逻辑：vtable 下标表、SEH、IPC、时间戳、Present 主流程、绘制编排、钩子安装与卸载 |
 | `src/hook/np_draw.h` / `np_draw.cpp` | 104 / 610 | 叠加层绘制：`Overlay11`（D3D11）与 `Overlay12`（D3D12）两套，外加 D3DCompile 运行时编译 |
 | `src/hook/np_reflex.h` | 128 | NVAPI Reflex 读取（`NvAPI_D3D_GetLatency` / `GetSleepStatus`），header-only |
 | `src/common/np_common.h` | 497 | 共享内存三块结构：`NPConfig` / `NPSensors` / `NPTelemetry`，以及各种位定义 |
@@ -51,7 +51,7 @@ AI 超分模块是否加载、渲染分辨率与输出分辨率的缩放比 —�
 
 ### 1.4 三个共享内存块（进程间通信的全部）
 
-定义在 `np_common.h:22-24`、`np_common.h:30-45`：
+定义在 `np_common.h:22-24`、`np_common.h:30-45`（源文件见 `src/common/np_common.h`）：
 
 | 块 | 名字 | 方向 | 钩子侧访问点 |
 | --- | --- | --- | --- |
@@ -418,70 +418,70 @@ PatchSwapChainVtable → gSwapVtCount>0 → PresentHooked()=true → 后续探�
 
 ### 12.2 涉及函数
 
-- `np_hook.cpp:1975-2106` `EnsureD3D12Hooks`（惰性安装，首次 D3D12 Present 时）
-- `np_hook.cpp:2157-2226` `NpECL`
-- `np_hook.cpp:2237-2283` `NpDispatchRays`
-- `np_hook.cpp:2285-2290` `NpBuildAS`
-- `np_hook.cpp:2292-2341` `NpDispatch`
-- `np_hook.cpp:2343-2347` `NpDrawInst` / `2349-2353` `NpDrawIdx`
-- `np_hook.cpp:2355-2372` `NpSetViewports`
-- `np_hook.cpp:2232-2235` `CanTimestamp`
+- `np_hook.cpp:2020-2151` `EnsureD3D12Hooks`（惰性安装，首次 D3D12 Present 时）
+- `np_hook.cpp:2202-2271` `NpECL`
+- `np_hook.cpp:2282-2328` `NpDispatchRays`
+- `np_hook.cpp:2330-2335` `NpBuildAS`
+- `np_hook.cpp:2337-2386` `NpDispatch`
+- `np_hook.cpp:2388-2392` `NpDrawInst` / `2394-2398` `NpDrawIdx`
+- `np_hook.cpp:2400-2417` `NpSetViewports`
+- `np_hook.cpp:2277-2280` `CanTimestamp`
 
 ### 12.3 ⚠ D3D12 的函数实现其实在 `D3D12Core.dll` 里
 
-`np_hook.cpp:430-440` 保留了一个**已无人使用**的 `InModule()`，它存在的唯一目的是记住这个教训：
+`np_hook.cpp:472-477` 保留了一个**已无人使用**的 `InModule()`，它存在的唯一目的是记住这个教训：
 
 > 曾经用它做「槽位必须落在 `dxgi.dll` / `d3d12.dll` 里」的健全性检查，
 > 结果在真实 Windows 上**全数失败** —— D3D12 的实现其实在 **`D3D12Core.dll`** 里，
 > `d3d12.dll` 只是个薄壳。判定依据错一个模块名，**光追和 DLSS 的钩子就一个都装不上**。
 
-同类教训还有一层（`1718-1725`）：那套「必须落在 d3d12.dll 里」的假设只在干净的自建宿主里成立，
+同类教训还有一层（`1763-1770`）：那套「必须落在 d3d12.dll 里」的假设只在干净的自建宿主里成立，
 真实游戏里模块布局完全不同（别的叠加层、厂商模块、D3D11 与 D3D12 走不同实现），
 结果命令列表钩子一个都没装 → **光追和 DLSS 数据全丢**，表面现象是「未检测到 DXR」「AI 已启用 · 估算中」。
 所以现在只检查「是可执行代码、槽位互不相同」，并把**实际归属模块**（`PtrOwner`）打进日志。
 
 ### 12.4 `EnsureD3D12Hooks` 的安装逻辑
 
-1. **失败必须能重试，但绝不能被并发重入**（`1976-1989`）：
+1. **失败必须能重试，但绝不能被并发重入**（`2021-2034`）：
    `attempts` / `lastTryMs` / `installing` 三个都是 `std::atomic`。
    原来是普通静态量：两个 Present 线程可以同时通过检查，各自建一套查询堆/fence/叠加资源 ——
    先建的句柄被覆盖，既泄漏又状态错乱（`gTsFreq` 也会跟着错）。
    策略是「谁先抢到谁装，其他人立刻返回 `false`」：装好后 `gOrigECL` 非空，
    下一帧所有线程都走最前面的快速路径。`InstallGuard` 保证任何返回路径都放开闸门。
-2. 上限：**5 次尝试 + 2 秒冷却**（`2001-2007`）。
-3. 建一条**临时 DIRECT 队列** → 读 `gQueueVt` → `Patch(ExecuteCommandLists)`（`2009-2019`）。
+2. 上限：**5 次尝试 + 2 秒冷却**（`2046-2052`）。
+3. 建一条**临时 DIRECT 队列** → 读 `gQueueVt` → `Patch(ExecuteCommandLists)`（`2054-2064`）。
 4. `GetTimestampFrequency` → `gTsFreq`（失败退 1000000）。
 5. `InitTs12(dev, q)`：查询堆（`TS_SLOTS=64`）+ 4 个 readback 缓冲 + fence +
-   `NP_ALLOC_RING=32` 个分配器 + 一条命令列表；然后**立刻 `Close()`**（`635-669`）。
+   `NP_ALLOC_RING=32` 个分配器 + 一条命令列表；然后**立刻 `Close()`**（`672-706`）。
 6. `gOv12.Init(dev)`，成功置 `NP_HOOK_OVERLAY`。
-7. **释放临时队列**（`2024`）—— 我们只借用它的 vtable 指针。
+7. **释放临时队列**（`2069`）—— 我们只借用它的 vtable 指针。
    注意：`gQueue12` 是后来在 `NpECL` 里 AddRef 锁定的**游戏队列**，与这条临时队列不是一回事。
 8. 若 `Cfg().deepEngineHook`：再借一条**临时命令列表**，`QI ID3D12GraphicsCommandList4`，
    做健全性检查后挂 `DispatchRays` / `BuildRaytracingAccelerationStructure` / `Dispatch` /
-   `DrawInstanced` / `DrawIndexedInstanced` / `RSSetViewports`（`2027-2104`）。
+   `DrawInstanced` / `DrawIndexedInstanced` / `RSSetViewports`（`2072-2149`）。
    任何一步失败都只写日志（`-> NO RT/Tensor data`），不影响帧时间路径。
 
 ### 12.5 `NpECL` 的关键逻辑
 
-- `gUnloading` / `!q` → 直通（`2158`）。
-- **只认 DIRECT 队列**（`2160-2177`）：复制/计算队列拿去做叠加和 GPU 时间戳都是错的，
+- `gUnloading` / `!q` → 直通（`2203`）。
+- **只认 DIRECT 队列**（`2205-2222`）：复制/计算队列拿去做叠加和 GPU 时间戳都是错的，
   而且游戏常常先提交复制队列，先到先得会把 `gQueue12` 记错。
-- **锁定队列时必须 `AddRef`**（`2166-2173`）：引擎在切换全屏/重建交换链/设备丢失恢复时
+- **锁定队列时必须 `AddRef`**（`2211-2218`）：引擎在切换全屏/重建交换链/设备丢失恢复时
   会**销毁并重建命令队列**（有时连设备一起换）。只存裸指针，之后往已销毁的队列上
   `ExecuteCommandLists`/`Signal`：轻则围栏永不推进（`BeginList` 从此一直 allocator busy、
   叠加永久停画），重则在驱动里访问违例把游戏带崩。
-- **只有 `q == gQueue12` 才插桩**（`2179-2189`）：原来只判 `q` 非空，
+- **只有 `q == gQueue12` 才插桩**（`2224-2234`）：原来只判 `q` 非空，
   于是游戏往复制队列提交时，我们会把**自己的 DIRECT 命令列表**丢给复制队列执行 ——
   非法调用，设备 removed，游戏弹 `DXGI_ERROR_INVALID_CALL` 退出。
   自建测试宿主只有一条队列所以测不出来，真实游戏大量用复制队列，症状是「数据出来一秒后闪退」。
-- **「本帧已开始」用 `compare_exchange` 抢**（`2191-2201`）：
+- **「本帧已开始」用 `compare_exchange` 抢**（`2236-2246`）：
   `EndList()` 内部会再调一次 `q->ExecuteCommandLists`，也就是再进一次本函数，
   所以标记必须在 `EndList` **之前**抢到手，再加一道 `thread_local bool busy` 本线程重入锁；
   用「先读后写」会让两个线程同时通过检查、同时 `Reset` 同一条命令列表。
-- **模拟阶段结束只认渲染线程**（`2202-2209`）：后台流式线程随时都在提交；
+- **模拟阶段结束只认渲染线程**（`2247-2254`）：后台流式线程随时都在提交；
   还必须排除 `gInPresent`（我们自己的叠加和时间戳命令列表也是从渲染线程提交的），
   否则算出来的模拟阶段会变成整个帧周期。
-- **逐批 GPU 时间戳夹取已被删除**（`2211-2224`）：曾经给每一次 `ExecuteCommandLists`
+- **逐批 GPU 时间戳夹取已被删除**（`2256-2269`）：曾经给每一次 `ExecuteCommandLists`
   前后各插一条时间戳（2 次 `BeginList`）。真实游戏一帧提交十几到几十批（实测
   "more than 16 batches per frame"），一帧要 32+ 个分配器 —— 环瞬间被掏空，然后
   `BeginList: allocator starved` 刷屏、`overlay NOT drawn`，**叠加永久停画**。
@@ -489,7 +489,7 @@ PatchSwapChainVtable → gSwapVtCount>0 → PresentHooked()=true → 后续探�
 
 ### 12.6 `CanTimestamp`
 
-`np_hook.cpp:2232-2235`。`ID3D12GraphicsCommandList` 的 vtable 是**打包（bundle）和直连列表共用**的，
+`np_hook.cpp:2277-2280`。`ID3D12GraphicsCommandList` 的 vtable 是**打包（bundle）和直连列表共用**的，
 而 bundle 上 `EndQuery` 是**非法操作** —— 真实游戏会用 bundle，一插就把设备搞成 removed。
 复制列表同理不接受时间戳。所以只有 `GetType() == D3D12_COMMAND_LIST_TYPE_DIRECT` 才允许插桩。
 
@@ -504,15 +504,15 @@ TS_RT_BASE     32   TS_RT_PAIRS    8    // 槽 32..47
 TS_AI_START    48   TS_AI_END      49
 ```
 
-`HarvestTimestamps`（`743-785`）在 fence 确认后 `Map` readback：
-- 批次区间求和得 `gpuMs`，**单批超过 50ms 判为配对出错（比如跨帧）直接丢弃并记日志**（`762-764`）；
+`HarvestTimestamps`（`780-822`）在 fence 确认后 `Map` readback：
+- 批次区间求和得 `gpuMs`，**单批超过 50ms 判为配对出错（比如跨帧）直接丢弃并记日志**（`799-801`）；
 - RT 区间求和；AI 区间（`TS_AI_END > TS_AI_START` 才算）；
 - 只有 `0 < gpuMs < 1000` 才写 `gTel->gpuFrameMs`；
-- **RT/Tensor 的百分比不在这里算**，统一在 `UpdateTelemetryCommon` 里按**帧周期**当分母（`780-782`，理由见 §15.3）。
+- **RT/Tensor 的百分比不在这里算**，统一在 `UpdateTelemetryCommon` 里按**帧周期**当分母（`817-819`，理由见 §15.3）。
 
 ### 12.8 `NpSetViewports` 与渲染分辨率
 
-`np_hook.cpp:2355-2372`。**只在视口长宽比和输出一致（`rel <= 1.05`）时才认**，
+`np_hook.cpp:2400-2417`。**只在视口长宽比和输出一致（`rel <= 1.05`）时才认**，
 并且取满足条件的最大面积。原来取「见过的最大的视口」，
 结果被 shadow atlas / 后处理用的方目标骗到：用户 16:10 的屏幕上显示成
 `3072×3072 → 3840×2400（80%）`，完全是错的。
@@ -528,38 +528,38 @@ TS_AI_START    48   TS_AI_END      49
 
 ### 13.2 涉及函数
 
-- `np_hook.cpp:671-718` `BeginList`
-- `np_hook.cpp:720-741` `EndList`
-- `np_hook.cpp:787-802` `SubmitPendingResolve`
-- `np_hook.cpp:377-384` `struct Pending gPending[4]`
-- `np_hook.cpp:361-375` 查询堆 / readback / fence / 分配器环
+- `np_hook.cpp:708-755` `BeginList`
+- `np_hook.cpp:757-778` `EndList`
+- `np_hook.cpp:824-839` `SubmitPendingResolve`
+- `np_hook.cpp:414-421` `struct Pending gPending[4]`
+- `np_hook.cpp:397-412` 查询堆 / readback / fence / 分配器环
 
 ### 13.3 实现逻辑
 
-1. `gD12Locked`（thread_local）已置 → 同线程重入，直接放弃（`672`）。
-2. `gD12Broken` → 直接放弃（`673`）。
-3. **`gD12Lock.try_lock()`，不是 `lock`**（`674-681`）：抢不到就**放弃这一帧**，
+1. `gD12Locked`（thread_local）已置 → 同线程重入，直接放弃（`709`）。
+2. `gD12Broken` → 直接放弃（`710`）。
+3. **`gD12Lock.try_lock()`，不是 `lock`**（`711-718`）：抢不到就**放弃这一帧**，
    绝不阻塞游戏线程。少一帧叠加/时间戳无所谓，卡住或搞崩游戏才是大事。
    前 5 次会记一条日志，避免刷屏。
-4. **分配器环形缓冲 `NP_ALLOC_RING = 32`**（`366-374`）：一帧里每批 GPU 时间戳要 2 次
+4. **分配器环形缓冲 `NP_ALLOC_RING = 32`**（`403-412`）：一帧里每批 GPU 时间戳要 2 次
    （起止各一次），再加 Present 里的 resolve 和叠加录制；批次多的时候十几个很正常，
    只给 3 或 8 会让 GPU 稍微落后就全部 busy，然后 `BeginList` 一路返回 `nullptr`，叠加**永久停画**。
-5. **绝不在这里等 GPU**（`685-701`）：原来会 `WaitForSingleObject` 最多 50ms ——
+5. **绝不在这里等 GPU**（`722-738`）：原来会 `WaitForSingleObject` 最多 50ms ——
    那是在游戏 Present 的调用栈里睡觉，直接变成游戏的卡顿，还会污染我们自己的帧时间统计。
    拿不到就返回 `nullptr`。连续拿不到会记日志；**连续失败超过 600 次**则
    `gD12Broken = true` 永久停手（一直失败会让叠加永久停画，而围栏不推进往往意味着
    我们手里的队列/围栏已经失效，继续硬撑只会把游戏拖死）。
-6. `Reset` 分配器 / `Reset` 命令列表失败 → 立刻 `gD12Broken = true`（`703-716`）。
+6. `Reset` 分配器 / `Reset` 命令列表失败 → 立刻 `gD12Broken = true`（`740-753`）。
 7. `EndList`：`Close` → `ExecuteCommandLists(1, {gList})` → `++gFenceVal` → `Signal(gFence)` →
    记 `gAllocFence[gAllocCur]` → 若叠加有自己的 fence 也一起 `Signal` 并把值写进
-   `fenceValuePtr()` → 解锁。**没拿锁就不要瞎解锁**（`721`）。
+   `fenceValuePtr()` → 解锁。**没拿锁就不要瞎解锁**（`758`）。
 8. `SubmitPendingResolve`：找空的 `Pending` 槽（4 个），`ResolveQueryData(0, TS_SLOTS)` 到对应
    readback，`EndList` 后才把 `busy/fenceVal/rtCount/batchCount/aiUsed` 记上。
 
 ### 13.4 D3D11 时间戳
 
-`InitTs11`（`807-817`）建 3 组（disjoint + a + b）；
-`Ts11Tick`（`819-848`）用 `seq % 3` 做三缓冲轮转：结束上一组、开始当前组、尝试读最旧一组
+`InitTs11`（`844-854`）建 3 组（disjoint + a + b）；
+`Ts11Tick`（`856-885`）用 `seq % 3` 做三缓冲轮转：结束上一组、开始当前组、尝试读最旧一组
 （`GetData` 返回 `S_OK` 才算就绪，且必须 `!dj.Disjoint`、`dj.Frequency` 非 0、`b > a`、
 `0 < ms < 1000`）。
 
@@ -567,46 +567,46 @@ TS_AI_START    48   TS_AI_END      49
 
 ## 14. Present 主流程 `PresentCommon`
 
-**这是整个钩子层的心脏**，`np_hook.cpp:1137-1693`。两个跳板 `NpPresent`/`NpPresent1`
-（`2114-2121`）只是转发。读懂这一节，就理解了钩子层 80% 的行为。
+**这是整个钩子层的心脏**，`np_hook.cpp:1182-1738`。两个跳板 `NpPresent`/`NpPresent1`
+（`2159-2166`）只是转发。读懂这一节，就理解了钩子层 80% 的行为。
 
 ### 14.1 入口防护（顺序不能改）
 
 ```
-1141-1144  按这条交换链的 vtable 反查原函数（op / op1），组装 CallOriginal lambda
-1157       if (gUnloading) 直通        ← 必须在 gTel 解引用之前！
-1158       if (!gTel || !sc) 直通
-1159       if (gInPresent) 直通        ← 防重入
-1160-1167  gInPresent = true；SehReady / setjmp 保护；失败一律复位后直通
-1168       EnsureRt()                  ← D2D/DirectWrite 只能在渲染线程初始化
+1186-1189  按这条交换链的 vtable 反查原函数（op / op1），组装 CallOriginal lambda
+1202       if (gUnloading) 直通        ← 必须在 gTel 解引用之前！
+1203       if (!gTel || !sc) 直通
+1204       if (gInPresent) 直通        ← 防重入
+1205-1212  gInPresent = true；SehReady / setjmp 保护；失败一律复位后直通
+1213       EnsureRt()                  ← D2D/DirectWrite 只能在渲染线程初始化
 ```
 
-`gUnloading` 为什么必须放在最前（`1152-1156`）：`SelfUnloadNow()` 会先置 `gUnloading`、Sleep 排空，
+`gUnloading` 为什么必须放在最前（`1197-1201`）：`SelfUnloadNow()` 会先置 `gUnloading`、Sleep 排空，
 然后 `UnmapViewOfFile(gTel)` 并把 `gTel` 置空；如果渲染线程正好晚一步进来，
 `!gTel` 检查可能通过、而下一行 `*gTel` 指向的视图已经被解除映射 —— 直接访问违例。
 
-### 14.2 首次接入（设备识别，`1174-1200`）
+### 14.2 首次接入（设备识别，`1219-1245`）
 
 `GetDevice` 会 AddRef，所以设备/上下文是安全的（真正缺 AddRef 的是命令队列，见 §12.5）。
 先试 `ID3D11Device`，再试 `ID3D12Device`；都失败就按已加载模块猜 API。
 随后写 `gTel->processName`（取 exe 文件名）。
 
-### 14.3 分辨率与全屏模式（`1202-1227`）
+### 14.3 分辨率与全屏模式（`1247-1272`）
 
 `GetDesc` 填 `windowW/windowH`；`GetFullscreenState` 为真 → `NP_PM_EXCLUSIVE`；
 否则 `QI IDXGISwapChain1` → `GetHwnd` → 检查 `WS_POPUP && !WS_EX_TOPMOST && WS_VISIBLE`
 → `NP_PM_BORDERLESS`。
 
-### 14.4 帧时间采集与「帧内重复 Present 合并」（`1229-1292`）★
+### 14.4 帧时间采集与「帧内重复 Present 合并」（`1274-1337`）★
 
 这是本轮最关键的一段。
 
-1. **只统计真正呈现的调用**（`1234`）：`realPresent = (flags & DXGI_PRESENT_TEST) == 0`。
+1. **只统计真正呈现的调用**（`1279`）：`realPresent = (flags & DXGI_PRESENT_TEST) == 0`。
    `DXGI_PRESENT_TEST` 只是问一句「能不能呈现」，不产生新帧；算进去会让帧数虚高、
    帧时间忽上忽下 —— 正是「游戏稳稳 60、我们却在 60~70 之间波动」的一个来源。
 2. **原始间隔**：`fmRaw = now - gPrevPresentQpc`，然后 `gPrevPresentQpc = now` **无条件推进**。
-   `fmRaw` 落在 `(0.02, 1000)` 才喂给 `gRawStats`（`1256-1262`）。
-3. **基准 = 长窗口均值 `gRawStats.meanMs(240)`**（`1264-1272`）：
+   `fmRaw` 落在 `(0.02, 1000)` 才喂给 `gRawStats`（`1301-1307`）。
+3. **基准 = 长窗口均值 `gRawStats.meanMs(240)`**（`1309-1317`）：
    - **不能用 `fpsAvg`**：那是从**合并后**序列算出来的 →
      合并 → 间隔被抬高 → `fpsAvg` 变小 → 阈值变大 → 合并更多 = **正反馈**。
      上一版就是这么翻车的（用户实测「帧时间」本身变得忽高忽低）。
@@ -614,17 +614,17 @@ TS_AI_START    48   TS_AI_END      49
      阈值在 9.99/5.04 之间跳 —— 数值模拟实测到过，表现就是「该合并的时而不合并」。
      均值在双峰上恒定 16.65，所以基准稳定（`np_stats.h:168-187`）。
    - 阈值 = `meanMs * 0.6`，**夹在 [2.0, 30.0]**：下限别把 120fps 的帧吞了，
-     上限真卡顿时别乱合并（`1269-1271`）。
-4. **判定用 `fmRaw`，记账用 `fm`**（`1273-1278`）：`fm = now - gLastPresentQpc`
+     上限真卡顿时别乱合并（`1315-1316`）。
+4. **判定用 `fmRaw`，记账用 `fm`**（`1318-1321`）：`fm = now - gLastPresentQpc`
    是「距上一次**记账**」的间隔，被合并时它自然覆盖整个帧。
    `fmRaw < mergeThresh` → `gAbsorbThisPresent = true`，`++gMergedCount`。
-5. **只有未被合并的间隔才进统计**（`1282-1291`）：写 `gTel->frameMs`、`gStats.push`、
+5. **只有未被合并的间隔才进统计**（`1327-1336`）：写 `gTel->frameMs`、`gStats.push`、
    `++frameTotal`、写 `frames[]/cpuFrames[]/gpuFrames[]` 环形缓冲。
-6. **超过 1 秒的间隔不是「一帧」**（`1279-1282`）：是切出去/加载/挂起留下的空档。
+6. **超过 1 秒的间隔不是「一帧」**（`1324-1327`）：是切出去/加载/挂起留下的空档。
    塞进统计会把 1% Low / 0.1% Low 直接拖到个位数 —— 用户看到「稳定 60fps 却显示 1% Low = 10」
    就是这么来的。
 
-**为什么要合并（实测证据，`1238-1255`）**：真实 Present 之间的**最小**间隔只有 2.17ms，
+**为什么要合并（实测证据，`1283-1300`）**：真实 Present 之间的**最小**间隔只有 2.17ms，
 而帧周期是 16.7ms —— 说明游戏在**一帧内调用了多次真实 Present**。
 若每次都记账，就会把一个 16.7ms 的帧劈成「~5ms 的假快帧 + ~25ms 的假慢帧」，
 于是 24% 的帧落进 20~30ms 区间、却在 30ms 处被硬生生切断（`over30≈0%`）。
@@ -638,14 +638,14 @@ TS_AI_START    48   TS_AI_END      49
 | RE8 干净 16.6 | 16.6 | 9.96 | 16.6 > 9.96 → 不动 ✓ |
 | 60fps 轻微抖动 14~20 | ~16.6 | 9.96 | 全部不动 ✓ |
 
-> 数值模拟抓到过的反例（`327-334`）：用合并口径的间隔去喂原始序列，
+> 数值模拟抓到过的反例（`364-371`）：用合并口径的间隔去喂原始序列，
 > 会让「形态 A 只吸收了 80 次而非约 200 次，合并后均值 20.81 而非 33.3」。
 > 这就是 `gPrevPresentQpc` 必须与 `gLastPresentQpc` 分开的原因。
 
-7. **`gLastPresentQpc` 只在真实且未被合并时推进**（`1403-1405`），
+7. **`gLastPresentQpc` 只在真实且未被合并时推进**（`1448-1450`），
    否则下一帧的间隔会从这个中间时刻算起，又会得到一段偏短的假帧时间。
 
-### 14.5 CPU 两段（sim / submit，`1293-1332`）
+### 14.5 CPU 两段（sim / submit，`1338-1377`）
 
 ```
 模拟阶段 = 上一帧 Present 返回 → 本帧渲染线程第一次提交   （gSimEndQpc - gPresentRetQpc）
@@ -782,10 +782,10 @@ D3D 已加载但 Present 未挂上 →「看 NextPerfHook.log」；其余 →「
 
 ### 17.2 涉及代码
 
-- 计算点：`np_hook.cpp:1641-1681`（**在 `CallOriginal()` 返回之后**）
-- 前置：`np_hook.cpp:1633-1639`（量 `tPresent0` / `tPresent1` / `gLastInPresentMs`）
-- 为什么不在 Present 之前算：`np_hook.cpp:1333-1340`（长注释）
-- 公式出处：`np_hook.cpp:1312-1328`
+- 计算点：`np_hook.cpp:1686-1726`（**在 `CallOriginal()` 返回之后**）
+- 前置：`np_hook.cpp:1678-1684`（量 `tPresent0` / `tPresent1` / `gLastInPresentMs`）
+- 为什么不在 Present 之前算：`np_hook.cpp:1378-1385`（长注释）
+- 公式出处：`np_hook.cpp:1357-1373`
 
 ### 17.3 公式
 
@@ -801,7 +801,7 @@ CPUTime  = CPUBusy + CPUWait = 帧周期                  (tPresent1 − gPresen
 → `msCPUBusy = 100'000 ticks = 10ms`；`timeInPresent = 200'000` → `msCPUWait = 20ms`；
 `msCPUTime = 30ms = 帧周期`。
 
-**为什么要放在 Present 返回之后**（`1333-1339`）：Busy 需要「本帧 Present 开始」，
+**为什么要放在 Present 返回之后**（`1378-1384`）：Busy 需要「本帧 Present 开始」，
 Wait 需要「本帧 Present 返回」—— 在 Present 调用之前 `tPresent1` 还不存在。
 之前在这里求和，Wait 用的是**上一帧**的值（而且赋值顺序还写在求和之后），
 结果面板上 `CPU 帧时间 ≠ Busy + Wait`（实测 0.37 vs 0.24+5.95=6.19）。
@@ -819,7 +819,7 @@ Wait  = tPresent1 − tPresent0
 三个 EMA（alpha=0.10）分别平滑 `cpuBusyAvg/cpuWaitAvg/cpuFrameMsAvg`；
 每 10 秒打一条 `cpu split avg` 日志用于核对「帧时间 = Busy + Wait」。
 
-**原来的三条分支都不对**（`1322-1328`）：用「本帧开始 − 上帧**开始**」= 帧周期，没减掉 Present 内的等待；
+**原来的三条分支都不对**（`1367-1373`）：用「本帧开始 − 上帧**开始**」= 帧周期，没减掉 Present 内的等待；
 兜底直接 `cpuFrameMs = frameMs` —— 那正是 PresentMon issue #222
 「CPUBusy always shows up as equal to FrameTime」的现象。
 sim/submit 仍单独记录供对照，但不再拿 `simMs` 当 CPU 帧时间（那只是「模拟阶段」，
@@ -835,9 +835,9 @@ sim/submit 仍单独记录供对照，但不再拿 `simMs` 当 CPU 帧时间（�
 ### 18.1 三层结构
 
 ```
-PresentCommon (np_hook.cpp:1497-1584)   决定画不画 / 取哪张后台缓冲 / 算位置
-   └─ RenderPanel (np_hook.cpp:866-892) 决定尺寸 → npb::PanelBitmap::Render 画成 BGRA DIB
-        └─ DrawCb (np_hook.cpp:858-861) → np::PanelRenderer::Render（真正的 D2D 绘制）
+PresentCommon (np_hook.cpp:1542-1629)   决定画不画 / 取哪张后台缓冲 / 算位置
+   └─ RenderPanel (np_hook.cpp:903-929) 决定尺寸 → npb::PanelBitmap::Render 画成 BGRA DIB
+        └─ DrawCb (np_hook.cpp:895-898) → np::PanelRenderer::Render（真正的 D2D 绘制）
    └─ Overlay11::Draw (np_draw.cpp:155-252)   D3D11：Map/UpdateSubresource 贴图 + Draw(3)
    └─ Overlay12::Record (np_draw.cpp:400-608) D3D12：上传堆 + CopyTextureRegion + 全屏三角形
 ```
@@ -846,7 +846,7 @@ PresentCommon (np_hook.cpp:1497-1584)   决定画不画 / 取哪张后台缓冲 
 同一套位图能给 D3D11、D3D12、桌面分层窗口（`UpdateLayeredWindow`）三种目标复用，
 代码量小、行为一致，也不会和游戏自己的状态打架。
 
-### 18.2 是否绘制（`np_hook.cpp:1486-1524`）
+### 18.2 是否绘制（`np_hook.cpp:1531-1569`）
 
 ```
 paused      = cfg.pauseHook != 0            // 主程序点了「停止监视」
@@ -856,21 +856,21 @@ wantOverlay = !paused && cfg.overlayMode != 2 && (gDev11 || gDev12)
 ```
 
 - `overlayMode == 2` 是「强制桌面叠加」：游戏内面板不画。
-- **暂停时既不更新遥测也不画面板**（`1486-1495`、`1502-1506`）：
+- **暂停时既不更新遥测也不画面板**（`1531-1540`、`1547-1551`）：
   原来停止监视只关掉桌面 HUD，游戏内 HUD 照旧在画、数据照旧在读，用户反馈「点了退出监视，
   画面里却还挂着一个面板在更新，很怪」。
-- 刷新率限制：`cfg.updateHz`（默认 20），未到间隔就复用上一张位图（`1516-1523`）。
+- 刷新率限制：`cfg.updateHz`（默认 20），未到间隔就复用上一张位图（`1561-1568`）。
 - **绝不在中间 return**：后台缓冲不属于我们接入的设备时只置 `stateOk = false`
-  （`1508-1514`），而不是 `return CallOriginal()`。
+  （`1553-1559`），而不是 `return CallOriginal()`。
 
-### 18.3 取后台缓冲（`1524-1582`）
+### 18.3 取后台缓冲（`1569-1629`）
 
-- **必须问 `GetCurrentBackBufferIndex()`**，不能固定 `GetBuffer(0)`（`1528-1532`）：
+- **必须问 `GetCurrentBackBufferIndex()`**，不能固定 `GetBuffer(0)`（`1573-1577`）：
   flip 模型（`FLIP_DISCARD` / `FLIP_SEQUENTIAL`）下 `GetBuffer(0)` 不一定是当前正在显示的那张，
   否则面板只会画进某一张、交替闪烁甚至完全看不见。只有老式 blt 模型（`DISCARD`）才固定是 0。
 - **光栅倍率以 1080p 为基准随分辨率放大**：`npb::SetRasterScale(clamp(Height/1080, 1.0, 2.5))`，
-  面板在各分辨率下占屏比例一致；变化超过 0.05 才重画（`1548-1549`、`1570-1571`）。
-- 位置：`px = 后台缓冲宽 - 面板宽 - offsetX * scale`（右上角对齐，`1550`、`1572`）。
+  面板在各分辨率下占屏比例一致；变化超过 0.05 才重画（`1593-1594`、`1615-1616`）。
+- 位置：`px = 后台缓冲宽 - 面板宽 - offsetX * scale`（右上角对齐，`1595`、`1617`）。
 
 ### 18.4 D3D11 叠加 `Overlay11`（`np_draw.cpp:98-252`）
 
@@ -892,7 +892,7 @@ wantOverlay = !paused && cfg.overlayMode != 2 && (gDev11 || gDev12)
 
 - `Init`：根签名（1 个 SRV 描述符表 + 1 个静态采样器）、SRV 堆（1 个，`SHADER_VISIBLE`）、
   RTV 堆（**8 个描述符**）、fence。PSO **不在 Init 建**，因为依赖后台缓冲格式，见 `EnsurePso`。
-- **`Retire` / `OnFrameCompleted`：fence 延迟回收**（`376-398`）：
+- **`Retire` / `OnFrameCompleted`：fence 延迟回收**（`379-398`）：
   D3D12 不会因为我们提交过命令列表就给资源加引用 —— 立刻 `Release` 一个
   「已录制进命令列表、但 GPU 还没执行完」的资源，就是释放正在使用的显存。
   队列上限 16 项，满了立刻放（宁可立刻放也别无限涨）；上传缓冲那条路径在满时
@@ -921,29 +921,29 @@ wantOverlay = !paused && cfg.overlayMode != 2 && (gDev11 || gDev12)
 - `Release` 里**必须重置 `psoFormat_ = UNKNOWN`**（`368-373`）：不重置的话，
   若本对象在同一进程里被重新 `Init`，`EnsurePso` 会因为 `psoFormat_` 恰好相等而认为旧 PSO 还能用
   （其实已经 `Release` 了）。同时这里也补上了原来漏掉的 `vsBlob_`/`psBlob_`。
-- **`Overlay12::Record` 必须由调用方用 `BeginList`/`EndList` 包起来**（`np_hook.cpp:1573-1578`），
+- **`Overlay12::Record` 必须由调用方用 `BeginList`/`EndList` 包起来**（`np_hook.cpp:1618-1624`），
   屏障与绘制录进的是**我们自己的**命令列表，再 `EndList(gQueue12)` 提到游戏队列。
 
 ### 18.6 抑制自己的 draw 计数
 
-`gNpCountingOverlayDraws`（定义 `np_hook.cpp:911`，声明使用 `np_draw.cpp:15`）：
+`gNpCountingOverlayDraws`（定义 `np_hook.cpp:948`，声明使用 `np_draw.cpp:15`）：
 - 画自己的全屏三角形时置 `true`（`np_draw.cpp:237-239`、`593-595`），
-  `NpDrawInst`/`NpDrawIdx`（`np_hook.cpp:2343-2353`）直接转发、不计数。
-- **必须是 `thread_local`**（`908-910`）：叠加是自己人画的，只应该抑制**我们自己这一路**的计数。
+  `NpDrawInst`/`NpDrawIdx`（`np_hook.cpp:2388-2398`）直接转发、不计数。
+- **必须是 `thread_local`**（`944-947`）：叠加是自己人画的，只应该抑制**我们自己这一路**的计数。
   原来是普通全局 bool —— 叠加在 Present 线程绘制时，游戏在别的提交线程恰好也 draw 一笔，
   那笔就会被误抑制。
-- 定义必须放在匿名命名空间**之外**（`900-907`）：`np_draw.cpp` 用的是 `extern "C"` 声明，
+- 定义必须放在匿名命名空间**之外**（`937-943`）：`np_draw.cpp` 用的是 `extern "C"` 声明，
   匿名命名空间里的名字没有外部链接，链接会直接失败。
 
 ### 18.7 叠加诊断
 
 | 日志 | 行 | 用途 |
 | --- | --- | --- |
-| `panel logical size WxH ...` | 875-886 | 面板逻辑尺寸一变就记一条。「HUD 宽度随数值一直变化」靠它客观判定；理想情况整局只出现一次 |
-| `overlay NOT drawn: want=... panel=... bmp=...` | 1586-1597 | 每秒最多一条。「注入成功、数据也对，但游戏里看不到面板」这类问题 |
-| `overlay drawn: WxH scale=` | 1598-1604 | 只记一次 |
-| `overlay 5s: drawn / skipped / heapSwaps` | 1606-1629 | **区分闪烁的两种成因**：A) 我们没画上去（`drawnOk=false`）→ 画面交替有/无；B) 每帧都画了但画到的不是最终呈现的那张缓冲 → 面板内容在几张缓冲之间跳。`heapSwaps` 暴涨说明游戏在频繁重建交换链 |
-| `D3D12 device lost: hr=...` / `GetDeviceRemovedReason hr=...` | 1460-1470 | 每 128 帧查一次；健康的设备返回 `S_OK`，拿到别的失败码说明设备指针本身有问题，也要记下来 |
+| `panel logical size WxH ...` | 916-921 | 面板逻辑尺寸一变就记一条。「HUD 宽度随数值一直变化」靠它客观判定；理想情况整局只出现一次 |
+| `overlay NOT drawn: want=... panel=... bmp=...` | 1634-1642 | 每秒最多一条。「注入成功、数据也对，但游戏里看不到面板」这类问题 |
+| `overlay drawn: WxH scale=` | 1643-1649 | 只记一次 |
+| `overlay 5s: drawn / skipped / heapSwaps` | 1651-1674 | **区分闪烁的两种成因**：A) 我们没画上去（`drawnOk=false`）→ 画面交替有/无；B) 每帧都画了但画到的不是最终呈现的那张缓冲 → 面板内容在几张缓冲之间跳。`heapSwaps` 暴涨说明游戏在频繁重建交换链 |
+| `D3D12 device lost: hr=...` / `GetDeviceRemovedReason hr=...` | 1505-1515 | 每 128 帧查一次；健康的设备返回 `S_OK`，拿到别的失败码说明设备指针本身有问题，也要记下来 |
 
 ---
 
@@ -957,7 +957,7 @@ wantOverlay = !paused && cfg.overlayMode != 2 && (gDev11 || gDev12)
 ### 19.2 涉及代码
 
 - `src/hook/np_reflex.h` 全文（header-only）
-- 使用点：`np_hook.cpp:1342-1402`
+- 使用点：`np_hook.cpp:1387-1447`
 - 结构体：`NVFrameReport`（`np_reflex.h:24-42`，**与 nvapi.h 逐字段对齐，不能改顺序/宽度**）、
   `NVLatencyParams`（`44-48`）、`NVGetSleepStatusParams`（`53-58`）
 - 接口 ID：`NvAPI_D3D_GetLatency = 0x1A587F9C`（来自 Intel PresentMon 的 `nvapi_interface_table.h`）、
@@ -974,12 +974,12 @@ wantOverlay = !paused && cfg.overlayMode != 2 && (gDev11 || gDev12)
    明显不合理的（结束早于开始）也不要。
 3. `SleepStatus(dev, &on)`（`111-118`）：**驱动直证**低延迟是否开启。
    注释说明了为什么比推断可靠：「用 CPU Wait 推断是『等待被移出 Present』的旁证，这个是驱动直说」。
-4. 钩子侧（`1342-1402`）：
-   - **设备只取一次**（`1348-1361`）：先试 `GetDevice(ID3D12Device)` 再试 `ID3D11Device`，
+4. 钩子侧（`1387-1447`）：
+   - **设备只取一次**（`1393-1406`）：先试 `GetDevice(ID3D12Device)` 再试 `ID3D11Device`，
      **AddRef 后长期持有，不释放**；`gReflexTried` 保证只试一次；并把 `init/ok` 打进日志。
-   - **低延迟状态 1 秒查一次**（`1362-1380`）：置 `NP_HOOK_REFLEX_KNOWN`；
+   - **低延迟状态 1 秒查一次**（`1407-1425`）：置 `NP_HOOK_REFLEX_KNOWN`；
      开启才置 `NP_HOOK_REFLEX`；每 10 秒打一条 `reflex sleep status: lowLatency=%d (authoritative)`。
-   - **每帧 Poll**（`1381-1401`）：`sim`/`sub` 都夹在 `(0, 1000)` 才写 `simMs`/`submitMs`；
+   - **每帧 Poll**（`1426-1446`）：`sim`/`sub` 都夹在 `(0, 1000)` 才写 `simMs`/`submitMs`；
      读到就置 `NP_HOOK_REFLEX`；每 10 秒打一条 `reflex frame: id=... sim=... submit=... gpuActiveUs=...`。
    - 只在 `realPresent` 时做。
 
@@ -1018,30 +1018,30 @@ wantOverlay = !paused && cfg.overlayMode != 2 && (gDev11 || gDev12)
 
 | 函数 | 行 | 触发条件 |
 | --- | --- | --- |
-| `RestoreAllHooks()` | 2397-2453 | 被下面两条路径调用（**幂等**） |
-| `SelfUnloadNow()` | 2462-2501 | `gCfg->quit` 或 `gCfg->detachPid == 自己的 pid` |
-| `NpHookDetach()` | 2663-2684 | `DllMain` 的 `DLL_PROCESS_DETACH` |
-| `Worker` 里的 `quit` 判定 | 2602 | 主程序退出 |
-| `Worker` 里的 `detachPid` 判定 | 2603-2611 | 主程序要求卸载 |
-| 三个工厂跳板里的 `!gUnloading` | 2133 / 2144 / 2153 | 防止卸载窗口期重新写回 vtable |
+| `RestoreAllHooks()` | 2442-2498 | 被下面两条路径调用（**幂等**） |
+| `SelfUnloadNow()` | 2522-2561 | `gCfg->quit` 或 `gCfg->detachPid == 自己的 pid` |
+| `NpHookDetach()` | 2723-2744 | `DllMain` 的 `DLL_PROCESS_DETACH` |
+| `Worker` 里的 `quit` 判定 | 2662 | 主程序退出 |
+| `Worker` 里的 `detachPid` 判定 | 2663-2671 | 主程序要求卸载 |
+| 三个工厂跳板里的 `!gUnloading` | 2178 / 2189 / 2198 | 防止卸载窗口期重新写回 vtable |
 
 ### 21.3 `RestoreAllHooks()` 做的事（顺序有意义）
 
-1. **先记一条日志**（`2398-2402`）：这样从日志就能确认**两条卸载路径**
+1. **先记一条日志**（`2443-2447`）：这样从日志就能确认**两条卸载路径**
    （`SelfUnloadNow` / `DLL_PROCESS_DETACH`）到底有没有真的还原。
    之前没有这条日志，所以无法判断还原是否发生。
    日志里带 `swapVt / factory / factory2 / queue / cmdlist / seh` 六个计数。
-2. **注销 VEH 处理器**（`2404-2415`）——**这是「重复注入 100% 闪退」的真正根因**：
+2. **注销 VEH 处理器**（`2449-2460`）——**这是「重复注入 100% 闪退」的真正根因**：
    注册了却从不注销，DLL 卸载后进程的 VEH 链表里就留下一个指向**已卸载内存**的处理器；
    下次注入再注册一个，链表变成 `[野指针, 新指针]`；而探测路径**本来就会触发异常**
    （SEH 机制正是为此存在），于是 Windows 先调用那个野指针 → 跳进已卸载内存 → `0xC0000005`。
    实测：注入过一次的进程再注入必崩，全新进程首次注入正常 —— 完全吻合。
    同时也把 `gSehReady` 复位，允许后续重新注册。
-3. 交换链：**遍历整张小表**逐条还原 `Present` / `Present1`（`2416-2422`），然后 `gSwapVtCount = 0`。
-4. 工厂 1/2 的 `CreateSwapChain` / `CreateSwapChainForHwnd` / `CreateSwapChainForComposition`（`2424-2433`）。
-5. 队列 `ExecuteCommandLists`（`2434-2435`）。
-6. 命令列表六项（`2436-2448`）。
-7. 把所有 vtable 指针全局置 `nullptr`（`2449-2452`）。
+3. 交换链：**遍历整张小表**逐条还原 `Present` / `Present1`（`2461-2467`），然后 `gSwapVtCount = 0`。
+4. 工厂 1/2 的 `CreateSwapChain` / `CreateSwapChainForHwnd` / `CreateSwapChainForComposition`（`2469-2478`）。
+5. 队列 `ExecuteCommandLists`（`2479-2480`）。
+6. 命令列表六项（`2481-2493`）。
+7. 把所有 vtable 指针全局置 `nullptr`（`2494-2497`）。
 
 ### 21.4 `SelfUnloadNow()` 的顺序（**不能乱**）
 
@@ -1056,26 +1056,26 @@ Sleep(250)                // 3. 在途调用排空窗口
 FreeLibraryAndExitThread(gSelf, 0)   // 6. 从宿主进程卸载自己并结束本线程
 ```
 
-源码注释（`2382-2385`）：顺序不能乱 —— 先让跳板直通（`gUnloading`），再还原 vtable，
+源码注释（`2427-2430`）：顺序不能乱 —— 先让跳板直通（`gUnloading`），再还原 vtable，
 **短暂等待在途调用排空后才允许 `FreeLibrary`**。
 
 ### 21.5 `detachPid` 机制（主程序主动要求卸载）
 
-- 字段定义：`np_common.h:193-199`。
-- 判定：`np_hook.cpp:2603-2611`，逐字条件
+- 字段定义：`np_common.h:193-200`。
+- 判定：`np_hook.cpp:2663-2671`，逐字条件
   `gCfg && gCfg->magic == NP_MAGIC && gCfg->detachPid != 0 && gCfg->detachPid == GetCurrentProcessId()`
   → `Log("detachPid matched -> SelfUnloadNow (asked by host)")` → `SelfUnloadNow()`。
-- **为什么用共享内存字段 + 轮询，而不是 `CreateRemoteThread` 调 `NpHookDetach`**（`np_common.h:196-198`）：
+- **为什么用共享内存字段 + 轮询，而不是 `CreateRemoteThread` 调 `NpHookDetach`**（`np_common.h:196-199`）：
   后者需要解析远端导出地址（ASLR 下要自己算偏移），而且跨位数（32 位游戏）还得另做一套。
   钩子本来每帧就在读 `NPConfig`，用这个字段既简单又天然支持跨位数。
-- **为什么判定放在 worker 循环而不是 Present 里**（`2603-2606`）：
+- **为什么判定放在 worker 循环而不是 Present 里**（`2663-2666`）：
   `SelfUnloadNow` 的定义在 `Worker` 下面，在它之前用需要前置声明，
   而跨作用域的前置声明会变成 `ambiguous`。worker 每 200ms 轮询一次，
   这个延迟对「卸载钩子」完全够用。
 - **触发后必须自己 `SelfUnloadNow()`**：因为 `detachPid` 只是「请求」，
   真正的还原动作只在 `RestoreAllHooks` 里。
 
-### 21.6 `NpHookDetach()` 为什么也必须还原（`2665-2675`）
+### 21.6 `NpHookDetach()` 为什么也必须还原（`2725-2735`）
 
 这里原来是**没有**还原的 —— 还原只写在 `SelfUnloadNow()` 里，而 `DllMain` 的
 `DLL_PROCESS_DETACH` 分支完全不碰补丁。于是只要卸载没走「优雅自卸载」那条路，
@@ -1086,18 +1086,18 @@ FreeLibraryAndExitThread(gSelf, 0)   // 6. 从宿主进程卸载自己并结束�
 `RestoreAllHooks` 是幂等的：`SelfUnloadNow` 已经还过一遍也没关系。
 
 然后是 `gReady = false`（停掉 worker 循环）、等 worker 线程结束
-（**自卸载路径下 detach 发生在 worker 线程自己身上，不能等自己**，`2676-2682`）、
+（**自卸载路径下 detach 发生在 worker 线程自己身上，不能等自己**，`2736-2742`）、
 `DeleteCriticalSection(&gCs)`。
 
 ### 21.7 卸载后仍然残留的东西（明确记录）
 
 | 残留物 | 为什么留着 | 影响 |
 | --- | --- | --- |
-| 窗口类 `NextPerfProbeWnd` | 注册在**宿主 exe 模块**上（`1860-1866`），exe 永不卸载，无法也不该注销 | 只是一个类名，用宿主模块句柄，不会变成野类 |
+| 窗口类 `NextPerfProbeWnd` | 注册在**宿主 exe 模块**上（`1916-1924`），exe 永不卸载，无法也不该注销 | 只是一个类名，用宿主模块句柄，不会变成野类 |
 | `nvapi64.dll`（`ReflexReader::dll_`） | 只在实现文件里 `LoadLibrary`，没有对应的 `FreeLibrary`（`np_reflex.h:65-69`） | 进程退出时自然回收；**未确认**是否有意为之 |
-| `gReflexDev`（D3D 设备） | 注释明确写「AddRef 后长期持有，**不释放**」（`np_hook.cpp:341`） | `SelfUnloadNow` 的释放清单里确实没有它 |
-| `gCs` | `InitializeCriticalSection` / `DeleteCriticalSection` 成对，但**全文件没有任何 `EnterCriticalSection`** | 当前是死代码（`gCs` 只在 `228/2659/2683` 出现） |
-| `gCpuStartQpc` | `NpECL` 里写（`2199`），**没有任何读点** | 死变量，原为「本帧 CPU 起点」 |
+| `gReflexDev`（D3D 设备） | 注释明确写「AddRef 后长期持有，**不释放**」（`np_hook.cpp:378`） | `SelfUnloadNow` 的释放清单里确实没有它 |
+| `gCs` | `InitializeCriticalSection` / `DeleteCriticalSection` 成对，但**全文件没有任何 `EnterCriticalSection`** | 当前是死代码（`gCs` 只在 `265/2719/2743` 出现） |
+| `gCpuStartQpc` | `NpECL` 里写（`2244`），**没有任何读点** | 死变量，原为「本帧 CPU 起点」 |
 
 > 若将来要把这些都清干净，注意 `gReflexDev` 一旦 `Release` 就必须同时让
 > `gReflexTried`/`ReflexReader` 状态可重置，否则「重新 Init」路径会拿到悬空设备指针。
@@ -1112,37 +1112,37 @@ FreeLibraryAndExitThread(gSelf, 0)   // 6. 从宿主进程卸载自己并结束�
 
 | # | 坑 | 位置 |
 | --- | --- | --- |
-| 1 | **VEH 注册了不注销 → 重复注入 100% 闪退**。链表里留下指向已卸载内存的处理器；崩溃地址 = 旧 DLL 基址 + 固定偏移（按地址反查会得到「不属于任何模块」） | `198-208`、`2404-2415` |
+| 1 | **VEH 注册了不注销 → 重复注入 100% 闪退**。链表里留下指向已卸载内存的处理器；崩溃地址 = 旧 DLL 基址 + 固定偏移（按地址反查会得到「不属于任何模块」） | `235-245`、`2449-2460` |
 | 2 | **VEH 拿到的是所有异常**，不筛就把探测整个 `longjmp` 掉（`DBG_PRINTEXCEPTION_C` 在 D3D 初始化时很常见）；C++ 异常也不能吞 | `146-168` |
 | 3 | **`jmp_buf` 必须每线程一份**，否则一边出错会 `longjmp` 到另一边的栈上 | `136-142` |
-| 4 | **D3D12 的实现在 `D3D12Core.dll`**，不在 `d3d12.dll`。按模块名做健全性检查 → 光追/DLSS 钩子一个都装不上 | `430-440`、`1718-1725` |
-| 5 | **本 DLL 静态导入 dxgi/d3d11/d3d12**，所以 `GetModuleHandleW(L"d3d12.dll") != nullptr` 永远为真 → 所有「让宿主工厂钩子先跑」的保护失效。必须读自己的 PE 导入表 | `442-448`、`449-478` |
-| 6 | **不能拿 `vulkan-1.dll` 当「这是 Vulkan 游戏」的证据**：D3D12 游戏也加载它，上一版因此把 D3D12 游戏判成 Vulkan → 探测永久禁用 | `491-496` |
-| 7 | **上一次卸载没还干净 → 「原函数」其实是上一次的钩子 → 调用自己 → 无限递归 → 栈溢出**（实测 `0xC0000005`，地址 = DLL 基址 + `0xA040`） | `1913-1926`、`1952-1958`、`2665-2675` |
-| 8 | 探测用的窗口类**必须注册在宿主 exe 模块**上；绑 `gSelf` 会留下指向已卸载内存的野类，并且**永久留在游戏进程里** | `1843-1859` |
-| 9 | **绝不在 Vulkan 进程里创建 D3D 设备**（实测某款 Vulkan 游戏：注入成功，一秒后闪退且无任何报错）。探测次数因此要分级限制 | `299-302`、`2579-2633` |
+| 4 | **D3D12 的实现在 `D3D12Core.dll`**，不在 `d3d12.dll`。按模块名做健全性检查 → 光追/DLSS 钩子一个都装不上 | `472-477`、`1763-1770` |
+| 5 | **本 DLL 静态导入 dxgi/d3d11/d3d12**，所以 `GetModuleHandleW(L"d3d12.dll") != nullptr` 永远为真 → 所有「让宿主工厂钩子先跑」的保护失效。必须读自己的 PE 导入表 | `479-485`、`486-515` |
+| 6 | **不能拿 `vulkan-1.dll` 当「这是 Vulkan 游戏」的证据**：D3D12 游戏也加载它，上一版因此把 D3D12 游戏判成 Vulkan → 探测永久禁用 | `528-533` |
+| 7 | **上一次卸载没还干净 → 「原函数」其实是上一次的钩子 → 调用自己 → 无限递归 → 栈溢出**（实测 `0xC0000005`，地址 = DLL 基址 + `0xA040`） | `1958-1967`、`1997-2003`、`2725-2735` |
+| 8 | 探测用的窗口类**必须注册在宿主 exe 模块**上；绑 `gSelf` 会留下指向已卸载内存的野类，并且**永久留在游戏进程里** | `1888-1904` |
+| 9 | **绝不在 Vulkan 进程里创建 D3D 设备**（实测某款 Vulkan 游戏：注入成功，一秒后闪退且无任何报错）。探测次数因此要分级限制 | `336-339`、`2639-2693` |
 
 ### 22.2 Present 主流程
 
 | # | 坑 | 位置 |
 | --- | --- | --- |
-| 10 | ★★ **绝不能在 `PresentCommon` 中间提前 `return`**：尾部还有一整套收尾（`gInPresent` / `gFrameStarted` / `gLastPresentQpc` / `gLastInPresentMs`），跳过会让 `gInPresent` 永远为 `true`，之后每帧都直通原函数，**叠加与 GPU 时间戳永久失效**。这个坑踩过**两次**（暂停分支、后台缓冲设备不匹配分支） | `1490-1495`、`1508-1514` |
-| 11 | **`gUnloading` 必须放在 `gTel` 解引用之前**，否则自卸载解除映射后渲染线程晚一步进来就是访问违例 | `1152-1157` |
-| 12 | **CPU 帧时间必须在 Present 返回之后算**：Busy 要用「本帧 Present 开始」、Wait 要用「本帧 Present 返回」，在 Present 之前求和会用到**上一帧**的 Wait（实测面板 `CPU 帧时间 ≠ Busy + Wait`：0.37 vs 0.24+5.95=6.19） | `1333-1340`、`1641-1651` |
-| 13 | **`DXGI_PRESENT_TEST` 不是帧**：不过滤会让帧数虚高、帧时间忽上忽下，窗口计数正好是真实帧率两倍（用户实测显示 120，实际 60） | `1229-1234`、`939-942` |
-| 14 | **超过 1 秒的间隔不是「一帧」**：塞进统计会把 1% Low / 0.1% Low 拖到个位数（「稳定 60fps 却显示 1% Low = 10」） | `1279-1282`、`1657-1658` |
-| 15 | **模拟阶段结束只认渲染线程、且要排除 `gInPresent`**：后台流式线程随时都在提交；我们自己的叠加/时间戳命令列表也是从渲染线程提交的 | `2202-2209` |
-| 16 | `gFrameStarted` 必须**在 `EndList` 之前**用 `compare_exchange` 抢（`EndList` 会再进一次 `NpECL`），否则两个线程会同时 `Reset` 同一条命令列表 | `2191-2201` |
-| 17 | **`GetBuffer(0)` 在 flip 模型下不一定是当前显示的那张**，必须问 `GetCurrentBackBufferIndex()`，否则面板交替闪烁甚至看不见 | `1528-1532` |
+| 10 | ★★ **绝不能在 `PresentCommon` 中间提前 `return`**：尾部还有一整套收尾（`gInPresent` / `gFrameStarted` / `gLastPresentQpc` / `gLastInPresentMs`），跳过会让 `gInPresent` 永远为 `true`，之后每帧都直通原函数，**叠加与 GPU 时间戳永久失效**。这个坑踩过**两次**（暂停分支、后台缓冲设备不匹配分支） | `1535-1540`、`1553-1559` |
+| 11 | **`gUnloading` 必须放在 `gTel` 解引用之前**，否则自卸载解除映射后渲染线程晚一步进来就是访问违例 | `1197-1202` |
+| 12 | **CPU 帧时间必须在 Present 返回之后算**：Busy 要用「本帧 Present 开始」、Wait 要用「本帧 Present 返回」，在 Present 之前求和会用到**上一帧**的 Wait（实测面板 `CPU 帧时间 ≠ Busy + Wait`：0.37 vs 0.24+5.95=6.19） | `1378-1385`、`1686-1697` |
+| 13 | **`DXGI_PRESENT_TEST` 不是帧**：不过滤会让帧数虚高、帧时间忽上忽下，窗口计数正好是真实帧率两倍（用户实测显示 120，实际 60） | `1274-1279`、`984-987` |
+| 14 | **超过 1 秒的间隔不是「一帧」**：塞进统计会把 1% Low / 0.1% Low 拖到个位数（「稳定 60fps 却显示 1% Low = 10」） | `1324-1327`、`1702-1703` |
+| 15 | **模拟阶段结束只认渲染线程、且要排除 `gInPresent`**：后台流式线程随时都在提交；我们自己的叠加/时间戳命令列表也是从渲染线程提交的 | `2247-2254` |
+| 16 | `gFrameStarted` 必须**在 `EndList` 之前**用 `compare_exchange` 抢（`EndList` 会再进一次 `NpECL`），否则两个线程会同时 `Reset` 同一条命令列表 | `2236-2246` |
+| 17 | **`GetBuffer(0)` 在 flip 模型下不一定是当前显示的那张**，必须问 `GetCurrentBackBufferIndex()`，否则面板交替闪烁甚至看不见 | `1573-1577` |
 
 ### 22.3 帧内重复 Present 的合并（本轮核心修复）
 
 | # | 坑 | 位置 |
 | --- | --- | --- |
-| 18 | ★★ **合并基准绝不能用 `fpsAvg`**：那是从**合并后**序列算出来的 → 合并抬高间隔 → `fpsAvg` 变小 → 阈值变大 → 合并更多 = **正反馈**（上一版就是这么翻车的，用户实测「帧时间」本身忽高忽低） | `1246-1249` |
-| 19 | ★★ **基准也不能用中位数**：双峰分布（8.4/24.9 各半）上中位数随样本奇偶振荡（16.65 / 8.4 / 24.9），阈值在 9.99/5.04 之间跳 → 「该合并的时而不合并」= 用户上次看到的帧时间忽高忽低。必须用**长窗口均值**（240 样本 ≈ 4 秒） | `1264-1266`、`np_stats.h:168-177` |
-| 20 | ★★ **原始间隔必须单独记 `gPrevPresentQpc`**：`now - gLastPresentQpc` 是**合并口径**的间隔，拿它喂原始序列等于让合并污染基准 → 中位数被抬高 → 阈值漂移 → 正反馈。数值模拟抓到过：形态 A 只吸收了 80 次而非约 200 次，合并后均值 20.81 而非 33.3 | `317-335`、`1256-1262` |
-| 21 | **纯中位数基准对「基准污染」极度敏感**：一旦没有独立原始序列，中位数会自己爬升（每次合并把对喂进去就被自己抬高），呈螺旋上升；均值有自限性 | `317-335` |
+| 18 | ★★ **合并基准绝不能用 `fpsAvg`**：那是从**合并后**序列算出来的 → 合并抬高间隔 → `fpsAvg` 变小 → 阈值变大 → 合并更多 = **正反馈**（上一版就是这么翻车的，用户实测「帧时间」本身忽高忽低） | `1291-1293` |
+| 19 | ★★ **基准也不能用中位数**：双峰分布（8.4/24.9 各半）上中位数随样本奇偶振荡（16.65 / 8.4 / 24.9），阈值在 9.99/5.04 之间跳 → 「该合并的时而不合并」= 用户上次看到的帧时间忽高忽低。必须用**长窗口均值**（240 样本 ≈ 4 秒） | `1309-1311`、`np_stats.h:168-177` |
+| 20 | ★★ **原始间隔必须单独记 `gPrevPresentQpc`**：`now - gLastPresentQpc` 是**合并口径**的间隔，拿它喂原始序列等于让合并污染基准 → 中位数被抬高 → 阈值漂移 → 正反馈。数值模拟抓到过：形态 A 只吸收了 80 次而非约 200 次，合并后均值 20.81 而非 33.3 | `364-371`、`1301-1307` |
+| 21 | **纯中位数基准对「基准污染」极度敏感**：一旦没有独立原始序列，中位数会自己爬升（每次合并都把合并后的间隔喂回去，于是被自己抬高），呈螺旋上升；均值有自限性 | `364-371` |
 
 ### 22.4 绘制与 D3D 资源
 
@@ -1151,60 +1151,60 @@ FreeLibraryAndExitThread(gSelf, 0)   // 6. 从宿主进程卸载自己并结束�
 | 22 | ★★ **绝不能长期引用后台缓冲**（`AddRef` / 缓存 RTV）：DXGI 要求 `ResizeBuffers` / 切独占全屏前**所有**后台缓冲引用必须释放，否则那次调用失败（`DXGI_ERROR_INVALID_CALL`），不少游戏不检查返回值直接闪退。用户实测：**不绘制叠加层不闪退，一绘制就闪退** | `np_draw.cpp:191-201`、`243-250` |
 | 23 | ★★ **描述符堆必须「换堆」而不是覆盖槽位**：GPU 是**执行时**才读描述符堆，而读它的是**游戏自己的命令列表** —— 「有没有在途命令列表」我们根本无法判断（`pending_` 只跟踪我们自己的上传缓冲）。用 `pendingN_ == 0` 做判据不够，会覆盖正在被读的描述符 = 偶发闪退 + 闪烁 | `np_draw.cpp:497-549` |
 | 24 | **RTV 槽位用尽 ⇒ 交换链被重建过多次**：旧槽引用着**已作废的旧后台缓冲**，既让游戏 `ResizeBuffers` 失败（闪退），也让我们画到旧缓冲上（全屏后换场景闪烁，闪一会就看不见了） | `np_draw.cpp:506-517`、`518-531` |
-| 25 | **交换链重建窗口期必须静默**：实测 `nvwgf2umx.dll+0x330124`（NVIDIA 用户态驱动里一个确定位置）会 `0xC0000005` 把游戏带走，崩溃只在重建那段窗口期发生 → `settle_ = 30` | `np_draw.cpp:542-548`、`1499-1501` |
+| 25 | **交换链重建窗口期必须静默**：实测 `nvwgf2umx.dll+0x330124`（NVIDIA 用户态驱动里一个确定位置）会 `0xC0000005` 把游戏带走，崩溃只在重建那段窗口期发生 → `settle_ = 30` | `np_draw.cpp:542-548`、`1543-1546` |
 | 26 | **D3D12 资源绝不能立刻 `Release`**：D3D12 不会因为我们提交过命令列表就给资源加引用 → 必须 fence 延迟回收（`Retire` / `OnFrameCompleted`） | `np_draw.cpp:376-385` |
 | 27 | **D3D11 默认 `CullMode = BACK`**，而全屏三角形正好是背面 → `Draw` 会「成功」返回但屏幕上什么都没有。必须显式建 `CULL_NONE` 光栅化状态并绑定 | `np_draw.cpp:130-139` |
 | 28 | **`texW_/texH_` 必须在纹理和 SRV 都建好之后才写**：先写尺寸再建 SRV，一旦 SRV 失败就永远不再重建，永久带着 NULL SRV 去 `PSSetShaderResources` | `np_draw.cpp:172-181` |
 | 29 | **`Overlay12::Release` 必须重置 `psoFormat_`**，否则同一进程内重新 `Init` 时 `EnsurePso` 会以为旧 PSO 还能用（其实已 `Release`） | `np_draw.cpp:368-373` |
-| 30 | **少了 `npb::GfxInit()` 就是「注入成功、数据也有，但游戏里看不到面板」** | `1128-1131` |
-| 31 | **面板纹理必须等 D2D 与 D3DCompile 都就绪**，而 D2D/DirectWrite 只能在**渲染线程**初始化（单线程 D2D 工厂不能跨线程用，多线程渲染的游戏会因此闪退） | `1121-1123` |
-| 32 | **渲染分辨率不能取「见过的最大的视口」**：会被 shadow atlas / 后处理的方目标骗到（16:10 屏幕显示 3072×3072 → 3840×2400）。必须要求长宽比与输出一致（`rel <= 1.05`） | `2355-2372` |
+| 30 | **少了 `npb::GfxInit()` 就是「注入成功、数据也有，但游戏里看不到面板」** | `1173-1176` |
+| 31 | **面板纹理必须等 D2D 与 D3DCompile 都就绪**，而 D2D/DirectWrite 只能在**渲染线程**初始化（单线程 D2D 工厂不能跨线程用，多线程渲染的游戏会因此闪退） | `1166-1168` |
+| 32 | **渲染分辨率不能取「见过的最大的视口」**：会被 shadow atlas / 后处理的方目标骗到（16:10 屏幕显示 3072×3072 → 3840×2400）。必须要求长宽比与输出一致（`rel <= 1.05`） | `2400-2417` |
 
 ### 22.5 并发与统计口径
 
 | # | 坑 | 位置 |
 | --- | --- | --- |
 | 33 | **`FrameStats` 的临时缓冲必须 `thread_local`**：原来是 `static float tmp[kCap]`（16KB 全线程共享），多线程 Present 并发进入会算出垃圾值，而且完全没有报错、看起来「只是数不对」 | `np_stats.h:45-55`、`78-80` |
-| 34 | **计数变量必须是 `atomic`**：命令列表钩子被多个提交线程同时调用，而 Present 线程同时在读并清零；普通变量的读-改-写既丢计数也是 UB | `352-357` |
-| 35 | **`gNpCountingOverlayDraws` 必须 `thread_local`**：普通全局 bool 会让「别的提交线程恰好也 draw 一笔」被误抑制 | `908-911` |
-| 36 | **`EnsureD3D12Hooks` 必须防并发重入**：两个线程同时通过检查会各建一套查询堆/fence/叠加资源，先建的句柄被覆盖，泄漏 + 状态错乱（`gTsFreq` 也跟着错） | `1976-1999` |
-| 37 | **槽位分配必须用 `fetch_add` 的返回值**，不能「先 load 判断、再 fetch_add」：两个提交线程会读到同一个 `n`，同时往同一个时间戳槽里写 | `2253-2257` |
-| 38 | **`setjmp` 返回值当条件用会「提交两次」**：`if (setjmp(...)==0) {...; gOrigX(); ...; return;} gOrigX();` —— 探针出异常时条件为假，掉到兜底再转发一次，同一次光追被提交两遍（画面错乱 + 设备 removed）。必须单独记 `faulted` 并**只转发一次** | `2237-2283`、`2296-2311` |
-| 39 | **RT/Tensor 占比的分母是帧周期不是 `gpuFrameMs`**：后者是个**上界**，会让光追占比严重低估（用户实测：开了光追却看着像没开） | `949-960` |
-| 40 | **`gpuFrameMs` 拆掉逐批时间戳后恒为 0**，所有以它为源的曲线变成一条零线（用户实测「gpu 帧这个曲线全部为 0」）→ 必须在**源头**用 PDH 的 `Sens().gpuBusyMs` 回填 | `1090-1103`、`1444-1453` |
-| 41 | **逐批 GPU 时间戳夹取的代价远大于收益**：真实游戏一帧十几到几十批（实测 "more than 16 batches per frame"），一帧要 32+ 分配器 → 环被掏空 → `allocator starved` 刷屏 + 叠加永久停画 | `2211-2224`、`366-369` |
-| 42 | **Low 帧口径**：按帧数（P99） vs 按时间累加 → 后者有「刀刃效应」（33.3ms spike 6 帧正好用满 1% 预算 → 恰好停在 spike 上 → 30）。驱动面板用前者（实测驱动 59 / 本程序 30） | `962-967`、`1028-1047` |
-| 43 | **窗口大小**：1200 帧 = 60fps 下 20 秒，比 PresentMon 默认的 1000ms 大 20 倍 → 历史里的偶发 spike 更容易被算进「最差 1%」 | `1051-1055` |
-| 44 | **采样率必须用累计帧数 `frameTotal` 算**，`count()` 满容量后不再增长 | `976-982` |
-| 45 | **「本帧第一次提交」不能当 CPU 起点**：后台流式线程的提交可能发生在**上一帧 Present 的阻塞当中**，量出来恒等于帧周期 | `1295-1300` |
+| 34 | **计数变量必须是 `atomic`**：命令列表钩子被多个提交线程同时调用，而 Present 线程同时在读并清零；普通变量的读-改-写既丢计数也是 UB | `389-393` |
+| 35 | **`gNpCountingOverlayDraws` 必须 `thread_local`**：普通全局 bool 会让「别的提交线程恰好也 draw 一笔」被误抑制 | `937-948` |
+| 36 | **`EnsureD3D12Hooks` 必须防并发重入**：两个线程同时通过检查会各建一套查询堆/fence/叠加资源，先建的句柄被覆盖，泄漏 + 状态错乱（`gTsFreq` 也跟着错） | `2021-2044` |
+| 37 | **槽位分配必须用 `fetch_add` 的返回值**，不能「先 load 判断、再 fetch_add」：两个提交线程会读到同一个 `n`，同时往同一个时间戳槽里写 | `2298-2302` |
+| 38 | **`setjmp` 返回值当条件用会「提交两次」**：`if (setjmp(...)==0) {...; gOrigX(); ...; return;} gOrigX();` —— 探针出异常时条件为假，掉到兜底再转发一次，同一次光追被提交两遍（画面错乱 + 设备 removed）。必须单独记 `faulted` 并**只转发一次** | `2282-2328`、`2341-2356` |
+| 39 | **RT/Tensor 占比的分母是帧周期不是 `gpuFrameMs`**：后者是个**上界**，会让光追占比严重低估（用户实测：开了光追却看着像没开） | `994-1005` |
+| 40 | **`gpuFrameMs` 拆掉逐批时间戳后恒为 0**，所有以它为源的曲线变成一条零线（用户实测「gpu 帧这个曲线全部为 0」）→ 必须在**源头**用 PDH 的 `Sens().gpuBusyMs` 回填 | `1135-1148`、`1489-1498` |
+| 41 | **逐批 GPU 时间戳夹取的代价远大于收益**：真实游戏一帧十几到几十批（实测 "more than 16 batches per frame"），一帧要 32+ 分配器 → 环被掏空 → `allocator starved` 刷屏 + 叠加永久停画 | `2256-2269`、`403-406` |
+| 42 | **Low 帧口径**：按帧数（P99） vs 按时间累加 → 后者有「刀刃效应」（33.3ms spike 6 帧正好用满 1% 预算 → 恰好停在 spike 上 → 30）。驱动面板用前者（实测驱动 59 / 本程序 30） | `1007-1012`、`1073-1092` |
+| 43 | **窗口大小**：1200 帧 = 60fps 下 20 秒，比 PresentMon 默认的 1000ms 大 20 倍 → 历史里的偶发 spike 更容易被算进「最差 1%」 | `1096-1100` |
+| 44 | **采样率必须用累计帧数 `frameTotal` 算**，`count()` 满容量后不再增长 | `1021-1027` |
+| 45 | **「本帧第一次提交」不能当 CPU 起点**：后台流式线程的提交可能发生在**上一帧 Present 的阻塞当中**，量出来恒等于帧周期 | `1340-1345` |
 
 ### 22.6 队列、命令列表与设备
 
 | # | 坑 | 位置 |
 | --- | --- | --- |
-| 46 | ★ **`gQueue12` 必须 `AddRef`**：引擎在全屏切换/重建交换链/设备丢失恢复时会**销毁并重建命令队列**，裸指针之后 `ExecuteCommandLists`/`Signal` 轻则围栏不推进（叠加永久停画），重则驱动里访问违例 | `2166-2173` |
-| 47 | ★ **只给选定的 DIRECT 队列插桩**：原来只判 `q` 非空，于是把**我们自己的 DIRECT 命令列表**丢给游戏的复制队列执行 —— 非法调用、设备 removed、游戏弹 `DXGI_ERROR_INVALID_CALL` 退出。自建宿主只有一条队列所以测不出来 | `2179-2189` |
-| 48 | **只认 DIRECT 队列做时间戳/叠加**，且要先 `GetDesc` 判类型（游戏常常先提交复制队列，先到先得会记错） | `2160-2177` |
-| 49 | **bundle 上 `EndQuery` 是非法操作**，而 bundle 与直连列表**共用同一个 vtable** → 必须用 `GetType()` 过滤 | `2228-2235` |
-| 50 | **`Pending` 槽位有限（4 个）**，满了就放弃这一帧的 resolve，不能等 | `787-802` |
-| 51 | **`EndList` 里没拿锁就不要瞎解锁**（`BeginList` 放弃过的情况） | `720-721` |
-| 52 | **`BeginList` 里绝不能 `WaitForSingleObject`**：那是在游戏 Present 的调用栈里睡觉，直接变成游戏卡顿，还会污染我们自己的帧时间统计 | `685-687` |
-| 53 | **分配器环不能太小**（只给 3 或 8 会让 GPU 稍微落后就全部 busy → 叠加永久停画），现在是 32 | `366-369` |
-| 54 | **`gD12Broken` 是「永久停手」语义**：出过不可恢复的错（`Close`/`Reset` 失败、探测撞 SEH、连续 600 次拿不到分配器）就彻底放弃 D3D12 插桩，**帧时间路径继续工作** | `294-297`、`693-697`、`703-716`、`2276-2281`、`2322-2325` |
-| 55 | **`Dispatch` 探针异常后不能补写另一半时间戳**，也必须复位 `gAiSpanOpen`，否则 `HarvestTimestamps` 会把没写过的 `TS_AI_END` 当有效结束点，报出荒唐的 Tensor 占用 | `2316-2326` |
-| 56 | **设备移除检测**：GPU 侧非法操作会导致 device removed，游戏随即自杀式退出；`GetDeviceRemovedReason` 健康时返回 `S_OK`，拿到别的失败码说明设备指针本身可疑，也要记 | `1460-1470` |
+| 46 | ★ **`gQueue12` 必须 `AddRef`**：引擎在全屏切换/重建交换链/设备丢失恢复时会**销毁并重建命令队列**，裸指针之后 `ExecuteCommandLists`/`Signal` 轻则围栏不推进（叠加永久停画），重则驱动里访问违例 | `2211-2218` |
+| 47 | ★ **只给选定的 DIRECT 队列插桩**：原来只判 `q` 非空，于是把**我们自己的 DIRECT 命令列表**丢给游戏的复制队列执行 —— 非法调用、设备 removed、游戏弹 `DXGI_ERROR_INVALID_CALL` 退出。自建宿主只有一条队列所以测不出来 | `2224-2234` |
+| 48 | **只认 DIRECT 队列做时间戳/叠加**，且要先 `GetDesc` 判类型（游戏常常先提交复制队列，先到先得会记错） | `2205-2222` |
+| 49 | **bundle 上 `EndQuery` 是非法操作**，而 bundle 与直连列表**共用同一个 vtable** → 必须用 `GetType()` 过滤 | `2273-2280` |
+| 50 | **`Pending` 槽位有限（4 个）**，满了就放弃这一帧的 resolve，不能等 | `824-839` |
+| 51 | **`EndList` 里没拿锁就不要瞎解锁**（`BeginList` 放弃过的情况） | `757-758` |
+| 52 | **`BeginList` 里绝不能 `WaitForSingleObject`**：那是在游戏 Present 的调用栈里睡觉，直接变成游戏卡顿，还会污染我们自己的帧时间统计 | `722-724` |
+| 53 | **分配器环不能太小**（只给 3 或 8 会让 GPU 稍微落后就全部 busy → 叠加永久停画），现在是 32 | `403-406` |
+| 54 | **`gD12Broken` 是「永久停手」语义**：出过不可恢复的错（`Close`/`Reset` 失败、探测撞 SEH、连续 600 次拿不到分配器）就彻底放弃 D3D12 插桩，**帧时间路径继续工作** | `331-334`、`730-734`、`740-753`、`2321-2326`、`2367-2370` |
+| 55 | **`Dispatch` 探针异常后不能补写另一半时间戳**，也必须复位 `gAiSpanOpen`，否则 `HarvestTimestamps` 会把没写过的 `TS_AI_END` 当有效结束点，报出荒唐的 Tensor 占用 | `2361-2371` |
+| 56 | **设备移除检测**：GPU 侧非法操作会导致 device removed，游戏随即自杀式退出；`GetDeviceRemovedReason` 健康时返回 `S_OK`，拿到别的失败码说明设备指针本身可疑，也要记 | `1505-1515` |
 
 ### 22.7 日志与排查
 
 | # | 坑 | 位置 |
 | --- | --- | --- |
-| 57 | ★ **日志文件写满后是从头覆盖的**：`SetFilePointer(FILE_BEGIN)` → **最新的行在文件开头，结尾反而是旧内容**。只看末尾会误判「日志里没有这一行」 | `529-535` |
-| 58 | **日志前缀必须有墙钟时间 + 进程名 + pid**：只有「开机后毫秒数」对不上用户说的时间点；这个文件是所有被注入进程共用的，光看 pid 不知道是哪个游戏 | `538-561` |
-| 59 | 日志上限从 64KB 提到 512KB：`present diag` / `frame dist` 每 5 秒各一条，64KB 只能存几分钟 | `532-534` |
-| 60 | **`recent ft` 连续序列是判断「伪影 vs 真抖动」最直接的手段**：`17 17 17 25 17 17 25` = 真抖动；`17 17 17 3 3 28 28 17` = 帧内多次 Present 的伪影 | `1010-1026` |
-| 61 | **`low compare`（merged vs raw）用来判断帧内合并是否生效或误合并** —— 光看一个数字分不出这两种情况 | `1028-1047` |
-| 62 | **`overlay 5s: drawn/skipped` 用来区分闪烁的两种成因**（没画上 vs 画错缓冲），不分开就无法决定怎么改 | `1606-1629` |
-| 63 | **`panel logical size` 只在尺寸变化时记** —— 「HUD 宽度随数值一直变化」这个问题靠它客观判定，理想情况整局只出现一次 | `872-886` |
+| 57 | ★ **日志文件写满后是从头覆盖的**：`SetFilePointer(FILE_BEGIN)` → **最新的行在文件开头，结尾反而是旧内容**。只看末尾会误判「日志里没有这一行」 | `566-572` |
+| 58 | **日志前缀必须有墙钟时间 + 进程名 + pid**：只有「开机后毫秒数」对不上用户说的时间点；这个文件是所有被注入进程共用的，光看 pid 不知道是哪个游戏 | `575-598` |
+| 59 | 日志上限从 64KB 提到 512KB：`present diag` / `frame dist` 每 5 秒各一条，64KB 只能存几分钟 | `569-571` |
+| 60 | **`recent ft` 连续序列是判断「伪影 vs 真抖动」最直接的手段**：`17 17 17 25 17 17 25` = 真抖动；`17 17 17 3 3 28 28 17` = 帧内多次 Present 的伪影 | `1055-1071` |
+| 61 | **`low compare`（merged vs raw）用来判断帧内合并是否生效或误合并** —— 光看一个数字分不出这两种情况 | `1073-1092` |
+| 62 | **`overlay 5s: drawn/skipped` 用来区分闪烁的两种成因**（没画上 vs 画错缓冲），不分开就无法决定怎么改 | `1651-1674` |
+| 63 | **`panel logical size` 只在尺寸变化时记** —— 「HUD 宽度随数值一直变化」这个问题靠它客观判定，理想情况整局只出现一次 | `909-922` |
 
 ---
 

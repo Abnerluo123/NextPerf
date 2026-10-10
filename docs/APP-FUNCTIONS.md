@@ -87,7 +87,7 @@
 | `np::SensorHub::Shutdown` | 声明 `np_sensors.h:93` | 释放厂商 SDK / PDH / WMI | `main.cpp:747`、`846`、`881` | 必须在 `GfxShutdown` 之后一起收尾 |
 | `np::Etw()` / `Start` / `Stop` / `SetTargetPid` / `Snapshot` / `active` / `status` | `src/etw/np_etw.h:38/39/43/64/40/68` | 外置帧计时（内核 DxgKrnl Present 事件） | `main.cpp:119/136/152/724/983` | 需要管理员；**Low 帧之外一律不覆盖**；`status()` 返回拷贝（线程安全） |
 | `np::BuildPanelData` | `src/common/np_build.cpp:199`（声明 `np_build.h:10`） | 把 `NPSensors + NPTelemetry + NPHistory + NPConfig` 整理成面板行 | `main.cpp:809`、`ui.cpp:393`、`overlay.cpp:98` | 三处显示通路共用，保证排版一致 |
-| `npb::GfxInit` / `GfxShutdown` / `Factory` / `SetRasterScale` / `RasterScale` / `PanelBitmap::Render` | `src/common/np_bitmap.cpp:17/29`、`np_bitmap.h:19/25/26/34` | Direct2D/DirectWrite 工厂与 BGRA 位图渲染 | `main.cpp:780/746/943`、`ui.cpp:391/398`、`overlay.cpp:87/95/105` | 叠加定位用 `RasterScale()` 换算物理像素 |
+| `npb::GfxInit` / `GfxShutdown` / `Factory` / `SetRasterScale` / `RasterScale` / `PanelBitmap::Render` | 声明 `src/common/np_bitmap.h:17/18/19/25/26/34`；实现 `np_bitmap.cpp:17/29/12/88` | Direct2D/DirectWrite 工厂与 BGRA 位图渲染 | `main.cpp:780/746/943`、`ui.cpp:391/398`、`overlay.cpp:87/95/105` | 叠加定位用 `RasterScale()` 换算物理像素 |
 
 ---
 
@@ -265,7 +265,9 @@
 
 1. 新增/修改了跨线程共享的数据？→ 按 `APP.md` §4.3 的清单逐点补 `AppLock`。
 2. 动过 UI 布局？→ 复核 `kWinH`（右列按钮底边目前 726/730），并在日志里搜「UI 重叠警告」。
-3. 动过共享内存结构体？→ 只在末尾加字段或复用 `reserved[]`；同步 `sizeof` 自校验语义与读方校验。
+3. 动过共享内存结构体？→ 只在末尾加字段或复用 `reserved[]`；同步 `sizeof` 自校验语义与读方校验；
+   并跑 `python tests/struct_check.py`（`version == sizeof` **抓不到**「同大小但字段换序」，
+   见 `APP.md` §3.5）。
 4. 新增配置字段？→ 读 + 写 + UI + `cfgVersion` 升级四处都改；**运行态字段不要落盘**。
 5. 动过任何轮询周期？→ 复核 2.5 秒契约（`detachPid` 超时 / 陈旧遥测 / overlay 判活）。
 6. 动过注入失败路径？→ 保证每条失败路径都有 `AppLog` + `SetNotice`。
