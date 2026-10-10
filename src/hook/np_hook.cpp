@@ -2495,6 +2495,21 @@ static void RestoreAllHooks() {
     gFactory2Vt = nullptr;
     gQueueVt = nullptr;
     gClVt = nullptr;
+
+    // ★ SELFCHECK：还原之后这些指针必须**全部**清空。
+    //   任何一项非空都意味着进程里留下了指向「即将被卸载的代码」的补丁 ——
+    //   下次注入读到的"原函数"会是上一次的钩子，钩子调用自己 -> 无限递归 -> 栈溢出
+    //   （这正是「重复注入 100% 闪退」的一号根因）。
+    //   打印成机器可断言的 OK/FAIL，便于测试脚本 grep，也便于我读日志时一眼看出。
+    {
+        bool clean = (gSwapVtCount == 0 && gFactoryVt == nullptr &&
+                      gFactory2Vt == nullptr && gQueueVt == nullptr && gClVt == nullptr &&
+                      gSehHandle == nullptr);
+        Log("SELFCHECK unloadClean = %s (swapVt=%d factory=%d factory2=%d queue=%d "
+            "cmdlist=%d seh=%d)",
+            clean ? "OK" : "FAIL", gSwapVtCount, gFactoryVt ? 1 : 0, gFactory2Vt ? 1 : 0,
+            gQueueVt ? 1 : 0, gClVt ? 1 : 0, gSehHandle ? 1 : 0);
+    }
 }
 
 // 指针是否落在**我们自己**的 DLL 里。

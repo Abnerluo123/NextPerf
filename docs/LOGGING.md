@@ -142,6 +142,28 @@
 | `UI 重叠警告` | 主程序 | 布局错误自动暴露 |
 | PDH 未出数的原因 | 主程序 | 写明命中几个实例、累计多少秒 |
 
+### 已落地的机器可断言自检：SELFCHECK
+
+格式约定：
+
+    SELFCHECK <名字> = OK|FAIL [细节]
+
+目前有 SELFCHECK unloadClean（卸载时必须把 swapVt / factory / factory2 /
+queue / cmdlist / VEH 句柄**全部**清空 —— 任何一项残留都意味着进程里留下了
+指向即将被卸载代码的补丁，是「重复注入闪退」的一号根因）。
+
+**测试脚本可以直接 grep 这一行做断言**，不需要人眼判断。
+
+### ⚠️ 已知的测试缺口（2026-10-11 发现）
+
+	ests/verify_reinject.py 名义上测「重复注入」，但钩子日志显示它**从未走到
+卸载路径** —— 它用的是进程被强杀（TerminateProcess 不执行 DllMain），
+所以**干净卸载这条链其实没有被这条测试覆盖**。
+真正的干净卸载要用 NPConfig.detachPid 触发（钩子守卫线程会走
+SelfUnloadNow）。等 	ests/sim/ 的模拟游戏可用后，应当补一条
+「注入 -> 改分辨率/切窗口 -> detachPid 卸载 -> 断言 SELFCHECK unloadClean = OK」
+的测试。
+
 **新增功能时请一并想**：这个改动**怎么在日志里证明它是对的**？
 想不出来就说明还没设计好自检。
 
