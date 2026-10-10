@@ -203,6 +203,27 @@ static void Add(int type, int x, int y, int w, int h, const wchar_t* text) {
     wd.type = (WType)type;
     wd.x = x; wd.y = y; wd.w = w; wd.h = h;
     wd.text = text;
+
+    // ★ 重叠检测：两个可交互控件画在同一个位置时，点击只会命中最先注册的那个，
+    //   表现就是「某个开关点了没反应」—— 用户实测撞过一次
+    //   （「自动注入 3D 窗口」被放在「传感器轮询」的同一个矩形上）。
+    //   这里主动查出来并记日志，别让它再靠用户发现。
+    for (const auto& o : gW) {
+        // 只对**同类型**控件报警：游戏列表行里，行容器与它内部的按钮天然是包含关系
+        // （父子的 y 相差十几像素、高度还不同），那不是 bug。真正会吃掉点击的是
+        // 「两个同类型的开关叠在同一块矩形上」—— 用户实测撞到的就是这个。
+        if (o.type != wd.type) continue;
+        const int ix = (x > o.x) ? x : o.x;
+        const int iy = (y > o.y) ? y : o.y;
+        const int ax = (x + w < o.x + o.w) ? x + w : o.x + o.w;
+        const int ay = (y + h < o.y + o.h) ? y + h : o.y + o.h;
+        if (ax > ix && ay > iy) {
+            AppLog("UI 重叠警告：新控件「%ls」(%d,%d %dx%d) 与已有控件 (%d,%d %dx%d) 相交 "
+                   "-> 点击会被先注册的那个吃掉",
+                   text ? text : L"(无文字)", x, y, w, h, o.x, o.y, o.w, o.h);
+            break;
+        }
+    }
     gW.push_back(wd);
 }
 
@@ -311,9 +332,6 @@ static void Layout() {
           {200, 350, 500, 1000}, RX, ry, half);
     cycle(L"深度引擎钩子", (int*)&gApp.cfg.deepEngineHook, {L"开启", L"关闭"}, {1, 0},
           RX + RW / 2 + S(4), ry, half);
-    // 3D 窗口自动注入：用户要求给开关，**默认关闭**（误注入会打扰无关程序）
-    cycle(L"自动注入 3D 窗口", (int*)&gApp.cfg.autoInject, {L"关闭", L"开启"}, {0, 1},
-          RX, ry, half);
     // Low 帧只用 Intel PresentMon 的权威口径（1 秒滑动窗口 + P1）。
     // 不提供「窗口时间」等可调项 —— 用户要求用权威方法、不让用户改窗口时间。
     ry += S(38);
@@ -322,6 +340,14 @@ static void Layout() {
     // 个别游戏对注入期创建设备敏感，留个开关能关掉。
     cycle(L"注入探测交换链", (int*)&gApp.cfg.vtableProbe, {L"开启", L"关闭"}, {1, 0},
           RX + RW / 2 + S(4), ry, half);
+
+    // ★ 3D 窗口自动注入：**必须单独占一行**。
+    //   原来它被放在 「传感器轮询」 那一行的**同一个矩形**上（都是 RX, ry, half），
+    //   两个控件叠在一起 —— 点击命中的是先注册的那个，表现就是「点了没反应」。
+    //   （用户实测反馈。Add() 里现在有重叠检测，同类错误会被日志抓到。）
+    //   默认关闭：误注入会打扰浏览器/聊天工具等无关程序。
+    ry += S(38);
+    cycle(L"自动注入 3D 窗口", (int*)&gApp.cfg.autoInject, {L"关闭", L"开启"}, {0, 1}, RX, ry, half);
 
     // ---------- 右：按钮 ----------
     ry += S(46);
