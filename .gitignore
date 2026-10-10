@@ -25,3 +25,6 @@ tests/*.png
 .workbuddy/
 # EMI 探测程序（源码入库，产物不入库）
 tests/emi_probe.exe
+
+# 调试符号（构建产物）
+*.pdb
