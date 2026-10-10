@@ -473,6 +473,16 @@ static void DoAction(int action) {
             if (GetOpenFileNameW(&ofn)) {
                 GameEntry ge;
                 ge.path = path;
+                // 同步填 name（小写 exe 名）—— InjectorScanNow 现在按 name 匹配，
+                // 这里不填的话手动添加的条目只能靠 path 回退，容易和自动学习
+                // 的条目产生不一致。
+                {
+                    std::wstring p = path;
+                    size_t sl = p.find_last_of(L"\\/");
+                    std::wstring nm = (sl == std::wstring::npos) ? p : p.substr(sl + 1);
+                    for (auto& c : nm) c = (wchar_t)towlower(c);
+                    ge.name = nm;
+                }
                 {
                     // ★ 加锁：守护线程每 800ms 就遍历一次 gApp.games，
                     //   这里 push_back 触发扩容会让它的迭代器变成野指针（会崩）。
@@ -609,7 +619,10 @@ static void DrawGameList(HDC mem, int gameTop) {
         int slot = wd.index;
         if (slot < 0 || slot >= (int)gApp.games.size()) continue;
         const GameEntry& ge = gApp.games[slot];
-        std::wstring name = ge.path;
+        // 学习来的条目**只有 name、没有 path**（商店应用的 exe 在 WindowsApps 下，
+        // 普通用户读不了），所以 path 为空时要回退到 name —— 否则列表里显示空白
+        // （用户实测的 bug：自动学习的程序在列表里没名字）。
+        std::wstring name = ge.path.empty() ? ge.name : ge.path;
         size_t p = name.find_last_of(L"\\/");
         std::wstring short_ = (p == std::wstring::npos) ? name : name.substr(p + 1);
         bool sel = (gSelGame == slot);
