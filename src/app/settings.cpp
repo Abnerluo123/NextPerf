@@ -70,6 +70,8 @@ bool SettingsLoad() {
     }
     // 背景固定纯黑（用户明确要求），旧配置里的蓝黑色一律丢弃
     gApp.cfg.bgColor = 0xFF000000u;
+    // ⚠ bgColor 原来只有写回、没有读取 —— 用户改了背景色，重启就丢（审计发现的）
+    if (auto* p = get("bgColor")) gApp.cfg.bgColor = (uint32_t)p->numOr(gApp.cfg.bgColor);
     if (auto* p = get("textColor")) gApp.cfg.textColor = (uint32_t)p->numOr(gApp.cfg.textColor);
     if (auto* p = get("accentColor")) gApp.cfg.accentColor = (uint32_t)p->numOr(gApp.cfg.accentColor);
     if (auto* p = get("warnColor")) gApp.cfg.warnColor = (uint32_t)p->numOr(gApp.cfg.warnColor);
@@ -87,6 +89,8 @@ bool SettingsLoad() {
     if (auto* p = get("deepEngineHook")) gApp.cfg.deepEngineHook = (uint32_t)p->numOr(1);
     if (auto* p = get("vtableProbe")) gApp.cfg.vtableProbe = (uint32_t)p->numOr(1);
     if (auto* p = get("simulate")) gApp.cfg.simulate = (uint32_t)p->numOr(0);
+    // ⚠ 「实验性自动注入」开关原来**读和写都没有** -> 用户勾选后重启就丢（用户实测）
+    if (auto* p = get("learnedAutoHook")) gApp.cfg.learnedAutoHook = (uint32_t)p->numOr(0);
 
     gApp.games.clear();
     if (auto* arr = get("games")) {
@@ -155,6 +159,7 @@ void SettingsSave() {
     root.obj["deepEngineHook"] = Json::mkNum(gApp.cfg.deepEngineHook);
     root.obj["vtableProbe"] = Json::mkNum(gApp.cfg.vtableProbe);
     root.obj["simulate"] = Json::mkNum(gApp.cfg.simulate);
+    root.obj["learnedAutoHook"] = Json::mkNum(gApp.cfg.learnedAutoHook);
 
     Json::Value games = Json::mkArr();
     // games 仍然只存**手动添加**的路径（保持老格式，零迁移风险）
