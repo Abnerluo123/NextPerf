@@ -84,7 +84,7 @@ public:
     int SwapchainGeneration() const override { return generation_; }
     int BufferCount() const override { return buffer_count_; }
     const char* BackendName() const override { return "dx12"; }
-    const char* Note() const override { return note_.c_str(); }
+    const char* Note() const override;
     bool TakeLastGpuMs(double* out) override;
     double GpuTimestampFreqHz() const override { return gpu_freq_hz_; }
     const char* GpuTimestampFreqSource() const override { return gpu_freq_source_; }
@@ -115,6 +115,7 @@ private:
     bool CreateFrameResources(std::string* err);
     void ReleaseBackBuffers();
     bool WaitForFrameRing(int slot, DWORD timeout_ms);
+    void ReadSlotTimestamps(int slot);
     void DrawFrame(int64_t frame_index, ID3D12GraphicsCommandList* list);
 
     HWND hwnd_ = nullptr;
@@ -151,6 +152,9 @@ private:
 
     int generation_ = 0;
     std::string note_;
+    // 时间戳回读的计数（诊断用，退出时打进汇总的 note）
+    int ts_read_attempt_ = 0, ts_read_ok_ = 0, ts_read_bad_ = 0, ts_read_map_fail_ = 0,
+        ts_read_fence_wait_ = 0;
 };
 
 // ---------------------------------------------------------------- 初始化
@@ -457,6 +461,58 @@ bool Dx12Engine::WaitForFrameRing(int slot, DWORD timeout_ms) {
     return true;
 }
 
+// 把某一槽上一次提交的时间戳读出来。
+//
+// 同步关系（这里必须严格，否则会读到还没写完的显存）：
+//   这一槽的数据是「上一轮用它的那一帧」写进去的，对应的 fence 值存在
+//   f.fence_value 里。BeginFrame 已经 WaitForFrameRing(slot) 等过它，
+//   所以进到这里时 GPU 一定写完了 —— 前提是 fence_value 在此之前没有被
+//   覆盖。这就是 EndFrame 里「fence_value 在读完之前不能改」的原因。
+void Dx12Engine::ReadSlotTimestamps(int slot) {
+    FrameRes& f = ring_[slot];
+    if (!f.readback || !ts_heap_ || f.gpu_frame < 0) return;
+    // 双保险：万一 WaitForFrameRing 超时了，这里再确认一次 fence 状态。
+    if (f.fence_value != 0 && fence_->GetCompletedValue() < f.fence_value) {
+        ts_read_fence_wait_++;
+        return;
+    }
+
+    void* mapped = nullptr;
+    // Map 的读取范围必须从**这一槽自己的字节偏移**开始。
+    // 踩过的坑：回读缓冲是 kFrameRing * kQPerFrame 个 UINT64，每槽的数据在
+    // 不同偏移上；如果写成 {0, 32}，槽 1/2 读到的永远是槽 0 那份数据
+    // （表现为「只有 1/3 的帧有 GPU 时间戳」）。
+    const UINT64 off = (UINT64)slot * kQPerFrame * sizeof(UINT64);
+    D3D12_RANGE range{(SIZE_T)off, (SIZE_T)(off + kQPerFrame * sizeof(UINT64))};
+    if (FAILED(f.readback->Map(0, &range, &mapped)) || !mapped) {
+        ts_read_map_fail_++;
+        return;
+    }
+    const UINT64* ts = (const UINT64*)((const unsigned char*)mapped + off);
+    ts_read_attempt_++;
+    // ts[0]=帧首 ts[1]=渲染末 ts[2]=Present 前 ts[3]=Present 后
+    if (gpu_freq_hz_ > 0.0 && ts[1] >= ts[0] && ts[0] != 0) {
+        GpuSample s;
+        s.frame = f.gpu_frame;
+        s.render_ms = (double)(ts[1] - ts[0]) * 1000.0 / gpu_freq_hz_;
+        s.present_interval_ms =
+            (ts[3] >= ts[2] && ts[2] != 0) ? (double)(ts[3] - ts[2]) * 1000.0 / gpu_freq_hz_ : 0.0;
+        s.taken = false;
+        gpu_samples_.push_back(s);
+        gpu_available_ = true;
+        ts_read_ok_++;
+    } else {
+        ts_read_bad_++;
+        if (ts_read_bad_ <= 3) {
+            SimLog("时间戳回读异常：t0=%llu t1=%llu t2=%llu t3=%llu freq=%.0f", (unsigned long long)ts[0],
+                   (unsigned long long)ts[1], (unsigned long long)ts[2],
+                   (unsigned long long)ts[3], gpu_freq_hz_);
+        }
+    }
+    D3D12_RANGE empty{0, 0};
+    f.readback->Unmap(0, &empty);
+}
+
 // ---------------------------------------------------------------- 渲染
 
 void Dx12Engine::DrawFrame(int64_t frame_index, ID3D12GraphicsCommandList* list) {
@@ -535,34 +591,15 @@ void Dx12Engine::DrawFrame(int64_t frame_index, ID3D12GraphicsCommandList* list)
 void Dx12Engine::BeginFrame(int64_t frame_index) {
     // 复用槽位前先确认 GPU 已经把上一轮这一槽的两条命令列表都执行完 ——
     // D3D12 明确禁止在 GPU 还在用某个分配器时 Reset 它。
-    // 放在 slot_ 前进之前：等的是「上一次用这个槽的那一帧」。
+    // 这一步同时也是「时间戳回读安全」的前提。
     const int next_slot = (slot_ + 1) % kFrameRing;
     WaitForFrameRing(next_slot, 2000);
     slot_ = next_slot;
     FrameRes& f = ring_[slot_];
 
-    // 读上一轮这一槽的 GPU 时间戳结果
-    if (!f.read && f.readback && f.gpu_frame >= 0) {
-        void* mapped = nullptr;
-        D3D12_RANGE range{0, (SIZE_T)(kQPerFrame * sizeof(UINT64))};
-        if (SUCCEEDED(f.readback->Map(0, &range, &mapped)) && mapped) {
-            const UINT64* ts = (const UINT64*)mapped;
-            // ts[0]=帧首 ts[1]=渲染末 ts[2]=Present前 ts[3]=Present后
-            if (gpu_freq_hz_ > 0.0 && ts[1] > ts[0]) {
-                GpuSample s;
-                s.frame = f.gpu_frame;
-                s.render_ms = (double)(ts[1] - ts[0]) * 1000.0 / gpu_freq_hz_;
-                s.present_interval_ms =
-                    ts[3] > ts[2] ? (double)(ts[3] - ts[2]) * 1000.0 / gpu_freq_hz_ : 0.0;
-                s.taken = false;
-                gpu_samples_.push_back(s);
-                gpu_available_ = true;
-            }
-            D3D12_RANGE empty{0, 0};
-            f.readback->Unmap(0, &empty);
-        }
-        f.read = true;
-    }
+    // 上一轮这一槽写进去的时间戳现在可以安全读了。
+    ReadSlotTimestamps(slot_);
+    f.gpu_frame = -1;
 
     HRESULT hr = f.alloc->Reset();
     if (FAILED(hr)) SimLog("命令分配器 Reset 失败 hr=%08lX", (unsigned long)hr);
@@ -644,10 +681,11 @@ void Dx12Engine::EndFrame(SimFrameReport& r) {
 
     // 提交后打个信号：下一轮复用这一槽时要等这个值（它在两条列表都提交之后，
     // 所以等到它就等于两条列表都执行完了）。
+    // 顺序很重要：先记 gpu_frame，再更新 fence_value —— 下一轮 BeginFrame
+    // 会先 WaitForFrameRing（用新值）再 ReadSlotTimestamps。
+    f.gpu_frame = r.frame_index;
     queue_->Signal(fence_.Get(), ++fence_value_);
     f.fence_value = fence_value_;
-    f.gpu_frame = r.frame_index;
-    f.read = false;
 }
 
 bool Dx12Engine::TakeLastGpuMs(double* out) {
@@ -660,6 +698,16 @@ bool Dx12Engine::TakeLastGpuMs(double* out) {
         return true;
     }
     return false;
+}
+
+// 让汇总 JSON 里能看到回读的成败计数：「GPU 时间戳可用但只有一半帧有样本」
+// 这种半吊子状态必须能一眼看出来，不能含糊过去。
+const char* Dx12Engine::Note() const {
+    static char buf[256];
+    snprintf(buf, sizeof(buf), "%sts-read(attempt=%d ok=%d bad=%d mapFail=%d fenceWait=%d);",
+             note_.c_str(), ts_read_attempt_, ts_read_ok_, ts_read_bad_, ts_read_map_fail_,
+             ts_read_fence_wait_);
+    return buf;
 }
 
 bool Dx12Engine::Resize(int w, int h, std::string* err) {

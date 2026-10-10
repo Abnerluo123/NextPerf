@@ -527,12 +527,22 @@ void SimPacer::WaitForFrameStart() {
 // 控制命令
 // ============================================================================
 
+// 空白切分。
+//
+// 必须把 '\n' 也算作空白：管道 / 文件重定向过来的行尾可能是裸 LF（Python 的
+// text 模式在某些平台上就是），fgets 会把 '\n' 一并读进来。早期版本只认
+// ' ' '\t' '\r'，结果 token 里带着 '\n'，`status` 这种单 token 命令变成
+// "status\n" -> 未知命令；`vsync off` 变成 "off\n" -> 解析失败并静默保持
+// 原值。现象很迷惑（resize 正常、单 token 命令全挂），所以这里显式修掉。
 static void SplitWs(const std::string& s, std::vector<std::string>* out) {
+    auto is_ws = [](char ch) {
+        return ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n' || ch == '\v' || ch == '\f';
+    };
     size_t i = 0;
     while (i < s.size()) {
-        while (i < s.size() && (s[i] == ' ' || s[i] == '\t' || s[i] == '\r')) ++i;
+        while (i < s.size() && is_ws(s[i])) ++i;
         size_t b = i;
-        while (i < s.size() && s[i] != ' ' && s[i] != '\t' && s[i] != '\r') ++i;
+        while (i < s.size() && !is_ws(s[i])) ++i;
         if (i > b) out->push_back(s.substr(b, i - b));
     }
 }
@@ -542,7 +552,29 @@ SimCommand SimParseCommand(const std::string& line) {
     c.raw = line;
     std::vector<std::string> t;
     SplitWs(line, &t);
+
+    // 诊断：SIM_DEBUG_CMDS=1 时把读到的原始字节和切出来的 token 都打出来。
+    // 排查「管道里传过来的到底是什么」这类问题时离不了（行尾 CR、空行、
+    // 多个命令粘在一行都很难从现象上猜）。
+    static const bool dbg = getenv("SIM_DEBUG_CMDS") != nullptr;
+    if (dbg) {
+        fprintf(stderr, "[sim] cmd raw bytes:");
+        for (unsigned char ch : line) fprintf(stderr, " %02X", ch);
+        fprintf(stderr, "   tokens=%llu", (unsigned long long)t.size());
+        for (auto& s : t) fprintf(stderr, " [%s]", s.c_str());
+        fprintf(stderr, "\n");
+    }
+
     if (t.empty()) return c;  // 空行：kind 保持 None，调用方忽略
+
+    // 双保险：SplitWs 已经不会产出带尾随空白的 token 了，这里再统一裁一遍，
+    // 免得以后有人改了 SplitWs 又把 '\n' 漏进来。
+    for (auto& tok : t) {
+        size_t b = tok.find_first_not_of(" \t\r\n\v\f");
+        size_t e = tok.find_last_not_of(" \t\r\n\v\f");
+        tok = (b == std::string::npos) ? std::string() : tok.substr(b, e - b + 1);
+    }
+    if (t[0].empty()) return c;
 
     std::string k = t[0];
     for (auto& ch : k) ch = (char)tolower((unsigned char)ch);
@@ -569,7 +601,8 @@ SimCommand SimParseCommand(const std::string& line) {
         if (!need(1, "vsync on|off")) return c;
         bool b = false;
         if (!ParseBool(t[1].c_str(), &b)) { c.raw = "vsync 只支持 on / off"; return c; }
-        c.on = b;
+        c.on = b;   // 注意：这里必须先解析到局部变量再赋值回来，
+                    // 早期版本漏了这一行，导致 "vsync off" 被当成 on（默认值）。
         c.kind = SimCommand::Vsync;
     } else if (k == "fpscap" || k == "fps-cap" || k == "cap") {
         if (!need(1, "fpscap N")) return c;

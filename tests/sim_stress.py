@@ -88,10 +88,17 @@ def main():
     #   包括「ResizeBuffers 失败 -> 退回重建整条交换链」这类关键线索。
     #   上一版把它丢进 DEVNULL，结果崩溃时完全没有诊断信息可看。
     err_path = os.path.join(os.environ.get("TEMP", "."), "sim_stderr.txt")
+    out_path = os.path.join(os.environ.get("TEMP", "."), "sim_stdout.txt")
     err_f = open(err_path, "w", encoding="utf-8", errors="replace")
+    # ⚠ stdout 必须**落到文件**，不能用 PIPE 后再在末尾读 ——
+    #   模拟器每帧（或每 N 帧）往 stdout 写一行 JSON，如果没人及时读，
+    #   管道缓冲区写满后它会**阻塞在 write 上**：表现为「stdin 命令不再被处理」，
+    #   极容易被误判成「钩子干扰了模拟器」。我自己就误判过一次（而且当时
+    #   还先入为主地怀疑是钩子）。
+    #   用文件当接收端就没有容量上限，不会死锁。
     p = subprocess.Popen([SIM, "--api=" + args.api, "--seconds=%d" % args.seconds,
                           "--json", "--json-every=30"],
-                         stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                         stdin=subprocess.PIPE, stdout=open(out_path, "w"),
                          stderr=err_f, text=True, bufsize=1)
     time.sleep(3.0)
     if p.poll() is not None:
@@ -155,7 +162,8 @@ def main():
 
     # 收结果
     try:
-        out = p.stdout.read() or ""
+        with open(out_path, "r", encoding="utf-8", errors="replace") as f:
+            out = f.read()
     except Exception:
         out = ""
     frames = []

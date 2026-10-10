@@ -1,0 +1,5 @@
+status
+resize 1024 768
+vsync off
+stats
+quit

@@ -122,19 +122,6 @@ static std::string JStr(const char* s) {
     return o;
 }
 
-static bool StrIContains(const char* hay, const char* needle) {
-    if (!hay || !needle) return false;
-    size_t nl = strlen(needle);
-    if (!nl) return false;
-    for (const char* p = hay; *p; ++p) {
-        size_t i = 0;
-        while (i < nl && p[i] &&
-               tolower((unsigned char)p[i]) == tolower((unsigned char)needle[i])) ++i;
-        if (i == nl) return true;
-    }
-    return false;
-}
-
 // UTF-16 → UTF-8（注册表/文件路径都是宽字符）
 static std::string W2U(const wchar_t* w) {
     if (!w) return std::string();
@@ -890,10 +877,61 @@ static int DoListLayers(VkApi& api) {
 struct ProcOrigin {
     std::string module;      // 函数所属模块的完整路径
     std::string moduleName;  // 只要文件名
-    bool        fromLoader = false;
+    int         owner = 0;   // 见 ProcOwner
 };
 
-static ProcOrigin DescribeProc(const char* name, void* fn) {
+// 函数指针的"归属"分类。
+// 重要（实测得出的模型）：现代 loader 的 vkGetDeviceProcAddr 会把**没有被层
+// 拦截**的 device 级函数**直接返回 ICD 里的实现**（一种分派优化），所以
+// 「不是 vulkan-1.dll」并不等于「被层拦截了」——
+//   * 落在 vulkan-1.dll   → loader 自己的跳板/终止函数，没有层介入
+//   * 落在 ICD（如 nvoglv64.dll）→ 直接分派给驱动，**没有层介入**
+//   * 落在层 DLL（如 GPP_VKLayer64.dll）→ **确实被层拦截了**
+// 所以必须先能认出"哪些 DLL 是层"。这里的依据是注册表层清单里的 library_path
+// （由 CollectLayers 收集，权威），再加一份常见的 ICD 文件名做兜底。
+enum ProcOwner {
+    OWNER_LOADER  = 0,
+    OWNER_LAYER   = 1,
+    OWNER_ICD     = 2,
+    OWNER_UNKNOWN = 3,
+};
+
+// 由 main 从层清单里填好（小写文件名）。用全局是因为报告函数在很深的调用栈里，
+// 为了两个字符串把整条链路的签名都改一遍不划算。
+static std::vector<std::string> g_knownLayerDlls;
+
+static std::string LowerBaseName(const std::string& path) {
+    size_t s = path.find_last_of("\\/");
+    std::string n = (s == std::string::npos) ? path : path.substr(s + 1);
+    for (auto& c : n) c = (char)tolower((unsigned char)c);
+    return n;
+}
+
+static ProcOwner ClassifyModule(const std::string& nameLower) {
+    if (nameLower == "vulkan-1.dll") return OWNER_LOADER;
+    for (auto& l : g_knownLayerDlls) if (l == nameLower) return OWNER_LAYER;
+    // 兜底：名字里带 layer 的基本可以确定是层（本机层 DLL 都遵循这个命名习惯）
+    if (nameLower.find("layer") != std::string::npos) return OWNER_LAYER;
+    // 常见 ICD（驱动）文件名。仅用于让输出更好读；判错也不影响"是不是层"的结论。
+    static const char* kIcd[] = {
+        "nvoglv64.dll", "nvoglv32.dll", "igvk64.dll", "igvk32.dll",
+        "amdvlk64.dll", "amdvlk32.dll", "vulkan_lvp.dll", "lvp_icd.x86_64.dll",
+        "vk_swiftshader.dll", "intel_icd.x86_64.dll", "intel_icd.x86.dll",
+    };
+    for (const char* n : kIcd) if (nameLower == n) return OWNER_ICD;
+    return OWNER_UNKNOWN;
+}
+
+static const char* OwnerName(int o) {
+    switch (o) {
+        case OWNER_LOADER:  return "loader 跳板（无层介入）";
+        case OWNER_LAYER:   return "层 DLL（已被层拦截）";
+        case OWNER_ICD:     return "驱动 ICD（直接分派，无层介入）";
+        default:            return "未知模块（无法判定是否层）";
+    }
+}
+
+static ProcOrigin DescribeProc(void* fn) {
     ProcOrigin o;
     if (!fn) { o.module = "(空指针)"; o.moduleName = o.module; return o; }
     HMODULE m = nullptr;
@@ -905,44 +943,65 @@ static ProcOrigin DescribeProc(const char* name, void* fn) {
         o.module = W2U(p);
         size_t s = o.module.find_last_of("\\/");
         o.moduleName = (s == std::string::npos) ? o.module : o.module.substr(s + 1);
-        o.fromLoader = (_stricmp(o.moduleName.c_str(), "vulkan-1.dll") == 0);
     } else {
         o.module = "(不属于任何已加载模块)";
         o.moduleName = o.module;
     }
-    (void)name;
+    o.owner = ClassifyModule(LowerBaseName(o.moduleName));
     return o;
 }
 
-// 打印一份「分派归属」报告。层只要拦截了这几个函数中的任何一个，
-// 对应的模块名就会从 vulkan-1.dll 变成层 DLL。
-static void ReportDispatch(VkApi& api) {
-    struct Item { const char* name; void* fn; };
-    Item items[] = {
-        { "vkQueuePresentKHR",          (void*)api.vkQueuePresentKHR },
-        { "vkQueueSubmit",              (void*)api.vkQueueSubmit },
-        { "vkAcquireNextImageKHR",      (void*)api.vkAcquireNextImageKHR },
-        { "vkCreateSwapchainKHR",       (void*)api.vkCreateSwapchainKHR },
-        { "vkCreateGraphicsPipelines",  (void*)api.vkCreateGraphicsPipelines },
-        { "vkCmdDraw",                  (void*)api.vkCmdDraw },
-    };
-    int wrapped = 0;
-    Info("[分派归属] 以下函数指针实际落在哪个模块里（层拦截了就会不是 vulkan-1.dll）：");
-    for (auto& it : items) {
-        ProcOrigin o = DescribeProc(it.name, it.fn);
-        if (!o.fromLoader && it.fn) ++wrapped;
-        Info("[分派归属]   %-26s -> %s%s", it.name, o.moduleName.c_str(),
-             o.fromLoader ? "" : "   ← 被层拦截！");
+// 我们关心的函数列表。层只要拦截了其中一个，对应模块名就会变成层 DLL，
+// 于是就有了「层挂上了」的**进程内硬证据**（不用去看 loader 日志）。
+struct DispatchItem { const char* name; void* fn; };
+static DispatchItem g_dispatchItems[8];
+static int          g_dispatchCount = 0;
+
+// 收集 + 打印。返回值里带上"哪些函数被层拦截了"，供 JSON 汇总使用。
+struct DispatchReport {
+    std::string presentModule;
+    bool        presentWrapped = false;
+    int         wrappedCount = 0;
+    std::vector<std::string> attachedLayerDlls;   // 出现在分派表里的层 DLL
+};
+
+static DispatchReport ReportDispatch(VkApi& api) {
+    DispatchReport rep;
+    g_dispatchCount = 0;
+    g_dispatchItems[g_dispatchCount++] = { "vkQueuePresentKHR",         (void*)api.vkQueuePresentKHR };
+    g_dispatchItems[g_dispatchCount++] = { "vkQueueSubmit",             (void*)api.vkQueueSubmit };
+    g_dispatchItems[g_dispatchCount++] = { "vkAcquireNextImageKHR",     (void*)api.vkAcquireNextImageKHR };
+    g_dispatchItems[g_dispatchCount++] = { "vkCreateSwapchainKHR",      (void*)api.vkCreateSwapchainKHR };
+    g_dispatchItems[g_dispatchCount++] = { "vkCreateGraphicsPipelines", (void*)api.vkCreateGraphicsPipelines };
+    g_dispatchItems[g_dispatchCount++] = { "vkCmdDraw",                 (void*)api.vkCmdDraw };
+
+    Info("[分派归属] 每个函数指针实际落在哪个模块里（进程内硬证据，不依赖日志）：");
+    for (int i = 0; i < g_dispatchCount; ++i) {
+        ProcOrigin o = DescribeProc(g_dispatchItems[i].fn);
+        bool isPresent = (strcmp(g_dispatchItems[i].name, "vkQueuePresentKHR") == 0);
+        if (isPresent) { rep.presentModule = o.moduleName; rep.presentWrapped = (o.owner == OWNER_LAYER); }
+        if (o.owner == OWNER_LAYER) {
+            ++rep.wrappedCount;
+            bool dup = false;
+            for (auto& s : rep.attachedLayerDlls) if (s == o.moduleName) dup = true;
+            if (!dup) rep.attachedLayerDlls.push_back(o.moduleName);
+        }
+        Info("[分派归属]   %-26s -> %-28s %s", g_dispatchItems[i].name,
+             o.moduleName.c_str(), OwnerName(o.owner));
     }
-    if (wrapped == 0) {
-        Info("[分派归属] 结论：这 6 个函数目前都由 loader(vulkan-1.dll) 直接分派，"
-             "没有任何层拦截它们。");
-        Info("[分派归属]       （注意：这不等于「没有层被加载」—— 层可能加载了但选择"
-             "不拦截这些函数，或者只拦截了没在这里列出的函数。）");
+
+    if (rep.wrappedCount == 0) {
+        Info("[分派归属] 结论：这 %d 个函数全部直接由 loader/驱动分派，"
+             "**没有任何层拦截它们**。", g_dispatchCount);
+        Info("[分派归属]       注意这不等于「没有层被加载」—— 层可能已加载但选择"
+             "不拦截这些函数。要确认层的加载情况请用 VK_LOADER_DEBUG=layer。");
     } else {
-        Info("[分派归属] 结论：有 %d 个函数被层接管了（见上面标了「被层拦截」的行）。",
-             wrapped);
+        Info("[分派归属] 结论：有 %d 个函数被层拦截，涉及层 DLL：%s",
+             rep.wrappedCount, rep.attachedLayerDlls.empty() ? "(?)" :
+             rep.attachedLayerDlls[0].c_str());
+        Info("[分派归属]       这就是「Vulkan 隐式层成功挂到本进程」的直接证据。");
     }
+    return rep;
 }
 
 // ============================================================================
@@ -1025,8 +1084,8 @@ static WindowSetup ApplyWindowMode(HWND hwnd, int mode, uint32_t wantW, uint32_t
     mi.cbSize = sizeof(mi);
     ::GetMonitorInfoW(mon, &mi);
     const RECT& mr = mi.rcMonitor;
+    // 只用宽度做水平居中；高度不用（窗口模式一律贴显示器顶部往下 80px）
     uint32_t monW = (uint32_t)(mr.right - mr.left);
-    uint32_t monH = (uint32_t)(mr.bottom - mr.top);
 
     DWORD style;
     RECT  rect;
@@ -1036,19 +1095,18 @@ static WindowSetup ApplyWindowMode(HWND hwnd, int mode, uint32_t wantW, uint32_t
         if (FindDisplayMode(wantW, wantH, &dm)) {
             LONG code = ::ChangeDisplaySettingsExW(nullptr, &dm, nullptr, CDS_FULLSCREEN, nullptr);
             if (code == DISP_CHANGE_SUCCESSFUL) {
+                // 切成功了：记住待还原。atexit / Ctrl 处理函数 / 切回窗口模式
+                // 三条路径都会调 RestoreDisplayMode()。
                 g_modeChangedDisplay = true;
                 r.note = "已切换到独占显示模式（CDS_FULLSCREEN）";
-                monW = wantW; monH = wantH;
-                // 切了模式之后显示器信息可能变了，重新取一次
-                ::GetMonitorInfoW(mon, &mi);
-                monW = (uint32_t)(mi.rcMonitor.right - mi.rcMonitor.left);
-                monH = (uint32_t)(mi.rcMonitor.bottom - mi.rcMonitor.top);
             } else {
-                char b[128]; sprintf(b, "ChangeDisplaySettingsEx 失败 code=%ld，回退为无边框全屏", code);
+                char b[160];
+                sprintf(b, "ChangeDisplaySettingsEx 失败 code=%ld，回退为无边框全屏（未改动显示模式）", code);
                 r.note = b;
             }
         } else {
-            char b[128]; sprintf(b, "显示器上没有 %ux%u 的显示模式，回退为无边框全屏", wantW, wantH);
+            char b[160];
+            sprintf(b, "显示器上没有 %ux%u 的显示模式，回退为无边框全屏（未改动显示模式）", wantW, wantH);
             r.note = b;
         }
         style = WS_POPUP | WS_VISIBLE;
@@ -1239,6 +1297,9 @@ struct Renderer {
 
     std::string deviceName;
     uint32_t    apiVersion = 0, driverVersion = 0, vendorID = 0;
+
+    // 「层挂上了没」的探测结果，汇总时写进 JSON
+    DispatchReport dispatchReport;
 
     // ---------- 创建/销毁 ----------
     bool CreateInstanceAndDevice(const Options& o, bool vsync);
@@ -1433,7 +1494,7 @@ bool Renderer::CreateLogicalDevice() {
     Info("[Vulkan] 逻辑设备创建成功");
 
     // 「我的层挂上了没」—— 这是本工具存在的首要理由，所以每次启动都打一份
-    ReportDispatch(api);
+    dispatchReport = ReportDispatch(api);
     return true;
 }
 
@@ -2265,6 +2326,14 @@ struct Emitter {
         }
         layerJson += "]";
 
+        // 出现在分派表里的层 DLL（= 真的挂上并拦截了函数的层）
+        std::string layDlls = "[";
+        for (size_t i = 0; i < R.dispatchReport.attachedLayerDlls.size(); ++i) {
+            if (i) layDlls += ",";
+            layDlls += "\"" + JStr(R.dispatchReport.attachedLayerDlls[i].c_str()) + "\"";
+        }
+        layDlls += "]";
+
         char buf[4096];
         sprintf(buf,
             "{\"type\":\"summary\",\"stop_reason\":\"%s\","
@@ -2276,7 +2345,9 @@ struct Emitter {
             "\"avg_wait_ms\":%.3f,\"avg_cpu_ms\":%.3f,\"avg_gpu_ms\":%.4f,\"avg_present_ms\":%.3f,"
             "\"gpu_timing\":%s,\"device\":\"%s\",\"api_version\":\"%s\","
             "\"w\":%u,\"h\":%u,\"present_mode\":\"%s\",\"fps_cap\":%u,\"window\":\"%s\","
-            "\"vsync\":%s,\"layers_available\":%zu,\"implicit_layers\":%s}",
+            "\"vsync\":%s,\"layers_available\":%zu,\"implicit_layers\":%s,"
+            "\"present_dispatch_module\":\"%s\",\"present_wrapped_by_layer\":%s,"
+            "\"wrapped_functions\":%d,\"attached_layer_dlls\":%s}",
             stopReason,
             s.frames, warmup, frameMs.size(), s.wallSeconds,
             avgFps, avgFt,
@@ -2286,7 +2357,10 @@ struct Emitter {
             JStr(R.deviceName.c_str()).c_str(), VersionStr(R.apiVersion).c_str(),
             R.extent.width, R.extent.height, PresentModeName(R.presentMode), o.fpsCap,
             WindowModeName(o.windowMode), o.vsync ? "true" : "false",
-            layers.size(), layerJson.c_str());
+            layers.size(), layerJson.c_str(),
+            JStr(R.dispatchReport.presentModule.c_str()).c_str(),
+            R.dispatchReport.presentWrapped ? "true" : "false",
+            R.dispatchReport.wrappedCount, layDlls.c_str());
         JsonRaw(buf);
     }
 };
@@ -2394,7 +2468,7 @@ static int RunSim(const Options& o, const std::vector<LayerInfo>& layers) {
                         opt.width = c.a; opt.height = c.b;
                         break;
                     case CMD_MODE:
-                        if (c.a != opt.windowMode) {
+                        if ((int)c.a != opt.windowMode) {
                             opt.windowMode = (int)c.a;
                             WindowSetup s2 = ApplyWindowMode(g_hwnd, opt.windowMode, opt.width, opt.height);
                             Info("[stdin] mode → %s（%s）", WindowModeName(opt.windowMode), s2.note.c_str());
@@ -2724,6 +2798,16 @@ static int RunSim(const Options& o, const std::vector<LayerInfo>& layers) {
     Info("交换链重建次数  : %u", swapRecreatedCount);
     Info("最终 present mode: %s   分辨率: %ux%u", PresentModeName(R.presentMode),
          R.extent.width, R.extent.height);
+    Info("层介入情况      : vkQueuePresentKHR 落在 %s，%s",
+         R.dispatchReport.presentModule.c_str(),
+         R.dispatchReport.presentWrapped ? "**被层拦截**" : "未被层拦截");
+    if (!R.dispatchReport.attachedLayerDlls.empty()) {
+        std::string s2;
+        for (auto& d : R.dispatchReport.attachedLayerDlls) { if (!s2.empty()) s2 += ", "; s2 += d; }
+        Info("                  出现在分派表里的层 DLL: %s", s2.c_str());
+    } else {
+        Info("                  没有任何层 DLL 出现在分派表里");
+    }
     if (!R.gpuTimingOk) Info("GPU 计时不可用原因: %s", R.gpuTimingNote.c_str());
     Info("==========================================");
 
@@ -2784,6 +2868,13 @@ int main(int argc, char** argv) {
 
         int total = (int)layers.size(), nImp = 0, nVkLayer = 0;
         for (auto& li : layers) { if (li.implicit) ++nImp; if (li.name.rfind("VK_LAYER_", 0) == 0) ++nVkLayer; }
+
+        // 把「哪些 DLL 是层」告诉分派探针 —— 它靠这份名单区分
+        // "落在层 DLL 里"（被层拦截）和 "落在 ICD 里"（直接分派，没层介入）。
+        g_knownLayerDlls.clear();
+        for (auto& li : layers) if (!li.libraryPath.empty())
+            g_knownLayerDlls.push_back(LowerBaseName(li.libraryPath));
+        Info("[层] 已登记 %zu 个层 DLL 用于分派归属判定", g_knownLayerDlls.size());
 
         Info("[层] vkEnumerateInstanceLayerProperties 报告 %d 个层，其中 VK_LAYER_* 前缀 %d 个，隐式 %d 个：",
              total, nVkLayer, nImp);
