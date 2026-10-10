@@ -48,6 +48,25 @@ void SimLog(const char* fmt, ...) {
     fflush(stderr);
 }
 
+// 大小写不敏感的字符串相等。
+//
+// 为什么不用 _stricmp / strcasecmp：这两个名字在不同 CRT / 头文件组合里
+// 时有时无（MinGW 头里 _stricmp 是 MSVC 私有名字，clang 可能把它当隐式
+// 声明处理，运行期就变成「永远返回 0」或直接崩），踩过一次就不想再踩。
+// 自己写 12 行最稳，行为完全可预测。
+static bool EqNoCase(const char* a, const char* b) {
+    if (!a || !b) return false;
+    while (*a && *b) {
+        char ca = *a, cb = *b;
+        if (ca >= 'A' && ca <= 'Z') ca = (char)(ca + 32);
+        if (cb >= 'A' && cb <= 'Z') cb = (char)(cb + 32);
+        if (ca != cb) return false;
+        ++a;
+        ++b;
+    }
+    return *a == '\0' && *b == '\0';
+}
+
 const char* SimHrName(long hr) {
     switch ((unsigned long)hr) {
         case 0x00000000UL: return "S_OK";
@@ -86,9 +105,9 @@ const char* SimWindowModeName(SimWindowMode m) {
 
 bool SimWindowModeParse(const char* s, SimWindowMode* out) {
     if (!s || !out) return false;
-    if (!_stricmp(s, "windowed") || !_stricmp(s, "window")) { *out = SimWindowMode::Windowed; return true; }
-    if (!_stricmp(s, "borderless") || !_stricmp(s, "noborder")) { *out = SimWindowMode::Borderless; return true; }
-    if (!_stricmp(s, "fullscreen") || !_stricmp(s, "exclusive") || !_stricmp(s, "fs")) {
+    if (!EqNoCase(s, "windowed") || !EqNoCase(s, "window")) { *out = SimWindowMode::Windowed; return true; }
+    if (!EqNoCase(s, "borderless") || !EqNoCase(s, "noborder")) { *out = SimWindowMode::Borderless; return true; }
+    if (!EqNoCase(s, "fullscreen") || !EqNoCase(s, "exclusive") || !EqNoCase(s, "fs")) {
         *out = SimWindowMode::Fullscreen; return true;
     }
     return false;
@@ -96,10 +115,10 @@ bool SimWindowModeParse(const char* s, SimWindowMode* out) {
 
 static bool ParseBool(const char* s, bool* out) {
     if (!s || !out) return false;
-    if (!_stricmp(s, "on") || !_stricmp(s, "1") || !_stricmp(s, "true") || !_stricmp(s, "yes")) {
+    if (!EqNoCase(s, "on") || !EqNoCase(s, "1") || !EqNoCase(s, "true") || !EqNoCase(s, "yes")) {
         *out = true; return true;
     }
-    if (!_stricmp(s, "off") || !_stricmp(s, "0") || !_stricmp(s, "false") || !_stricmp(s, "no")) {
+    if (!EqNoCase(s, "off") || !EqNoCase(s, "0") || !EqNoCase(s, "false") || !EqNoCase(s, "no")) {
         *out = false; return true;
     }
     return false;
@@ -130,22 +149,21 @@ SimConfig SimParseArgs(int argc, char** argv) {
     std::vector<std::string> args;
     for (int i = 1; i < argc; ++i) args.push_back(argv[i]);
 
-    // 取出第 i 个参数的值：--k=v 已内联，否则吃下一个 argv。
-    auto value_at = [&](size_t i, const std::string& a, size_t eq, const char** val) -> bool {
-        if (eq != std::string::npos) {
-            // 注意：这里返回的是 a 里的临时子串，调用方必须马上用。
-            *val = a.c_str() + eq + 1;
-            return true;
-        }
-        if (i + 1 < args.size()) {
-            *val = args[i + 1].c_str();
-            return true;
-        }
-        return false;
+    // 不需要取值的开关。**必须显式列出来**：早期版本靠「key 不在这个表里
+    // 就吃下一个 argv 当值」来解析，结果 `--json --api=dx11` 会把
+    // `--api=dx11` 当成 --json 的值吃掉，后面的参数全部错位。
+    // 这个 bug 真实发生过（见 README「已知坑」），所以这里改成白名单。
+    auto is_flag = [](const std::string& k) {
+        return k == "hidden" || k == "json" || k == "help" || k == "h" ||
+               k == "list-outputs" || k == "no-stdin" || k == "no-tint" || k == "dump-argv";
     };
 
     for (size_t i = 0; i < args.size(); ++i) {
         const std::string& a = args[i];
+
+        // 单独一个 "--" 之后的内容忽略（方便脚本传占位参数）
+        if (a == "--") break;
+
         if (a.size() < 3 || a[0] != '-' || a[1] != '-') {
             if (a == "-h") { c.error = "__help__"; return c; }
             c.error = "无法识别的参数：" + a;
@@ -154,43 +172,53 @@ SimConfig SimParseArgs(int argc, char** argv) {
         size_t eq = a.find('=');
         std::string key = a.substr(2, (eq == std::string::npos ? a.size() : eq) - 2);
         const char* val = nullptr;
-        bool has_val = (eq != std::string::npos);
-        if (!has_val) {
-            // 无值参数：先看是不是布尔开关
-            if (key == "hidden" || key == "json" || key == "help" || key == "list-outputs" ||
-                key == "no-stdin" || key == "vsync") {
-                // --vsync 后面可能跟 on/off，也可能不跟（默认 on）
-                if (key == "vsync" && i + 1 < args.size() &&
-                    (args[i + 1] == "on" || args[i + 1] == "off")) {
-                    val = args[i + 1].c_str();
-                    ++i;
-                } else {
-                    val = "1";
-                }
-                has_val = true;
+
+        // 取值来源有三条路，顺序不能反（这里踩过坑）：
+        //   1) --key=value  -> 取值就是 '=' 之后的部分
+        //   2) --vsync [on|off] -> 唯一一个「可选取值」的参数，不跟就默认 on
+        //   3) --key value  -> 吃下一个 argv
+        // 开关类参数（--json / --hidden / ...）不取值，也**不消费**下一个 argv：
+        // 早期版本漏了这条，`--json --api=dx11` 会把 --api=dx11 当 --json 的值
+        // 吃掉，后面全错位（见 README「已知坑」）。
+        if (eq != std::string::npos) {
+            val = a.c_str() + eq + 1;
+        } else if (is_flag(key)) {
+            val = "1";
+        } else if (key == "vsync") {
+            if (i + 1 < args.size() && (args[i + 1] == "on" || args[i + 1] == "off")) {
+                val = args[i + 1].c_str();
+                ++i;
+            } else {
+                val = "on";
             }
+        } else if (i + 1 < args.size()) {
+            val = args[i + 1].c_str();
+            ++i;
+        } else {
+            c.error = "参数 --" + key + " 缺少取值";
+            return c;
         }
-        if (!has_val) {
-            if (!value_at(i, a, eq, &val)) {
-                c.error = "参数 --" + key + " 缺少取值";
-                return c;
-            }
-            if (eq == std::string::npos) ++i;  // 吃掉了下一个 argv
-        }
-        // 注意：--k=v 时 val 指向 a.c_str()，a 在本轮结束后仍然有效（args 常驻），
-        // 但循环变量 i 变化不会影响，所以这里直接往下用是安全的。
 
         long long n = 0;
         double d = 0.0;
         bool b = false;
 
+        // 诊断：--dump-argv 时把「这一轮解析出来的 key/value」也打出来，
+        // 定位「参数明明传对了却被拒」这类问题。
+        for (size_t di = 0; di < args.size(); ++di) {
+            if (args[di] == "--dump-argv") {
+                fprintf(stderr, "[sim] parse: raw=<%s> key=<%s> val=<%s>\n", a.c_str(),
+                        key.c_str(), val ? val : "(null)");
+            }
+        }
         if (key == "api") {
-            if (!_stricmp(val, "dx12") || !_stricmp(val, "d3d12") || !_stricmp(val, "12")) {
+            if (EqNoCase(val, "dx12") || EqNoCase(val, "d3d12") || EqNoCase(val, "12")) {
                 c.use_dx12 = true;
-            } else if (!_stricmp(val, "dx11") || !_stricmp(val, "d3d11") || !_stricmp(val, "11")) {
+            } else if (EqNoCase(val, "dx11") || EqNoCase(val, "d3d11") || EqNoCase(val, "11")) {
                 c.use_dx12 = false;
             } else {
-                c.error = "--api 只支持 dx11 / dx12";
+                c.error = std::string("--api 只支持 dx11 / dx12（收到 <") +
+                          (val ? val : "(null)") + ">）";
                 return c;
             }
         } else if (key == "seconds") {
@@ -259,6 +287,9 @@ SimConfig SimParseArgs(int argc, char** argv) {
         c.error = "--seconds 与 --frames 只能给一个（要「先到先退」请用控制命令 quit）";
         return c;
     }
+    // 没给 --seconds / --frames 就是「跑到被要求退出为止」（quit 命令或关窗）。
+    // 这是有意的默认：手动观察画面时不想每次都算时间。
+    if (c.warmup_frames < 0) c.warmup_frames = 0;
     return c;
 }
 

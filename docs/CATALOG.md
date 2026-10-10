@@ -46,7 +46,8 @@
                                     │ CreateRemoteThread + LoadLibraryW
                     ┌───────────────┴─────────────────────────┐
                     │  NextPerfHook.dll（注入游戏，src/hook）   │
-                    │  钩 Present/ResizeBuffers · 采集 · 画面板 │
+                    │  钩 Present · 采集 · 画面板               │
+                    │  ⚠ **ResizeBuffers 目前没有挂钩**         │
                     └─────────────────────────────────────────┘
 ```
 
@@ -101,7 +102,8 @@
 | 交换链 vtable 钩子 | `src/hook/np_hook.cpp` | `PatchSwapChainVtable`、`Patch`、`SwapVtFor` |
 | Present / Present1 | `src/hook/np_hook.cpp` | `PresentCommon`（**核心**） |
 | ResizeBuffers | `src/hook/np_hook.cpp` | （见 `HOOK.md`） |
-| D3D12 命令队列/命令列表 | `src/hook/np_hook.cpp` | `InstallD3D12`（注意函数实现在 **`D3D12Core.dll`**） |
+| D3D12 命令队列/命令列表 | `src/hook/np_hook.cpp` | `EnsureD3D12Hooks`（注意函数实现在 **`D3D12Core.dll`**） |
+| ~~ResizeBuffers~~ | — | ❌ **未挂钩**（全仓 grep 证实只出现在注释里）。详见下方「下一版第一优先」 |
 | **还原所有补丁（幂等）** | `src/hook/np_hook.cpp` | `RestoreAllHooks`（**两条卸载路径都必须调**） |
 | 干净卸载 | `src/hook/np_hook.cpp` | `SelfUnloadNow`、`NpHookDetach`、`detachPid` 机制 |
 
@@ -167,11 +169,15 @@
 
 | 文件 | 行数 | 职责 |
 |---|---|---|
-| `np_hook.cpp` | ~2100 | **钩子主体**：探测、挂钩、采集、遥测、卸载 |
-| `np_draw.cpp` / `.h` | ~500 / 74 | 游戏内叠加绘制（D3D11 / D3D12 两套） |
-| `np_reflex.h` | ~99 | NVAPI Reflex / 低延迟状态 |
-| `dllmain.cpp` | 20 | DLL 入口 |
-| `np_hook.h` | 5 | 导出声明 |
+| `np_hook.cpp` | 2755 | **钩子主体**：探测、挂钩、采集、遥测、卸载 |
+| `np_draw.cpp` / `.h` | 610 / 104 | 游戏内叠加绘制（D3D11 / D3D12 两套） |
+| `np_reflex.h` | 128 | NVAPI Reflex / 低延迟状态 |
+| `dllmain.cpp` | 26 | DLL 入口 |
+| `np_hook.h` | 7 | 导出声明 |
+
+> ⚠ **行数会漂移**。上面是 2026-10-11 的实测值（由子代理逐个核对）。
+> 用 `Get-Content | Measure-Object -Line` 数出来的值会**偏小**（它会吃掉
+> LF-only 文件的空行），不要用那个口径。
 
 ### 3.3 公共（`src/common/`）
 

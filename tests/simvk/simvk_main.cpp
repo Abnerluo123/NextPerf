@@ -365,6 +365,7 @@ struct Options {
     bool     json      = false;
     bool     listLayers = false;
     bool     showHelp  = false;
+    bool     noStdin   = false;    // 不启动 stdin 命令线程（自动化跑的时候省心）
 };
 
 static const char* WindowModeName(int m) {
@@ -395,6 +396,7 @@ static void PrintUsage() {
 "  --width=W --height=H 窗口/交换链尺寸\n"
 "  --window-mode=M      windowed | borderless | fullscreen\n"
 "  --json               每帧一行 JSON 输出到 stdout（人类可读信息改走 stderr）\n"
+"  --no-stdin           不启动 stdin 命令线程（纯自动化跑，不需要运行时控制时用）\n"
 "  --list-layers        列出系统上所有 Vulkan 层（隐式/显式），然后退出\n"
 "  --help               显示本帮助\n"
 "\n"
@@ -414,6 +416,7 @@ static bool ParseArgs(int argc, char** argv, Options* o) {
         };
         if (strcmp(a, "--help") == 0 || strcmp(a, "-h") == 0) { o->showHelp = true; return true; }
         else if (strcmp(a, "--json") == 0)       o->json = true;
+        else if (strcmp(a, "--no-stdin") == 0)   o->noStdin = true;
         else if (strcmp(a, "--list-layers") == 0) o->listLayers = true;
         else if (const char* v = val("--seconds"))   o->seconds = atof(v);
         else if (const char* v = val("--frames"))    o->frames = (uint32_t)strtoul(v, nullptr, 10);
@@ -1060,14 +1063,35 @@ struct FrameSlot {
 struct FrameRecord {
     bool     valid = false;
     uint32_t id = 0;
-    double   dtMs = 0, cpuMs = 0, acquireMs = 0, submitMs = 0, presentMs = 0, gpuMs = -1;
+    double   dtMs = 0;          // 帧周期（上一帧起点 → 本帧起点）
+    double   waitMs = 0;        // 等本槽位上一轮提交完成（vkWaitForFences）
+    double   acquireMs = 0;     // vkAcquireNextImageKHR
+    double   cpuMs = 0;         // 纯 CPU 干活时间（上传顶点 + 录制 + 提交）
+    double   submitMs = 0;      // 其中 vkQueueSubmit 那一小段
+    double   presentMs = 0;     // vkQueuePresentKHR 进到返回
+    double   gpuMs = -1;        // 本帧 GPU 执行时间（时间戳查询）
     uint32_t imageIndex = 0;
     uint32_t w = 0, h = 0;
     VkPresentModeKHR presentMode = VK_PRESENT_MODE_FIFO_KHR;
     uint32_t fpsCap = 0;
     int      windowMode = 0;
     bool     swapRecreated = false;
+    bool     warmup = false;    // 落在预热期，只输出不计入汇总统计
 };
+
+// 预热期帧数。为什么要丢弃开头这些帧：
+//   驱动要编译管线、填 shader cache，交换链刚建好时 3 张图像都是空闲的
+//   （垂直同步还没开始节流），头几帧的 dt 会低到 0.4ms —— 直接算进统计
+//   会把 P99.9 和 1% Low 拉得一塌糊涂（实测 1% Low 从 58 掉到 30）。
+//   所有正经的 benchmark 工具都会丢弃预热帧，这里也丢，并且**把丢了多少
+//   明确报出来**，不偷偷摸摸。
+static uint32_t WarmupFrameCount(uint32_t totalFrames) {
+    uint32_t w = totalFrames / 5;      // 最多丢 20%
+    if (w > 30) w = 30;                // 也最多丢 30 帧
+    return w;
+}
+// 单帧 JSON 里的 warmup 标记用这个上界（跑完之前不知道总帧数，先按上界标）
+static const uint32_t kMaxWarmupFrames = 30;
 
 struct Stats {
     std::vector<double> frameMs;    // 帧间隔
@@ -1075,10 +1099,19 @@ struct Stats {
     std::vector<double> cpuMs;
     std::vector<double> gpuMs;
     std::vector<double> presentMs;
+    std::vector<double> waitMs;
+    std::vector<double> acquireMs;
     uint32_t frames = 0;
     double   wallSeconds = 0;
     static const size_t CAP = 400000;   // 约 2 小时 @60fps，够用且不会吃爆内存
 };
+
+// 取 [from, end) 的子区间（用于剔除预热帧）。用下标而不是拷贝迭代器，
+// 是因为下面所有统计函数都吃 vector<double>。
+static std::vector<double> TailFrom(const std::vector<double>& v, size_t from) {
+    if (from >= v.size()) return std::vector<double>();
+    return std::vector<double>(v.begin() + (ptrdiff_t)from, v.end());
+}
 
 struct Renderer {
     VkApi         api;
@@ -1972,6 +2005,18 @@ static DWORD WINAPI StdinThread(LPVOID) {
     HANDLE h = ::GetStdHandle(STD_INPUT_HANDLE);
     if (!h || h == INVALID_HANDLE_VALUE) return 0;
 
+    // stdin 的类型决定了「读到 EOF」该怎么理解 —— 这一步不做的话会踩坑：
+    //   * 管道 (FILE_TYPE_PIPE)：驱动方 process.stdin.close() 会让我们读到 EOF，
+    //     这时候**应该**退出，否则管道关了程序还在傻跑。
+    //   * 磁盘文件 (FILE_TYPE_DISK)：`simvk.exe < cmds.txt` 读完就是 EOF，
+    //     但那是"命令读完了"，不是"让我退出"，不应该退出。
+    //   * 控制台 (FILE_TYPE_CHAR)：ReadFile 会一直阻塞等输入，不会立刻 EOF。
+    //   * 无效/未知：干脆不启动命令处理。
+    // （最初的版本把任何 EOF 都当 quit，结果从某些启动器运行时 stdin 天生就是
+    //   EOF，程序 0 帧就退出了。）
+    DWORD ft = ::GetFileType(h);
+    bool eofMeansQuit = (ft == FILE_TYPE_PIPE);
+
     std::string buf;
     char chunk[512];
     for (;;) {
@@ -1979,12 +2024,12 @@ static DWORD WINAPI StdinThread(LPVOID) {
         // 用 ReadFile 而不是 std::getline：管道输入时 std::cin 的缓冲行为和
         // 控制台不一样，而我们要的就是「来一行处理一行」，ReadFile 最直观。
         if (!::ReadFile(h, chunk, sizeof(chunk), &got, nullptr) || got == 0) {
-            // stdin 关闭（Python 驱动方 process.stdin.close()）→ 视为 quit。
-            // 这个行为很重要：否则管道关了以后程序会一直跑到 --seconds 才退。
-            ::EnterCriticalSection(&g_cmdLock);
-            Command c; c.kind = CMD_QUIT;
-            g_cmdQueue.push_back(c);
-            ::LeaveCriticalSection(&g_cmdLock);
+            if (eofMeansQuit) {
+                ::EnterCriticalSection(&g_cmdLock);
+                Command c; c.kind = CMD_QUIT;
+                g_cmdQueue.push_back(c);
+                ::LeaveCriticalSection(&g_cmdLock);
+            }
             return 0;
         }
         buf.append(chunk, got);
@@ -2057,54 +2102,65 @@ struct Emitter {
     // 这一槽位的 fence 被 signal（= 提交完成），而那要等到 kFramesInFlight
     // 帧之后。所以 JSON 行虽然**顺序正确、一帧不落**，但**滞后
     // kFramesInFlight 帧**才吐出来。这一点在 README 里写明了。
+    //
+    // 时间口径（这是本工具最该讲清楚的东西）：
+    //   dt_ms = 帧周期 = wait + acquire + cpu + present + 锁帧睡眠
+    //   cpu_ms 只算**真正在 CPU 上干活**的那一段（上传顶点 + 录制 + 提交），
+    //         绝不包含等待。这是踩过坑才定死的：如果从帧首开始计时，
+    //         开垂直同步时它会恒等于 16.67ms —— 那是帧周期，不是 CPU 的活。
+    //   wait_ms 是卡在 vkWaitForFences 里的时间。**实测发现垂直同步的等待
+    //         主要落在这里**（现代 WDDM 翻转模型下 vkQueuePresentKHR 几乎
+    //         不阻塞），所以这一段必须单独报出来，否则 CPU 帧时间会被算错。
     static void EmitFrame(const FrameRecord& r, uint32_t framesInFlight) {
-        char buf[1024];
-        if (r.gpuMs >= 0.0) {
-            sprintf(buf,
-                "{\"type\":\"frame\",\"frame\":%u,\"lag_frames\":%u,\"dt_ms\":%.3f,\"fps\":%.2f,"
-                "\"cpu_ms\":%.3f,\"gpu_ms\":%.3f,\"present_ms\":%.3f,\"acquire_ms\":%.3f,"
-                "\"submit_ms\":%.3f,\"image\":%u,\"w\":%u,\"h\":%u,\"present_mode\":\"%s\","
-                "\"fps_cap\":%u,\"window\":\"%s\",\"swap_recreated\":%d}",
-                r.id, framesInFlight, r.dtMs, r.dtMs > 0 ? 1000.0 / r.dtMs : 0.0,
-                r.cpuMs, r.gpuMs, r.presentMs, r.acquireMs, r.submitMs,
-                r.imageIndex, r.w, r.h, PresentModeName(r.presentMode), r.fpsCap,
-                WindowModeName(r.windowMode), r.swapRecreated ? 1 : 0);
-        } else {
-            // gpu_ms = -1：驱动不支持时间戳查询，或该帧读数作废。
-            // 这里明确输出 -1 而不是 0，避免下游把「没测到」当成「耗时为 0」。
-            sprintf(buf,
-                "{\"type\":\"frame\",\"frame\":%u,\"lag_frames\":%u,\"dt_ms\":%.3f,\"fps\":%.2f,"
-                "\"cpu_ms\":%.3f,\"gpu_ms\":-1,\"present_ms\":%.3f,\"acquire_ms\":%.3f,"
-                "\"submit_ms\":%.3f,\"image\":%u,\"w\":%u,\"h\":%u,\"present_mode\":\"%s\","
-                "\"fps_cap\":%u,\"window\":\"%s\",\"swap_recreated\":%d}",
-                r.id, framesInFlight, r.dtMs, r.dtMs > 0 ? 1000.0 / r.dtMs : 0.0,
-                r.cpuMs, r.presentMs, r.acquireMs, r.submitMs,
-                r.imageIndex, r.w, r.h, PresentModeName(r.presentMode), r.fpsCap,
-                WindowModeName(r.windowMode), r.swapRecreated ? 1 : 0);
-        }
+        char buf[1200];
+        // dt 极小（交换链刚建好那几帧）时不要算出 10000000 这种离谱 FPS
+        double fps = (r.dtMs > 0.01) ? (1000.0 / r.dtMs) : 0.0;
+        char gpuField[32];
+        if (r.gpuMs >= 0.0) sprintf(gpuField, "%.4f", r.gpuMs);
+        else                sprintf(gpuField, "-1");
+        sprintf(buf,
+            "{\"type\":\"frame\",\"frame\":%u,\"lag_frames\":%u,\"warmup\":%d,"
+            "\"dt_ms\":%.3f,\"fps\":%.2f,"
+            "\"wait_ms\":%.3f,\"acquire_ms\":%.3f,\"cpu_ms\":%.3f,"
+            "\"submit_ms\":%.3f,\"present_ms\":%.3f,\"gpu_ms\":%s,"
+            "\"image\":%u,\"w\":%u,\"h\":%u,\"present_mode\":\"%s\","
+            "\"fps_cap\":%u,\"window\":\"%s\",\"swap_recreated\":%d}",
+            r.id, framesInFlight, r.warmup ? 1 : 0,
+            r.dtMs, fps,
+            r.waitMs, r.acquireMs, r.cpuMs, r.submitMs, r.presentMs, gpuField,
+            r.imageIndex, r.w, r.h, PresentModeName(r.presentMode),
+            r.fpsCap, WindowModeName(r.windowMode), r.swapRecreated ? 1 : 0);
         JsonRaw(buf);
     }
 
     static void EmitSummary(const Stats& s, const Renderer& R, const Options& o,
                             const std::vector<LayerInfo>& layers, const char* stopReason) {
-        std::vector<double> ftAsc = s.frameMs, fpsAsc = s.fps;
-        std::vector<double> ftDesc = s.frameMs;
+        // 剔除预热帧后再统计
+        uint32_t warmup = WarmupFrameCount(s.frames);
+        std::vector<double> frameMs = TailFrom(s.frameMs, warmup);
+        std::vector<double> fpsV    = TailFrom(s.fps, warmup);
+        std::vector<double> cpuV    = TailFrom(s.cpuMs, warmup);
+        std::vector<double> gpuV    = TailFrom(s.gpuMs, warmup);
+        std::vector<double> presV   = TailFrom(s.presentMs, warmup);
+        std::vector<double> waitV   = TailFrom(s.waitMs, warmup);
+
+        std::vector<double> ftAsc = frameMs, ftDesc = frameMs;
         std::sort(ftAsc.begin(), ftAsc.end());
-        std::sort(fpsAsc.begin(), fpsAsc.end());
+        std::sort(fpsV.begin(), fpsV.end());
         std::sort(ftDesc.begin(), ftDesc.end(), std::greater<double>());
 
         double avgFps = 0, avgFt = 0, p50 = 0, p99 = 0, p999 = 0;
         double low1 = 0, low01 = 0, low1avg = 0, low01avg = 0;
-        if (!s.frameMs.empty()) {
+        if (!frameMs.empty()) {
             double sum = 0;
-            for (double v : s.frameMs) sum += v;
-            avgFt = sum / (double)s.frameMs.size();
+            for (double v : frameMs) sum += v;
+            avgFt = sum / (double)frameMs.size();
             avgFps = avgFt > 0 ? 1000.0 / avgFt : 0.0;
             p50   = Percentile(ftAsc, 0.50);
             p99   = Percentile(ftAsc, 0.99);
             p999  = Percentile(ftAsc, 0.999);
-            low1   = Percentile(fpsAsc, 0.01);
-            low01  = Percentile(fpsAsc, 0.001);
+            low1   = Percentile(fpsV, 0.01);
+            low01  = Percentile(fpsV, 0.001);
             low1avg  = LowFpsAvgWorst(ftDesc, 0.01);
             low01avg = LowFpsAvgWorst(ftDesc, 0.001);
         }
@@ -2113,9 +2169,10 @@ struct Emitter {
             double s2 = 0; for (double x : v) s2 += x;
             return s2 / (double)v.size();
         };
-        double avgCpu = avgOf(s.cpuMs), avgGpu = avgOf(s.gpuMs), avgPres = avgOf(s.presentMs);
+        double avgCpu = avgOf(cpuV), avgGpu = avgOf(gpuV),
+               avgPres = avgOf(presV), avgWait = avgOf(waitV);
 
-        // 启用的层名
+        // 隐式层名（NextPerf 将来的层会出现在这个列表里）
         std::string layerJson = "[";
         int nImp = 0;
         for (size_t i = 0; i < layers.size(); ++i) {
@@ -2129,17 +2186,21 @@ struct Emitter {
 
         char buf[4096];
         sprintf(buf,
-            "{\"type\":\"summary\",\"stop_reason\":\"%s\",\"frames\":%u,\"seconds\":%.3f,"
+            "{\"type\":\"summary\",\"stop_reason\":\"%s\","
+            "\"frames_total\":%u,\"warmup_excluded\":%u,\"frames_counted\":%zu,"
+            "\"seconds\":%.3f,"
             "\"avg_fps\":%.2f,\"avg_frame_ms\":%.3f,"
             "\"ft_p50_ms\":%.3f,\"ft_p99_ms\":%.3f,\"ft_p999_ms\":%.3f,"
             "\"low1_fps\":%.2f,\"low01_fps\":%.2f,\"low1_avg_fps\":%.2f,\"low01_avg_fps\":%.2f,"
-            "\"avg_cpu_ms\":%.3f,\"avg_gpu_ms\":%.3f,\"avg_present_ms\":%.3f,"
+            "\"avg_wait_ms\":%.3f,\"avg_cpu_ms\":%.3f,\"avg_gpu_ms\":%.4f,\"avg_present_ms\":%.3f,"
             "\"gpu_timing\":%s,\"device\":\"%s\",\"api_version\":\"%s\","
             "\"w\":%u,\"h\":%u,\"present_mode\":\"%s\",\"fps_cap\":%u,\"window\":\"%s\","
             "\"vsync\":%s,\"layers_available\":%zu,\"implicit_layers\":%s}",
-            stopReason, s.frames, s.wallSeconds, avgFps, avgFt,
+            stopReason,
+            s.frames, warmup, frameMs.size(), s.wallSeconds,
+            avgFps, avgFt,
             p50, p99, p999, low1, low01, low1avg, low01avg,
-            avgCpu, avgGpu, avgPres,
+            avgWait, avgCpu, avgGpu, avgPres,
             R.gpuTimingOk ? "true" : "false",
             JStr(R.deviceName.c_str()).c_str(), VersionStr(R.apiVersion).c_str(),
             R.extent.width, R.extent.height, PresentModeName(R.presentMode), o.fpsCap,
@@ -2191,9 +2252,25 @@ static int RunSim(const Options& o, const std::vector<LayerInfo>& layers) {
     // stdin 必须在**独立线程**上读：渲染循环不能阻塞在 ReadFile 上。
     // 命令通过 g_cmdQueue 交给渲染线程执行 —— 所有 Vulkan 调用都留在主线程，
     // 避免多线程访问 device 带来的同步问题。
-    HANDLE stdinThread = ::CreateThread(nullptr, 0, StdinThread, nullptr, 0, nullptr);
-    if (!stdinThread) Info("[警告] 无法创建 stdin 线程，运行时命令不可用（GetLastError=%lu）", ::GetLastError());
-    else Info("[运行] stdin 命令线程已启动");
+    HANDLE stdinThread = nullptr;
+    if (opt.noStdin) {
+        Info("[运行] --no-stdin：不启动 stdin 命令线程");
+    } else {
+        HANDLE hIn = ::GetStdHandle(STD_INPUT_HANDLE);
+        DWORD  ft  = (hIn && hIn != INVALID_HANDLE_VALUE) ? ::GetFileType(hIn) : FILE_TYPE_UNKNOWN;
+        const char* tn = (ft == FILE_TYPE_PIPE) ? "管道（EOF 视为 quit）"
+                       : (ft == FILE_TYPE_CHAR) ? "控制台"
+                       : (ft == FILE_TYPE_DISK) ? "重定向文件（EOF 不退出）"
+                       : "未知/无效（命令不可用）";
+        Info("[运行] stdin 类型: %s", tn);
+        if (ft == FILE_TYPE_UNKNOWN) {
+            Info("[运行] 没有可用的 stdin，跳过命令线程（这不影响渲染）");
+        } else {
+            stdinThread = ::CreateThread(nullptr, 0, StdinThread, nullptr, 0, nullptr);
+            if (!stdinThread) Info("[警告] 无法创建 stdin 线程，运行时命令不可用（GetLastError=%lu）", ::GetLastError());
+            else Info("[运行] stdin 命令线程已启动");
+        }
+    }
 
     while (!g_quit) {
         // ---- 消息泵（必须每帧来一次，否则窗口会「无响应」）
@@ -2260,13 +2337,17 @@ static int RunSim(const Options& o, const std::vector<LayerInfo>& layers) {
         }
         if (g_quit) break;
 
-        // ---- WM_SIZE 攒下来的尺寸变化
+        // ---- WM_SIZE 攒下来的尺寸变化。
+        //      只有当尺寸真的变了才重建交换链：窗口刚创建时 ApplyWindowMode
+        //      会 SetWindowPos，从而触发一次 WM_SIZE，尺寸和刚建好的交换链
+        //      完全一样 —— 那次重建纯属浪费（而且会把第一帧的 dt 打成 0）。
         LONG pw = ::InterlockedExchange(&g_pendingW, 0);
         LONG ph = ::InterlockedExchange(&g_pendingH, 0);
         if (pw > 0 && ph > 0) {
             opt.width  = (uint32_t)pw;
             opt.height = (uint32_t)ph;
-            wantRecreate = true;
+            if ((uint32_t)pw != R.extent.width || (uint32_t)ph != R.extent.height)
+                wantRecreate = true;
         }
 
         // ---- 最小化：不渲染，也不计帧。真实游戏也是这么 idle 的。
@@ -2307,8 +2388,14 @@ static int RunSim(const Options& o, const std::vector<LayerInfo>& layers) {
         uint32_t slot = frameId % kFramesInFlight;
         ++frameId;
 
-        // 1) 等这个槽位上一轮的提交完成
+        // 1) 等这个槽位上一轮的提交完成。
+        //    ★ 实测发现：开垂直同步时的等待**主要发生在这里**，而不是
+        //      vkQueuePresentKHR。现代 WDDM 的翻转模型下 Present 很快返回，
+        //      节流体现为「这一槽位的 fence 迟迟不 signal」。所以这一段必须
+        //      单独计时，否则会被误算进 CPU 帧时间。
+        double tw0 = QpcMs();
         VkResult wr = R.api.vkWaitForFences(R.device, 1, &R.slots[slot].inFlight, VK_TRUE, 1000000000ull);
+        double waitMs = QpcMs() - tw0;
         if (wr == VK_TIMEOUT) {
             Info("[警告] vkWaitForFences 超时（1s），跳过本帧");
             --frameId;
@@ -2334,11 +2421,12 @@ static int RunSim(const Options& o, const std::vector<LayerInfo>& layers) {
                 done.gpuMs = gpuMs;
                 if (o.json) Emitter::EmitFrame(done, kFramesInFlight);
                 else if ((done.id % 60) == 0) {
-                    Info("[帧 %u] dt=%.2fms fps=%.1f cpu=%.3fms gpu=%s present=%.2fms %ux%u %s",
-                         done.id, done.dtMs, done.dtMs > 0 ? 1000.0 / done.dtMs : 0.0,
-                         done.cpuMs,
-                         done.gpuMs >= 0 ? (std::to_string(done.gpuMs) + "ms").c_str() : "n/a",
-                         done.presentMs, done.w, done.h, PresentModeName(done.presentMode));
+                    char g[32];
+                    if (done.gpuMs >= 0) sprintf(g, "%.4f", done.gpuMs); else sprintf(g, "n/a");
+                    Info("[帧 %u] dt=%.2fms fps=%.1f | 等待=%.3f 取图=%.3f CPU=%.3f 提交=%.3f Present=%.3f GPU=%s ms | %ux%u %s",
+                         done.id, done.dtMs, (done.dtMs > 0.01 ? 1000.0 / done.dtMs : 0.0),
+                         done.waitMs, done.acquireMs, done.cpuMs, done.submitMs, done.presentMs,
+                         g, done.w, done.h, PresentModeName(done.presentMode));
                 }
                 // 统计里补上 GPU 时间
                 if (done.gpuMs >= 0 && stats.gpuMs.size() < Stats::CAP) stats.gpuMs.push_back(done.gpuMs);
@@ -2369,6 +2457,8 @@ static int RunSim(const Options& o, const std::vector<LayerInfo>& layers) {
         }
 
         // 4) 上传本帧顶点数据（此时该槽位的 fence 已被等到，GPU 不会读它）
+        //    ── 从这里开始才是「CPU 真正在干活」，cpu_ms 就从这里量起 ──
+        double tWork = QpcMs();
         R.WriteVertices(slot, frameId);
 
         // 5) 录制
@@ -2398,7 +2488,7 @@ static int RunSim(const Options& o, const std::vector<LayerInfo>& layers) {
             Info("[致命] vkQueueSubmit 失败: %d", (int)sr);
             break;
         }
-        double cpuMs = QpcMs() - tFrameStart;   // 本帧 CPU 侧全部开销
+        double cpuMs = QpcMs() - tWork;   // 纯 CPU 干活时间（不含任何等待）
 
         // 7) Present —— 这一步就是将来 NextPerf 的 Vulkan 层要挂钩的地方。
         //    单独计时的原因：垂直同步开着的时候，卡在 Present 里的时间
@@ -2428,28 +2518,36 @@ static int RunSim(const Options& o, const std::vector<LayerInfo>& layers) {
             rec.valid        = true;
             rec.id           = frameId;
             rec.dtMs         = (dt > 0.0) ? dt : 0.0;
+            rec.waitMs       = waitMs;
             rec.cpuMs        = cpuMs;
             rec.acquireMs    = acquireMs;
             rec.submitMs     = submitMs;
             rec.presentMs    = presentMs;
             rec.gpuMs        = -1.0;
             rec.imageIndex   = imageIndex;
-            rec.w            = R.extent.width;
-            rec.h            = R.extent.height;
+            rec.w           = R.extent.width;
+            rec.h           = R.extent.height;
             rec.presentMode  = R.presentMode;
             rec.fpsCap       = opt.fpsCap;
             rec.windowMode   = opt.windowMode;
             rec.swapRecreated = swapRecreatedThisFrame;
+            // 前 kMaxWarmupFrames 帧在单帧输出里标 warmup=1（供下游自行取舍）；
+            // 汇总统计里实际剔除的是 WarmupFrameCount(总帧数)，见 EmitSummary。
+            rec.warmup       = (frameId <= kMaxWarmupFrames);
         }
         swapRecreatedThisFrame = false;
 
-        // 9) 统计（GPU 时间在上面读到时补进去）
+        // 9) 统计（GPU 时间在上面读到时补进去）。
+        //    所有帧都进统计，预热帧在出汇总时再按 WarmupFrameCount 剔除 ——
+        //    这样最后才知道总共跑了多少帧，也就能按比例决定丢多少。
         ++stats.frames;
         if (stats.frameMs.size() < Stats::CAP) {
             stats.frameMs.push_back(dt);
             stats.fps.push_back(dt > 0 ? 1000.0 / dt : 0.0);
             stats.cpuMs.push_back(cpuMs);
             stats.presentMs.push_back(presentMs);
+            stats.waitMs.push_back(waitMs);
+            stats.acquireMs.push_back(acquireMs);
         }
 
         // 10) 窗口标题上滚动显示帧号 —— 肉眼确认「真的在出帧」的最快方式，
@@ -2497,14 +2595,29 @@ static int RunSim(const Options& o, const std::vector<LayerInfo>& layers) {
     Info("================== 汇总 ==================");
     Info("退出原因        : %s", stopReason);
     Info("提交帧数        : %u（JSON 输出 %u 行）", stats.frames, emittedFrames);
+
+    // 和 EmitSummary 用同一套口径：剔除预热帧再统计
+    uint32_t warmup = WarmupFrameCount(stats.frames);
+    std::vector<double> sFt   = TailFrom(stats.frameMs, warmup);
+    std::vector<double> sFps  = TailFrom(stats.fps, warmup);
+    std::vector<double> sCpu  = TailFrom(stats.cpuMs, warmup);
+    std::vector<double> sGpu  = TailFrom(stats.gpuMs, warmup);
+    std::vector<double> sPres = TailFrom(stats.presentMs, warmup);
+    std::vector<double> sWait = TailFrom(stats.waitMs, warmup);
+    auto avgOf = [](const std::vector<double>& v) {
+        if (v.empty()) return -1.0;
+        double s2 = 0; for (double x : v) s2 += x;
+        return s2 / (double)v.size();
+    };
+
     Info("运行时长        : %.3f s", stats.wallSeconds);
-    if (!stats.frameMs.empty()) {
-        std::vector<double> ft = stats.frameMs, fps = stats.fps, ftd = stats.frameMs;
+    Info("统计样本        : %zu 帧（已剔除开头 %u 帧预热期）", sFt.size(), warmup);
+    if (!sFt.empty()) {
+        std::vector<double> ft = sFt, fps = sFps, ftd = sFt;
         std::sort(ft.begin(), ft.end());
         std::sort(fps.begin(), fps.end());
         std::sort(ftd.begin(), ftd.end(), std::greater<double>());
-        double sum = 0; for (double v : stats.frameMs) sum += v;
-        double avgFt = sum / (double)stats.frameMs.size();
+        double avgFt = avgOf(sFt);
         Info("平均帧率        : %.2f FPS（平均帧时间 %.3f ms）",
              avgFt > 0 ? 1000.0 / avgFt : 0.0, avgFt);
         Info("帧时间 P50      : %.3f ms", Percentile(ft, 0.50));
@@ -2514,18 +2627,18 @@ static int RunSim(const Options& o, const std::vector<LayerInfo>& layers) {
         Info("0.1%% Low(FPS P0.1): %.2f FPS", Percentile(fps, 0.001));
         Info("1%% Low (PresentMon 口径: 最慢 1%% 帧平均)   : %.2f FPS", LowFpsAvgWorst(ftd, 0.01));
         Info("0.1%% Low(PresentMon 口径)                  : %.2f FPS", LowFpsAvgWorst(ftd, 0.001));
+    } else {
+        Info("（样本不足，跳过百分位统计）");
     }
     {
-        auto avgOf = [](const std::vector<double>& v) {
-            if (v.empty()) return -1.0;
-            double s2 = 0; for (double x : v) s2 += x;
-            return s2 / (double)v.size();
-        };
-        double a = avgOf(stats.cpuMs), b = avgOf(stats.gpuMs), c = avgOf(stats.presentMs);
-        Info("平均 CPU 帧时间 : %.3f ms", a);
-        Info("平均 GPU 帧时间 : %s", b >= 0 ? (std::to_string(b) + " ms").c_str()
-                                          : "n/a（时间戳查询不可用）");
-        Info("平均 Present 阻塞: %.3f ms", c);
+        double a = avgOf(sCpu), b = avgOf(sGpu), c = avgOf(sPres), d = avgOf(sWait);
+        double e = avgOf(TailFrom(stats.acquireMs, warmup));
+        Info("平均 等待(WaitForFences): %.3f ms   ← 开 vsync 时等待主要在这里", d);
+        Info("平均 取图(AcquireNextImg): %.3f ms", e);
+        Info("平均 CPU 帧时间         : %.3f ms   （只算真正干活，不含等待）", a);
+        Info("平均 GPU 帧时间         : %s", b >= 0 ? (std::to_string(b) + " ms").c_str()
+                                                   : "n/a（时间戳查询不可用）");
+        Info("平均 Present 阻塞       : %.3f ms", c);
     }
     Info("交换链重建次数  : %u", swapRecreatedCount);
     Info("最终 present mode: %s   分辨率: %ux%u", PresentModeName(R.presentMode),

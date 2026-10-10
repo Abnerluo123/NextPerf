@@ -264,6 +264,9 @@ NPTelemetry* gTel = nullptr;
 
 CRITICAL_SECTION gCs;
 bool             gInPresent = false;
+// 崩溃快照里的 inPresent 是镜像 gInPresent 的（见文件前面 gDbg* 的说明）。
+// ⚠ 它原来只声明、从不赋值 -> SEH ctx 里 inPresent 恒为 0（子代理审计发现）。
+//   凡是镜像量都必须在**每一处**赋值点同步，否则比不报还糟（会误导定位）。
 std::atomic<bool> gReady{false};
 std::atomic<uint32_t> gSeq{0};
 
@@ -1214,7 +1217,8 @@ HRESULT PresentCommon(IDXGISwapChain* sc, UINT sync, UINT flags,
     if (!gTel || !sc) return CallOriginal();
     if (gInPresent) return CallOriginal();
     gInPresent = true;
-    if (!SehReady()) { gInPresent = false; return CallOriginal(); }
+    gDbgInPresent = 1;   // 镜像给崩溃快照（漏了会让 SEH ctx 的 inPresent 恒报 0）
+    if (!SehReady()) { gInPresent = false; gDbgInPresent = 0; return CallOriginal(); }
     if (setjmp(gJmp) != 0) {
         gJmpArmed = false;
         gInPresent = false;
@@ -1745,6 +1749,7 @@ HRESULT PresentCommon(IDXGISwapChain* sc, UINT sync, UINT flags,
     // 不然它们会被算进本帧，让「本帧第一次提交」的时刻变得毫无意义。
     gFrameStarted = false;
     gInPresent = false;
+    gDbgInPresent = 0;
     return hr;
 }
 
