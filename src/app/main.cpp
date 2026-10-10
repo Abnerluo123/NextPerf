@@ -9,7 +9,7 @@
 #include "np_app.h"
 
 #include <tlhelp32.h>   // CreateToolhelp32Snapshot（扫描进程，用于自动注入 + 反作弊检测）
-#include <psapi.h>      // EnumProcessModules / GetModuleFileNameExW（查目标进程加载的反作弊模块）
+#include <psapi.h>      // （目前未使用；保留以免将来需要时再动 include 区）
 #include <shellapi.h>
 #include <algorithm>
 #include <cstdarg>
@@ -372,39 +372,6 @@ static bool NameIsAntiCheat(const std::wstring& raw) {
     return false;
 }
 
-// 目标进程自身是否加载了反作弊模块（跨位数枚举不到，返回 false，由第 2 条兜底）
-static bool ProcessHasAntiCheatModule(DWORD pid) {
-    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, FALSE, pid);
-    if (!h) return false;
-    typedef BOOL(WINAPI * EnumMods_t)(HANDLE, HMODULE*, DWORD, LPDWORD);
-    static EnumMods_t enumMods = nullptr;
-    static bool tried = false;
-    if (!tried) {
-        tried = true;
-        HMODULE ps = GetModuleHandleW(L"psapi.dll");
-        if (!ps) ps = LoadLibraryW(L"psapi.dll");
-        if (ps) enumMods = reinterpret_cast<EnumMods_t>(GetProcAddress(ps, "EnumProcessModules"));
-    }
-    bool hit = false;
-    if (enumMods) {
-        HMODULE mods[256]{};
-        DWORD need = 0;
-        if (enumMods(h, mods, sizeof(mods), &need)) {
-            DWORD n = need / sizeof(HMODULE);
-            if (n > 256) n = 256;
-            for (DWORD i = 0; i < n && !hit; ++i) {
-                wchar_t path[MAX_PATH]{};
-                if (GetModuleFileNameExW(h, mods[i], path, MAX_PATH)) {
-                    const wchar_t* base = wcsrchr(path, L'\\');
-                    if (NameIsAntiCheat(base ? base + 1 : path)) hit = true;
-                }
-            }
-        }
-    }
-    CloseHandle(h);
-    return hit;
-}
-
 // 当前是否有反作弊进程在运行（进程名匹配；5 秒缓存，不必每帧扫）
 static bool AnyAntiCheatRunning() {
     static uint32_t sLastScan = 0;
@@ -426,45 +393,47 @@ static bool AnyAntiCheatRunning() {
     return sCached;
 }
 
-// 目标进程是否**真的加载了 D3D/DXGI**。
+// ---------------------------------------------------------------------------
+// 「这个前台窗口像不像游戏」—— 全部用**窗口属性**判断，不打开目标进程。
 //
-// 这是「像不像游戏」的核心判据 —— 光看「有可见的大窗口」是不够的：
-// 微信、浏览器、梯子客户端全都有大窗口，实测**都被误注入了**（用户反馈）。
-// 真 D3D 游戏必然加载 d3d11 / d3d12 / dxgi 之一。
-// ⚠ 跨位数时枚举不到模块，此时返回 false（宁可不注入，也不要乱注入）。
-static bool ProcessLoadsD3D(DWORD pid) {
-    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, FALSE, pid);
-    if (!h) return false;
-    typedef BOOL(WINAPI * EnumMods_t)(HANDLE, HMODULE*, DWORD, LPDWORD);
-    static EnumMods_t enumMods = nullptr;
-    static bool tried = false;
-    if (!tried) {
-        tried = true;
-        HMODULE ps = GetModuleHandleW(L"psapi.dll");
-        if (!ps) ps = LoadLibraryW(L"psapi.dll");
-        if (ps) enumMods = reinterpret_cast<EnumMods_t>(GetProcAddress(ps, "EnumProcessModules"));
-    }
-    bool hit = false;
-    if (enumMods) {
-        HMODULE mods[512]{};
-        DWORD need = 0;
-        if (enumMods(h, mods, sizeof(mods), &need)) {
-            DWORD n = need / sizeof(HMODULE);
-            if (n > 512) n = 512;
-            for (DWORD k = 0; k < n && !hit; ++k) {
-                wchar_t path[MAX_PATH]{};
-                if (!GetModuleFileNameExW(h, mods[k], path, MAX_PATH)) continue;
-                const wchar_t* base = wcsrchr(path, L'\\');
-                if (!base) base = path;
-                if (_wcsicmp(base, L"d3d11.dll") == 0 || _wcsicmp(base, L"d3d12.dll") == 0 ||
-                    _wcsicmp(base, L"dxgi.dll") == 0) {
-                    hit = true;
+// 调研结论：RTSS / Special K / PowerToys 这类工具判断全屏游戏，走的都是
+// 「窗口扩展样式 + 显示器几何 + DWM 状态」这条路，而不是去枚举目标进程的模块 ——
+// 后者既不可靠（UWP/受保护进程打不开，实测把生化危机8 误判成「不是游戏」），
+// 又有副作用（枚举受保护进程的模块可能把它搞崩，实测游戏待机闪退）。
+// ---------------------------------------------------------------------------
+static bool WindowLooksLikeGame(HWND fg) {
+    if (!fg || !IsWindowVisible(fg)) return false;
+
+    // 1) WS_EX_NOREDIRECTIONBITMAP：DirectComposition 合成目标。
+    //    DX12 flip 模型游戏与 UWP 应用都用它 —— **最强信号**。
+    //    微信 / 浏览器 / 梯子客户端不会有这个样式。
+    LONG_PTR ex = GetWindowLongPtrW(fg, GWL_EXSTYLE);
+    if ((ex & WS_EX_NOREDIRECTIONBITMAP) != 0) return true;
+
+    // 2) 窗口矩形正好覆盖某个显示器的完整区域 -> 独占全屏 / 无边框全屏
+    RECT rc{};
+    if (GetWindowRect(fg, &rc)) {
+        const int w = rc.right - rc.left, h = rc.bottom - rc.top;
+        if (w >= 640 && h >= 360) {
+            for (int i = 0; i < 8; ++i) {
+                DISPLAY_DEVICEW dd{};
+                dd.cb = sizeof(dd);
+                if (!EnumDisplayDevicesW(nullptr, (DWORD)i, &dd, 0)) break;
+                if (!(dd.StateFlags & DISPLAY_DEVICE_ACTIVE)) continue;
+                DEVMODEW dm{};
+                dm.dmSize = sizeof(dm);
+                if (EnumDisplaySettingsExW(dd.DeviceName, ENUM_CURRENT_SETTINGS, &dm, 0) &&
+                    (int)dm.dmPelsWidth == w && (int)dm.dmPelsHeight == h) {
+                    return true;   // 像素尺寸与显示器完全一致
                 }
             }
         }
     }
-    CloseHandle(h);
-    return hit;
+
+    // 到这里没有命中任何「游戏特征」—— 交给调用方跳过
+    // （注：本来还想用 DwmGetWindowAttribute(DWMWA_CLOAKED) 再排除一次被 DWM
+    //   隐藏的窗口，但那要额外链接 dwmapi、而前两条判据已经够用，所以不加依赖。）
+    return false;
 }
 
 static DWORD    gAutoCand = 0;
@@ -520,17 +489,28 @@ static void AppAutoInjectTick() {
     }
     if (NameLooksNonGame(gApp.foreName)) { gAutoCand = 0; return; }
 
-    // ★ 必须**真的加载了 D3D/DXGI** —— 光有大窗口会把微信/浏览器/梯子全放进来。
-    if (!ProcessLoadsD3D(pid)) {
+    // ★ 窗口特征判定：WS_EX_NOREDIRECTIONBITMAP（DX12 flip / UWP，最强信号）、
+    //   或窗口矩形与某个显示器完全一致（独占/无边框全屏）。
+    //   命中不了就认为「不像游戏」——宁可不注入，也不要乱注入
+    //   （上一版正因判据太宽，把用户的梯子、微信都注入了）。
+    if (!WindowLooksLikeGame(fg)) {
         static DWORD sLoggedPid = 0;
         if (sLoggedPid != pid) {
             sLoggedPid = pid;
-            AppLog("auto-inject: pid=%lu (%ls) 未加载 d3d11/d3d12/dxgi -> 判定不是 D3D 游戏，跳过",
+            AppLog("auto-inject: pid=%lu (%ls) 窗口无游戏特征"
+                   "（非 DirectComposition 合成、且尺寸不等于任何显示器）-> 跳过",
                    (unsigned long)pid, gApp.foreName.c_str());
         }
         gAutoCand = 0;
         return;
     }
+
+    // ⚠ 这里**不再去枚举目标进程的模块**判断「是不是 D3D 游戏」。
+    //   实测后果有两个：① 微软商店/UWP 应用（如生化危机8）OpenProcess 打不开，
+    //   一律被误判成「不是游戏」而不注入；② 枚举受保护进程的模块可能把它搞崩
+    //   （用户实测「游戏待机一会闪退」很可能就是它）。
+    //   而且有的游戏主界面根本不做 3D 渲染，「用没用 3D」也不能当判据。
+    //   => 判断依据回到「前台 + 窗口特征 + 拒绝清单」，全部不需要碰目标进程。
 
     for (DWORD t : gAutoTried) {
         if (t == pid) return;   // 同一个 pid 只试一次
