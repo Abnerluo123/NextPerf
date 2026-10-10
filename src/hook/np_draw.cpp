@@ -188,13 +188,19 @@ bool Overlay11::Draw(ID3D11Device* dev, ID3D11DeviceContext* ctx, ID3D11Texture2
                px + (size_t)r * stride, (size_t)stride);
     ctx->Unmap(tex_, 0);
 
-    // 后台缓冲 RTV
-    if (rtvSrc_ != backbuffer) {
-        if (rtv_) { rtv_->Release(); rtv_ = nullptr; }
-        if (FAILED(dev->CreateRenderTargetView(backbuffer, nullptr, &rtv_))) return false;
-        rtvSrc_ = backbuffer;
-        rtvSrc_->AddRef();
-    }
+    // ---- 后台缓冲 RTV：**每帧新建，本帧结束就放掉**
+    //
+    // ★★ 原来这里是「缓存 RTV + 对后台缓冲 AddRef」：
+    //       rtvSrc_ = backbuffer;  rtvSrc_->AddRef();
+    //    这是对 DXGI 规则的**严重违反**：应用调用 ResizeBuffers / 切换独占全屏之前，
+    //    必须释放**所有**对后台缓冲的引用。我们长期握着引用、又握着从它创建的 RTV，
+    //    游戏切全屏时 ResizeBuffers 就会失败（DXGI_ERROR_INVALID_CALL），
+    //    而不少游戏不检查这个返回值 —— 直接闪退。
+    //    用户实测完全吻合：**不绘制叠加层不闪退，一绘制就闪退**
+    //    （AddRef 只发生在绘制路径里）。
+    //    代价只是每帧多建一个 RTV，可忽略；换来的是不再干涉游戏的全屏转换。
+    if (rtv_) { rtv_->Release(); rtv_ = nullptr; }
+    if (FAILED(dev->CreateRenderTargetView(backbuffer, nullptr, &rtv_))) return false;
 
     D3D11_TEXTURE2D_DESC bbd{};
     backbuffer->GetDesc(&bbd);
@@ -234,6 +240,14 @@ bool Overlay11::Draw(ID3D11Device* dev, ID3D11DeviceContext* ctx, ID3D11Texture2
 
     // 还原视口，尽量不打扰游戏
     ctx->RSSetViewports(1, &vp);
+    // ★ 立刻解除绑定并释放后台缓冲的 RTV —— 绝不让这个引用活过本帧。
+    //   游戏随后调用 ResizeBuffers / 切独占全屏时，要求后台缓冲引用为 0，
+    //   留着它就会让那次调用失败（进而可能让游戏闪退）。见上面的长注释。
+    if (rtv_) {
+        ctx->OMSetRenderTargets(0, nullptr, nullptr);
+        rtv_->Release();
+        rtv_ = nullptr;
+    }
     return true;
 }
 
