@@ -183,7 +183,11 @@ struct NPConfig {
     // 复用原来的 reserved[0] 槽位 —— NPConfig 的**大小完全不变**，
     // 共享内存的 version(=sizeof) 自检不受影响，旧钩子 DLL 也不会失配。
     uint32_t autoInject;     // 0 = 关（默认）  1 = 检测到 3D 窗口时自动注入
-    uint32_t reserved[7];
+    // Low 帧口径开关（默认关 = 用「窗口平均」，与驱动面板对齐）。
+    // 打开则用「最差 pct% 单帧」的严格口径，适合抓单帧卡顿。
+    // 同样复用 reserved 槽位 —— NPConfig 大小不变。
+    uint32_t lowStrict;
+    uint32_t reserved[6];
 };
 
 // 历史采样环形缓冲：图表曲线的数据源。

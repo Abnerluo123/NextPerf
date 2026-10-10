@@ -314,6 +314,10 @@ static void Layout() {
     // 3D 窗口自动注入：用户要求给开关，**默认关闭**（误注入会打扰无关程序）
     cycle(L"自动注入 3D 窗口", (int*)&gApp.cfg.autoInject, {L"关闭", L"开启"}, {0, 1},
           RX, ry, half);
+    // Low 帧口径：默认「窗口平均」——与驱动面板/游戏内 overlay 的口径一致
+    // （实测 RE8 锁 60：窗口平均 57.1 vs 严格 53.8，驱动显示 59）。
+    // 想抓单帧卡顿就切到「严格」。
+    cycle(L"Low 帧口径", (int*)&gApp.cfg.lowStrict, {L"窗口平均", L"严格"}, {0, 1}, RX, ry, half);
     ry += S(38);
     cycle(L"模拟数据（预览）", (int*)&gApp.cfg.simulate, {L"关闭", L"开启"}, {0, 1}, RX, ry, half);
     // 游戏已经在跑时，Present 只能靠自己造一条临时交换链去挂（见 ProbeSwapChainVtable）。

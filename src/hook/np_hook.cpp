@@ -1057,8 +1057,31 @@ void UpdateTelemetryCommon(const NPConfig& cfg, uint64_t nowQpc, bool realPresen
     uint32_t lowWin = (uint32_t)(t.fpsAvg > 1.0f ? t.fpsAvg : 60.0f);
     if (lowWin < 30) lowWin = 30;
     if (lowWin > 480) lowWin = 480;
-    t.fpsLow1 = gStats.lowPercentileFps(99.0f, lowWin);
-    t.fpsLow01 = gStats.lowPercentileFps(99.9f, lowWin);
+    // ---- Low 帧口径
+    //
+    // 默认走**窗口平均**：把帧时间按 ~500ms 分组求平均，再取最差的那几个窗口。
+    // 依据（用户实机日志，RE8 锁 60）：
+    //     严格（最差 1% 单帧）      = 53.8   与驱动 59 差 5
+    //     窗口平均（win500_1）      = 57.1   **明显更贴近驱动**
+    // 游戏内 overlay 与驱动面板显示的本来就是窗口平均后的 FPS，它们的 low 帧
+    // 也是在平滑后的序列上取的百分位 —— 所以这个口径才和它们对得上。
+    //
+    // 想要「抓单帧卡顿」的严格口径：打开配置里的「Low 帧（严格）」。
+    //
+    // ⚠ 窗口数用**全部样本**（不是 lowWin）：lowWindowed 是在「一批窗口平均值」
+    //   上取百分位，窗口太少时 1% 与 0.1% 会取到同一个窗口、两个数一样。
+    //   全部样本（4096 帧 ≈ 60fps 下 68 秒 ≈ 136 个窗口）下 1% 取 2 个、0.1% 取 1 个。
+    bool strict = (gCfg && gCfg->lowStrict);
+    if (strict) {
+        t.fpsLow1 = gStats.lowPercentileFps(99.0f, lowWin);
+        t.fpsLow01 = gStats.lowPercentileFps(99.9f, lowWin);
+    } else {
+        t.fpsLow1 = gStats.lowWindowed(1.0f, 500.0f, np::FrameStats::kCap);
+        t.fpsLow01 = gStats.lowWindowed(0.1f, 500.0f, np::FrameStats::kCap);
+        // 样本还不够（lowWindowed 少于 4 个窗口会返回 0）时先用严格口径兜底
+        if (t.fpsLow1 <= 0.0f) t.fpsLow1 = gStats.lowPercentileFps(99.0f, lowWin);
+        if (t.fpsLow01 <= 0.0f) t.fpsLow01 = gStats.lowPercentileFps(99.9f, lowWin);
+    }
     t.p99Ms = gStats.percentileMs(99.0f);
     t.p999Ms = gStats.percentileMs(99.9f);
 
