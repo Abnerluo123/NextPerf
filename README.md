@@ -270,7 +270,11 @@ docs/           **代码文档（改代码请同步更新）**
 ## 参考过的开源项目
 
 * **[Intel PresentMon](https://github.com/GameTechDev/PresentMon)** ——
-  Low 帧口径直接对齐它（1 秒滑动窗口 + 对 FPS 取 P1），
+  **CPU Busy / CPU Wait 的拆分公式来自它**（MetricsCalculatorCpuGpu.cpp）：
+    msCPUBusy = 上一帧 Present 返回 → 本帧 Present 开始；msCPUWait = 本帧在 Present 内部停留的时长。
+    本项目的「CPU 帧时间」取其中的 **Busy**（判断 CPU 瓶颈用，不含排队）。
+    ⚠️ Low 帧**没有**采用它的严格百分位口径 —— 真实游戏会把一帧拆成多次 Present，
+    严格百分位会落在假的短帧/长帧上；本项目用**窗口平均（1000ms）**更贴近体感。
   CPU Busy / Wait 的拆分公式也来自它。
 * **NVAPI / NVML** —— 显存、频率、利用率；接口 ID 与结构体定义以
   PresentMon 里的 `nvapi_interface_table.h` / `nvapi.h` 为准（那是权威列表）。
