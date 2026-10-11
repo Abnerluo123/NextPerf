@@ -95,16 +95,18 @@ static int ClassifyEvent(PEVENT_RECORD ev, uint8_t* opOut, wchar_t* nameOut, siz
 }
 
 std::string EtwMonitor::diagText() const {
-    char buf[400];
-    int off = snprintf(buf, sizeof(buf), "收到事件 %u（头部 pid 命中 %u / 不命中 %u）",
+    char buf[700];
+    int off = snprintf(buf, sizeof(buf), "收到事件 %u（头部 pid 命中 %u / 不命中 %u）| ID 直方图: ",
                        diagRecv_, diagPidMatch_, diagOtherPid_);
-    if (diagSeenN_ > 0 && off > 0 && off < (int)sizeof(buf) - 2) {
-        off += snprintf(buf + off, sizeof(buf) - (size_t)off, " | 事件键: ");
-        for (int i = 0; i < diagSeenN_ && off > 0 && off < (int)sizeof(buf) - 40; ++i) {
-            off += snprintf(buf + off, sizeof(buf) - (size_t)off, "%s(id=%u v=%u op=%u pid=%u)",
-                            i ? ", " : "", (unsigned)diagSeen_[i].id, (unsigned)diagSeen_[i].ver,
-                            (unsigned)diagSeen_[i].op, (unsigned)diagSeen_[i].pid);
-        }
+    for (int i = 0; i < diagSeenN_ && off > 0 && off < (int)sizeof(buf) - 90; ++i) {
+        char nm[128] = {0};
+        if (diagSeen_[i].nm[0])
+            WideCharToMultiByte(CP_UTF8, 0, diagSeen_[i].nm, -1, nm, sizeof(nm) - 1, nullptr, nullptr);
+        off += snprintf(buf + off, sizeof(buf) - (size_t)off, "%sid=%u op=%u pid=%u x%u%s%s",
+                        i ? " | " : "", (unsigned)diagSeen_[i].id, (unsigned)diagSeen_[i].op,
+                        (unsigned)diagSeen_[i].pid, diagSeen_[i].n,
+                        nm[0] ? " [" : "", nm[0] ? nm : "");
+        if (nm[0] && off < (int)sizeof(buf) - 2) off += snprintf(buf + off, sizeof(buf) - (size_t)off, "]");
     }
     return std::string(buf);
 }
@@ -112,23 +114,24 @@ std::string EtwMonitor::diagText() const {
 void __stdcall EtwMonitor::OnEvent(PEVENT_RECORD ev) {
     EtwMonitor& m = Etw();
     if (!m.active_ || !ev) return;
-    // ---- 诊断：在**任何过滤之前**先统计 + 记下事件键（2026-10-11）
+    // ---- 诊断：在**任何过滤之前**先统计 + 记 ID 直方图（带事件名）（2026-10-11）
     {
         ++m.diagRecv_;
         if (m.targetPid_ && ev->EventHeader.ProcessId == m.targetPid_) ++m.diagPidMatch_;
         else ++m.diagOtherPid_;
-        if (m.diagSeenN_ < 10) {
-            const auto& dd = ev->EventHeader.EventDescriptor;
-            bool dup = false;
-            for (int i = 0; i < m.diagSeenN_; ++i) {
-                if (m.diagSeen_[i].id == dd.Id && m.diagSeen_[i].op == dd.Opcode &&
-                    m.diagSeen_[i].pid == ev->EventHeader.ProcessId) { dup = true; break; }
-            }
-            if (!dup) {
-                m.diagSeen_[m.diagSeenN_] = {dd.Id, dd.Version, dd.Opcode, ev->EventHeader.ProcessId};
-                ++m.diagSeenN_;
-            }
+        const auto& dd = ev->EventHeader.EventDescriptor;
+        int slot = -1;
+        for (int i = 0; i < m.diagSeenN_; ++i) {
+            if (m.diagSeen_[i].id == dd.Id && m.diagSeen_[i].op == dd.Opcode) { slot = i; break; }
         }
+        if (slot < 0 && m.diagSeenN_ < 12) {
+            slot = m.diagSeenN_++;
+            m.diagSeen_[slot] = {dd.Id, dd.Opcode, ev->EventHeader.ProcessId, 0, {}};
+            // 取一次事件名（TDH）。注意 ClassifyEvent 会把 task/opcode 名写进 nm。
+            uint8_t opTmp = 0;
+            ClassifyEvent(ev, &opTmp, m.diagSeen_[slot].nm, 40);
+        }
+        if (slot >= 0) ++m.diagSeen_[slot].n;
     }
     // ★ 没有目标进程时**一条都不算**。targetPid_ == 0 以前表示「全都算」，
     //   而主程序在还没注入任何游戏时正是这个状态 —— 于是全系统（桌面、浏览器、

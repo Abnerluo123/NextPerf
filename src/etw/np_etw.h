@@ -100,10 +100,12 @@ private:
     int     evNameN_ = 0;
 
     // 诊断计数（在**过滤之前**统计）：收到的全部事件 / 头部 pid 命中 / 头部 pid 不命中；
-    // 以及前几个不同的事件键（id/ver/op/pid），用来判断"到了但键不对"还是"根本没到"。
+    // 以及**事件 ID 直方图**（带 TDH 取到的 Task/Opcode 名 + 计数）——
+    // 用它一次就能确定"哪个 ID/名字才是真正的 Present"（2026-10-11 实测：
+    // 会话开着时 5 秒收到 1140 万条事件，全是杂项，说明关键字开宽了）。
     uint32_t diagRecv_ = 0, diagPidMatch_ = 0, diagOtherPid_ = 0;
-    struct DiagEv { uint16_t id; uint8_t ver; uint8_t op; uint32_t pid; };
-    DiagEv   diagSeen_[10]{};
+    struct DiagEv { uint16_t id; uint8_t op; uint32_t pid; uint32_t n; wchar_t nm[40]; };
+    DiagEv   diagSeen_[12]{};
     int      diagSeenN_ = 0;
 
     uint32_t targetPid_ = 0;
