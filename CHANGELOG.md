@@ -51,6 +51,38 @@
 
 ---
 
+### 再修一个：每帧带 `DXGI_PRESENT_TEST` 的游戏，CPU 帧时间被切成半个帧
+
+**用户实测现象**（《漫威蜘蛛侠》）：「CPU 帧时间 0.几 ms 太异常，之前是 2-3ms」。
+
+**根因**（`src/hook/np_hook.cpp`，`PresentCommon` 收尾处）：
+`gPresentRetQpc = tPresent1;`（"上一帧 Present 返回的时刻"，也就是 **Busy** 与 **模拟阶段** 的基准）
+漏写在 `realPresent` 判断**之外**。而 Spider-Man 每帧调两次 Present
+（日志 `present diag: calls=600 real=300 test=300` —— 一次 `DXGI_PRESENT_TEST` 探测 + 一次真的），
+于是基准被**探测调用**的返回覆盖、落到帧中间：
+
+```
+cpu split avg: busy=0.35 wait=7.88 sum=8.23      ← 而帧周期是 16.7ms（正好一半）
+```
+
+面板「CPU 帧时间」取的是 `cpuBusyAvg` → 显示 0.3ms。
+对照：帧记账那边的 `gLastPresentQpc` **本来就有** `realPresent` 判断 —— 这是判断标准不一致。
+
+**修法**：测试性 Present 不推进这两个基准（`if (realPresent) { gPresentRetQpc = …; gSimEndQpc = 0; }`）。
+
+**验证（工作区内确定性复现，不用开游戏）**：测试宿主新增 `--probe-present`
+（每次真 Present 之前先调一次 `Present(0, DXGI_PRESENT_TEST)`），新用例 `tests/verify_present_test.py`
+断言 `Busy + Wait ≈ 帧周期`：
+
+| | busy | wait | sum | 帧周期 | 比值 |
+| --- | --- | --- | --- | --- | --- |
+| 修复前 | 12.94 | 0.49 | 13.43 | 28.06 | **0.48** ❌（与被切半的真实故障形态一致） |
+| 修复后 | 28.88 | 0.16 | **29.04** | 26.72 | **1.09** ✅ |
+
+`selftest` 通过；该用例已纳入 `tests/run_all.py`。
+
+---
+
 ## v1.6.4（tag `v1.6.4`，2026-10-11 发布）—— 修掉 D3D12 游戏内叠加的驱动崩溃
 
 > ✅ **已由用户实测确认**（2026-10-11，商店版《生化危机8》DX12）：
