@@ -242,11 +242,14 @@ void BuildPanelData(PanelData& out, const NPConfig& c, const NPSensors& s, const
         if (showCharts && (c.counters & NP_C_GRAPH)) attach(acc.pending.back(), h->latFrame, 0);
     }
     if (c.counters & NP_C_LOW1) {
-        acc.row(L"1% Low", active ? WF(t.fpsLow1, 0) + L" FPS" : L"—");
+        // ★ 向下取整（用户要求）：59.6 显示 59 而不是 60。
+        //   理由：Low 帧的含义是「最差的那 1% 只有 59 点几」，
+        //   四舍五入成 60 会让人误以为没有掉帧，与「平均 60」分不开。
+        acc.row(L"1% Low", active ? WF(floorf(t.fpsLow1), 0) + L" FPS" : L"—");
         // 不画曲线：用户明确要求「low 帧不需要画曲线，显示出数值就好」
     }
     if (c.counters & NP_C_LOW01) {
-        acc.row(L"0.1% Low", active ? WF(t.fpsLow01, 0) + L" FPS" : L"—");
+        acc.row(L"0.1% Low", active ? WF(floorf(t.fpsLow01), 0) + L" FPS" : L"—");
     }
     acc.flush(L"帧率与延迟", true, 0.0f);    // 首组：顶端不留
 
