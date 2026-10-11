@@ -8,8 +8,13 @@
 >
 > | 日志 | 谁写的 | **真实位置（用户的机器）** | 编码 |
 > |---|---|---|---|
-> | `NextPerf.log` | 主程序 `NextPerf.exe` | `C:\Users\Abner\AppData\Local\Temp\NextPerf.log` | **GBK** |
-> | `NextPerfHook.log` | 注入到游戏里的 `NextPerfHook.dll` | `C:\Users\Abner\AppData\Local\Temp\NextPerfHook.log` | **GBK** |
+> | `NextPerf.log` | 主程序 `NextPerf.exe` | `C:\Users\Abner\AppData\Local\Temp\NextPerf.log` | **UTF-8** |
+> | `NextPerfHook.log` | 注入到游戏里的 `NextPerfHook.dll` | `C:\Users\Abner\AppData\Local\Temp\NextPerfHook.log` | **UTF-8** |
+>
+> ⚠️ **编码这一行原先写的是「GBK」，那是错的**（2026-10-11 实测核实）：两个日志里的
+> 中文都是 **UTF-8** 字节 —— 因为格式串来自 **UTF-8 源码**，`Log()` 原样写出不做转码。
+> 按 GBK 解会得到 `宸叉湁 5.2s 娌℃湁 Present` 这种乱码，**后果是中文关键字永远匹配不上**
+> （`tests/_exitprobe.py` 就因此一直没发现问题；`tests/verify_watchdog.py` 第一次跑也栽在这上面）。
 >
 > ### ⚠️ 为什么这里要专门警告
 >
@@ -29,12 +34,13 @@
 > 1. **要看用户的实际运行情况，就去读工作区外的真实路径**（上面的表），
 >    不要去读 `$env:TEMP`。
 > 2. **要看自己测试脚本的结果，才读 `$env:TEMP`**（那是沙箱里的）。
-> 3. 用 PowerShell 读时**必须指定 GBK**：
+> 3. 用 PowerShell 读时**按 UTF-8**（中文才读得对；要匹配中文关键字时这是必须的）：
 >    ```powershell
 >    $real = "C:\Users\Abner\AppData\Local\Temp"
 >    $b = [System.IO.File]::ReadAllBytes("$real\NextPerfHook.log")
->    [System.Text.Encoding]::GetEncoding('GBK').GetString($b) -split "`r?`n"
+>    [System.Text.Encoding]::UTF8.GetString($b) -split "`r?`n"
 >    ```
+>    （旧记录写的是 `GetEncoding('GBK')` —— **那是错的**，会读出乱码，见上表下面的警告。）
 > 4. **不要问用户"把日志贴给我"** —— 直接去读。用户明确说过这件事。
 > 5. 日志被**截断**：钩子日志超过 **4 MB** 会从文件头开始覆盖（2026-10-11 从 512 KB 提高，
 >    因为一场游戏就把现场冲掉了）。

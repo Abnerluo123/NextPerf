@@ -137,8 +137,8 @@
 
 | # | 项 | 现状 | 下一步 |
 | --- | --- | --- | --- |
-| T1 | **"退出时不再注入"没有自动化回归** | 手工验过（日志里 `quit` 后不再出现 `attach`），但没人守着 | 让 `tests/_exitprobe.py` 支持"把宿主写进游戏列表 → 退出 NextPerf → 断言此后无 `attach:` 行" |
-| T2 | **看门狗没有正例测试** | 反例验过 | 造"只挂起渲染线程"的靶子 |
+| T1 | ~~**"退出时不再注入"没有自动化回归**~~ ✅ **已补（2026-10-11）** | `tests/verify_quit_noinject.py`：预置配置让看护线程有维护目标 → 手动注入宿主 → 发「退出」→ 断言退出后 `attach:` 次数**不再增长**、主程序 ≤10s 退出。已纳入 `run_all.py` | ⚠ 沙箱里改不了 `%APPDATA%`（用例会优雅跳过）；沙箱的 TEMP 每次命令一换，主/钩子日志落点会被回收，所以**前置条件的确证**在沙箱里不可靠，真机正常 |
+| T2 | ~~**看门狗没有正例测试**~~ ✅ **已补（2026-10-11）** | `tests/verify_watchdog.py`：只 `SuspendThread` **渲染线程**（不挂 worker）→ 8 秒内应出现 `watchdog: 已有 X.Xs 没有 Present 调用` → 恢复后应出现 `watchdog: Present 已恢复`。实测已通过 | 就是这个用例顺带抓出了"日志编码写错"（见 D11） |
 | T3 | **`struct_check.py` 只检查 `NPTelemetry`** | `NPConfig` / `NPSensors` 没有镜像比对；且 `NPSensors` 字段宽度和 444 ≠ `sizeof` 448（尾部填充），直接加会**误报** | 先修脚本比较方式，再补两个结构体 |
 | T4 | **C++ 侧没有读方 `version`/`size` 校验** | 钩子/主程序只看 `magic`（G4 属实，grep 无 `->version` 比较） | 两侧各加一行判断 |
 | T5 | **`sizeof(NPConfig/NPSensors/NPTelemetry)` 没有编译期断言** | 无 `static_assert` | 加三行 |
@@ -184,7 +184,10 @@
 
 | # | 项 | 现状 | 建议 |
 | --- | --- | --- | --- |
-| D1 | **HOOK.md 与 HOOK-FUNCTIONS.md 系统性行号漂移** | 同一函数在两份文档里差 11~43 行（`Worker` 2556 vs 2616、`PresentCommon` 1182 vs 1193、`RestoreAllHooks` 2442 vs 2453 …）；`gSehHandle` 注销点**三处**不一致；`gNpCountingOverlayDraws` 写 911 与 948 两说；HOOK.md 自身 §14.6/§17.2、§12.2/§5.4 也互相矛盾 | **把两份文档里的行号全部删掉，只留函数名**（`np_hook.cpp` 现在 2971 行且还在改）。量大，值得单独一轮 |
+| D1 | ~~**HOOK.md 与 HOOK-FUNCTIONS.md 系统性行号漂移**~~ ✅ **已根治（2026-10-11）** | `HOOK.md` **423 处 → 0**、`HOOK-FUNCTIONS.md` **284 处 → 0**；两份文档头部都改成新政策：**不引用行号，只引用函数名/变量名/日志文本**（结构完整、解释文字一条未删） | 后续新增内容**也不许再写行号**；行号只在绝对必要时以"某函数内"描述 |
+| D11 | **日志编码写错：文档说 GBK，实际是 UTF-8** ✅ **已修** | 按 GBK 解会得到 `宸叉湁 5.2s` 这种乱码 → **中文关键字永远匹配不上**（`_exitprobe.py` 因此一直没察觉；新写的看门狗用例第一次跑也栽在这） | 已改 `LOGGING.md` 编码表与 PowerShell 读法；`_exitprobe.py`/`verify_watchdog.py`/`verify_quit_noinject.py`/`sim_stress.py`/`_bisect.py` 全部改成 UTF-8 优先、GBK 兜底 |
+| D12 | **`Get-Content` 会吃掉 LF-only + 无 BOM UTF-8 文件的换行** | 本机默认按 GBK 解码这种文件：`(Get-Content docs\HOOK-FUNCTIONS.md).Count` = **278**，真值 **307**。这正是 `CATALOG.md` 行数写错的根源（已于本轮更正） | 数行数用 **LF 字节数** 或 `-Encoding utf8` / `[IO.File]::ReadAllLines`；`Select-String` 不受影响 |
+| D13 | **沙箱 TEMP 每次命令一个、结束即回收** | 我的测试脚本里，主程序/钩子日志的落点会因此漂移（表现为"读不到日志"），一度被误判成产品问题 | 测试**不要依赖单一日志路径**：按 mtime 在多个候选里挑；判据尽量落在跟着被测进程走的那份日志上 |
 | D2 | 日志字段 `frame merge: … merged=N` **误导** | 它其实是"满足合并阈值、但**没有吸收**"的次数（合并已回退）。子代理就是照它得出"合并生效"的错误结论 | 改名 `wouldMerge=`（**改它要重新构建 + 重测**，放下一个版本） |
 | D3 | **`sim.exe` 切垂直同步时自己就崩**（不注入也崩） | 而 `sim_stress.py` 把 vsync 当 12 条重建场景之一 → **对照组的"不注入是稳的"前提不成立** | 先修模拟器（或把 vsync 从默认场景里摘掉并注明） |
 | D4 | **钩子 vs 模拟器自报的数值对照（ground truth）从未做** | `SIMULATOR.md` §5.1 自己写着这是"模拟器最大的用途" | 一次对照就能把"准不准"从 ❓ 变成 ✅（`verify_framedata.py` 只比了帧间隔与阻塞） |
