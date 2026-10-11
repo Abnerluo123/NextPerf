@@ -740,7 +740,7 @@ PresentMon / RTSS 这类成熟软件的做法是订阅 `Microsoft-Windows-DxgKrn
 | 编码器 / 解码器 | NVML（唯一来源，且**当前无消费者**） | `:846-853` |
 | 硬件 RT / Tensor | HWiNFO（名字含 `Tensor`/`RT Core`） → LHM WMI | `:996-1025` |
 | GPU 帧时间 | PDH `Running Time`（唯一在传感器层的来源；钩子推算值只在面板层兜底） | `:426-484`、`np_build.cpp:342-354` |
-| AI 引擎 compute/OFA | PDH `Utilization Percentage`（**当前因大小写不匹配而失效**，见 3.4） | `:398-417` |
+| AI 引擎 compute/OFA | PDH `Utilization Percentage`（**过滤器大小写 bug 已修**，`53037bd`；见 3.4 / 6.1。⚠ 真机复验 `engOfa > 0` 仍未做；且**面板只在 > 0 时才显示这一行**，`0.0%` 会整行消失 —— 日志里其实是有的） | `:398-417` |
 
 **「最终用了哪个源」怎么表达**
 

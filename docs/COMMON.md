@@ -718,8 +718,10 @@ void rowRange(label, value, level, active, series, h, dec, warnMinBelow, warnMax
 24. **`h == nullptr` 不能提前 return** —— 会把不需要历史数据的行一起干掉。
 25. **"读不到"必须显示 `—`，不能显示 0。** GPU 帧时间的兜底值不判 `> 0.01f` 时，
     "注入没成功"会在面板上变成**假的 `0.00 ms`**。
-26. **CPU 帧时间必须显示 `cpuBusyAvg + cpuWaitAvg`**，否则它和下面两行**永远加不上**
-    （用户实测抓到 0.37 vs 0.24+5.95）。
+26. **面板「CPU 帧时间」显示的是 `cpuBusyAvg`（不是 Busy+Wait）** —— 用户定的口径，
+    `np_build.cpp` 里写着「别改回去」。判断 CPU 是不是瓶颈要用 Busy；排队（垂直同步等待）
+    不是 CPU 在干活。⚠ 不要把它和遥测字段 `cpuFrameMs`（= Busy+Wait，PresentMon 口径）混为一谈，
+    **两者同名不同物**，文档里必须分别写清。
 27. **新加的字符串行必须过 `FitCols`**（14 格，全角算 2 格），否则会撑破固定列宽被裁掉。
 28. **`tickMs` 不能跨进程做减法**：钩子写的 `GetTickCount64()` 与主程序自己的钟不可比，
     会算出负数或天文数字。判"钩子还活着吗"**一律用 `frameTotal` 是否增长**。

@@ -45,10 +45,10 @@ CXX="-target x86_64-windows-gnu -O2 -std=c++20 -DUNICODE -D_UNICODE -fno-excepti
 $ZIG c++ $CXX -o dist/NextPerf.exe \
     src/app/main.cpp src/app/ui.cpp src/app/overlay.cpp src/app/injector.cpp src/app/settings.cpp \
     src/common/np_panel.cpp src/common/np_build.cpp src/common/np_bitmap.cpp \
-    src/sensors/np_vendor.cpp src/sensors/np_sensors.cpp \
+    src/sensors/np_vendor.cpp src/sensors/np_sensors.cpp src/etw/np_etw.cpp \
     -Wl,--subsystem,windows \
     -luser32 -lgdi32 -lshell32 -ladvapi32 -lole32 -loleaut32 -luuid -lcomctl32 -lcomdlg32 \
-    -lpdh -lpsapi -ldxgi -ld3d11 -ld2d1 -ldwrite -lshlwapi -lwinmm -lmsimg32
+    -lpdh -lpsapi -ldxgi -ld3d11 -ld2d1 -ldwrite -lshlwapi -lwinmm -lmsimg32 -ltdh
 
 # 钩子 DLL（-shared，不要 subsystem 参数）
 $ZIG c++ $CXX -shared -o dist/NextPerfHook.dll \

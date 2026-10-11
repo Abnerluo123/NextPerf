@@ -630,7 +630,7 @@ TS_AI_START    48   TS_AI_END      49
      上限真卡顿时别乱合并（`1315-1316`）。
 4. **判定用 `fmRaw`，记账用 `fm`**（`1318-1321`）：`fm = now - gLastPresentQpc`
    是「距上一次**记账**」的间隔，被合并时它自然覆盖整个帧。
-   `fmRaw < mergeThresh` → `gAbsorbThisPresent = true`，`++gMergedCount`。
+   `fmRaw < mergeThresh` → ~~`gAbsorbThisPresent = true`~~（**吸收已回退**：那行被注释掉）、只有 `++gMergedCount` 仍在跑。所以日志里的 `frame merge: … merged=N` 是「**满足阈值的次数**」，**不是真合并了 N 帧**。
 5. **只有未被合并的间隔才进统计**（`1327-1336`）：写 `gTel->frameMs`、`gStats.push`、
    `++frameTotal`、写 `frames[]/cpuFrames[]/gpuFrames[]` 环形缓冲。
 6. **超过 1 秒的间隔不是「一帧」**（`1324-1327`）：是切出去/加载/挂起留下的空档。
@@ -781,7 +781,7 @@ D3D 已加载但 Present 未挂上 →「看 NextPerfHook.log」；其余 →「
   严格（最差 1% 单帧）= 53.8，与驱动 59 差 5；窗口平均 = 57.1，明显更贴近驱动。
   原因是游戏内 overlay 与驱动面板显示的本来就是窗口平均后的 FPS。
   现在**面板固定用 PresentMon 口径**，`np::FrameStats::lowWindowed` 仍保留在 `np_stats.h:138-166` 供对照，
-  但钩子层不再调用它 —— 若将来要恢复「Low 帧（严格）」开关，那才是入口。
+  但**钩子层的主路径就是 `lowWindowed`**（`np_hook.cpp` 1186-1187：`lowWindowed(1.0/0.1, 1000ms, look)`），`lowPercentileFps` 只在窗口数不足 4 个时兜底。⚠ 这句话原本写反了（写成「钩子层不再调用 lowWindowed」），已按代码更正。
 - `p99Ms` / `p999Ms` 同时给出（`1087-1088`），走**全缓冲区**（默认窗口 = `kCap`）。
 
 ---
@@ -1267,7 +1267,7 @@ FreeLibraryAndExitThread(gSelf, 0)   // 6. 从宿主进程卸载自己并结束�
 | `gDbgInPresent` 只声明不赋值 | `NpSeh` 的 `SEH ctx:` 里 `inPresent=` 恒为 0 | 注释说明这是「只打确定存在的量」的有意取舍；要真想用，得在 `PresentCommon` 入口/出口同步它 |
 | `NPConfig::reserved` 只有 **4** 个元素，而 `NPDefaultConfig` 却在 `for (i = 0; i < 8; ++i)` 里写 | `np_common.h:200` vs `np_common.h:438` —— **越界写 16 字节** | 写入的是**主程序进程**里的栈结构，不跨进程；修的时候把循环改成 4，或把 `reserved` 扩到 8（后者会改 `sizeof`，必须同验三个进程的 `version` 自检） |
 | `InModule()` 已无人使用 | 有意保留为教训备忘（`472-477`） | **不要「顺手删掉」**，注释说明它就是文档 |
-| `lowWindowed` 口径不再被钩子层调用 | 保留在 `np_stats.h:138-166` 供对照 | 若恢复「Low 帧（严格）」开关，这里是入口 |
+| `lowWindowed` 是钩子层**主路径**（`np_hook.cpp` 1186-1187），`lowPercentileFps` 只兜底 | 都在 `np_stats.h:138-166` | ⚠ 本行曾经写反（"不再被钩子层调用"），已更正 |
 | `gReflexDev` / `nvapi64.dll` 卸载时不释放 | 见 §21.7 | 若释放，必须同时让 Reflex 状态可重置 |
 | `gVpW/gVpH` 是 32 位标量竞态（注释认可「影响可忽略」） | `394` | 若要严谨可换成 `std::atomic<uint32_t>` |
 

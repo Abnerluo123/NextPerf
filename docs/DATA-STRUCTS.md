@@ -457,23 +457,23 @@ for (size_t i = 0; i < sizeof(c->reserved) / sizeof(c->reserved[0]); ++i) {
 | `processName` | char[128] | 进程 exe 名（UTF-8） | `PresentCommon` / 守卫线程（`NPCopyStr`） | 主程序状态栏、`tests/verify_inject.py` 打印 | 活跃 |
 | `frameTotal` | uint32 | **累计帧数**（只增，溢出回绕） | `PresentCommon`（合并判定通过后 `++`） | 主程序（防"时间戳跨进程比较"的**唯一可靠活性判据**）、`tests`（算稳态帧率） | 活跃；⚠ **不要用 `count()` 替代它**（环形缓冲满容量后 `count()` 不再增长 —— 源码注释专门标了这个坑） |
 | `frameWrite` | uint32 | `frames/cpuFrames/gpuFrames` 的环形写指针，`(wi + 1) % NP_FRAME_CAP` | `PresentCommon` | **无人读**（Python ctypes 镜像里为布局保留） | 写-无读 |
-| `frames[4096]` | float[4096] | 每帧帧生成时间 ms（Present 间隔，已做「帧内重复 Present 合并」） | `PresentCommon` | **无人读**（主程序图表走 `NPHistory`，不是这个数组） | 写-无读（保留：给未来的离线分析/导出用） |
+| `frames[4096]` | float[4096] | 每帧帧生成时间 ms（Present 间隔）。⚠ **帧内合并已回退**：每一次真实 Present 都记账 | `PresentCommon` | **无人读**（主程序图表走 `NPHistory`，不是这个数组） | 写-无读（保留：给未来的离线分析/导出用） |
 | `cpuFrames[4096]` | float[4096] | 每帧 CPU 帧时间 ms | 同上 | 无人读 | 写-无读 |
 | `gpuFrames[4096]` | float[4096] | 每帧 GPU 帧时间 ms（= 当时的 `gpuFrameMs`） | 同上 | 无人读 | 写-无读（历史上是"GPU 曲线全为 0"投诉的现场） |
 | `fps` | float | 瞬时 FPS。**按 500ms 时间窗计数**得到（不是逐帧 `1000/frameMs`）：锁 60 时窗口内 30 帧/0.5s = 恰好 60.0，不会 60↔100 乱跳 | `UpdateTelemetryCommon()` | 面板「FPS」行、主程序 `NPHistoryPush` | 活跃 |
 | `fpsAvg` | float | 平均 FPS = 最近 600 帧的平均帧时间换算（`gStats.avgFps(600)`） | 同上 | 仪表/日志/`NPHistory`；**也用于把 1 秒窗口换算成帧数** | 活跃 |
-| `fpsLow1` | float | **1% Low（FPS）**，最终口径：`lowPercentileFps(99.0, lowWin)` | 同上 | 面板「1% Low」行；主程序可能被 ETW 读数覆盖（见下） | 活跃 |
-| `fpsLow01` | float | **0.1% Low（FPS）**，`lowPercentileFps(99.9, lowWin)` | 同上 | 面板「0.1% Low」行 | 活跃 |
+| `fpsLow1` | float | **1% Low（FPS）**。**最终口径 = `lowWindowed(1.0, 1000ms, look)`（窗口平均，回看约 10s）**；只有窗口数不足 4 个时才回退 `lowPercentileFps(99.0, lowWin)` 兜底（`np_hook.cpp` 1186-1191） | 同上 | 面板「1% Low」行；**主程序会用 ETW 读数覆盖**（见下） | 活跃 |
+| `fpsLow01` | float | **0.1% Low（FPS）**。同 `fpsLow1`：`lowWindowed(0.1, 1000ms, look)` 为主，`lowPercentileFps(99.9, lowWin)` 兜底 | 同上 | 面板「0.1% Low」行 | 活跃 |
 | `frameMs` | float | **最近一帧的原始帧生成时间** ms（未平滑）。参与统计、合并判定、图表 | `PresentCommon` | `UpdateTelemetryCommon()`（喂 `gStats`、算 EMA、算 `rtLoad` 分母）、`np_build` 兜底显示 | 活跃 |
 | `frameMsAvg` | float | 平滑后的帧时间（`np::Ema(0.10f)`）。**面板显示用这个** | `UpdateTelemetryCommon()` | `np_build.cpp`「帧时间」行（`frameMsAvg > 0.0001 ? frameMsAvg : frameMs`） | 活跃 |
-| `cpuFrameMs` | float | CPU 帧时间 = **`CPUBusy + CPUWait`**（PresentMon 口径）= 帧周期。⚠ 必须扣掉卡在 `Present` 里的等待，否则锁 60 时恒等于 16.66ms —— 那是帧周期，不是 CPU 的活 | `PresentCommon` 尾部（`busyMs + waitMs`）；首帧兜底 `= frameMs` | 主程序 `NPHistoryPush`（桌面曲线的 `latCpu`）；`np_build` 在平滑值还没建立时兜底 | 活跃（但**面板优先用 `cpuBusyAvg + cpuWaitAvg`**，见 `cpuBusyAvg`） |
+| `cpuFrameMs` | float | CPU 帧时间 = **`CPUBusy + CPUWait`**（PresentMon 口径）= 帧周期。⚠ 必须扣掉卡在 `Present` 里的等待，否则锁 60 时恒等于 16.66ms —— 那是帧周期，不是 CPU 的活 | `PresentCommon` 尾部（`busyMs + waitMs`）；首帧兜底 `= frameMs` | 主程序 `NPHistoryPush`（桌面曲线的 `latCpu`）；`np_build` 在 `cpuBusyAvg` 还没建立时兜底 | 活跃。⚠ **这是遥测字段**；**面板「CPU 帧时间」显示的不是它**，而是 `cpuBusyAvg`（用户定的口径，见下） |
 | `cpuFrameMsAvg` | float | 平滑后的 CPU 帧时间（EMA） | `PresentCommon` | 钩子侧 `NPHistoryPush`（游戏内曲线的 `latCpu`，用平滑值避免锯齿看着像剧烈波动） | 活跃 |
 | `simMs` | float | **模拟阶段** ms：上一帧 `Present` 返回 → 本帧渲染线程第一次提交命令（游戏自己的逻辑/物理/动画/剔除）。有 Reflex 时会被游戏自报的权威值覆盖 | `PresentCommon`（启发式）/ Reflex 分支 | **无人读**（面板不再用它算 CPU 帧时间） | 写-无读（保留供对照） |
 | `submitMs` | float | **渲染提交** ms：第一次提交 → 调 `Present`（录制命令列表 + 提交，**本质上是在排队**，用户明确说不该算进 CPU 帧） | 同上 | 无人读 | 写-无读（保留供对照） |
 | `gpuFrameMs` | float | GPU 帧时间 ms | **不再是钩子自己推算的**：逐批时间戳夹取方案已整个拆除（它给每次 `ExecuteCommandLists` 插时间戳，真实游戏一帧十几到几十批 → allocator starved + 叠加永久停画）。现在在 `UpdateTelemetryCommon()` 里**从 `Sens().gpuBusyMs`（系统 PDH）回填** | `np_build.cpp`「GPU 帧时间」的兜底（要求 `> 0.01f` 才显示）；`NPHistoryPush`；图表环形缓冲 | 活跃，但**依赖 PDH**：读不到 PDH 时**恒为 0**（面板会显示 `—`，历史事故：所有以它为源的曲线是一条零线） |
 | `msInPresent` | float | 本帧卡在 `Present` 调用里的时长 ms（主要就是等垂直同步） | `PresentCommon` | 用于算 `cpuWaitMs`；主程序诊断 | 活跃 |
 | `cpuBusyMs` | float | **CPUBusy** = 本帧 `Present` 开始 − **上一帧 `Present` 返回**。本质是「Present 之间的残差」：流水线渲染的游戏里本来就接近 0；开 Reflex 后等待被移到 `Present` 之前，这段睡眠落进间隙 → 数值明显变大 | `PresentCommon` 尾部 | 面板「CPU Busy（高级）」行（默认不显示）；`CPU 帧时间 = busyAvg + waitAvg` | 活跃 |
-| `cpuBusyAvg` | float | 上面那个的 EMA（`np::Ema(0.10f)`） | 同上 | **面板「CPU 帧时间」的主来源**（`cpuBusyAvg + cpuWaitAvg`） | 活跃 |
+| `cpuBusyAvg` | float | 上面那个的 EMA（`np::Ema(0.10f)`） | 同上 | **面板「CPU 帧时间」的唯一主来源**（`np_build.cpp` 取 `t.cpuBusyAvg`；只有它还是 0 时才兜底 `cpuFrameMs`）。**不要改回 Busy+Wait** | 活跃 |
 | `cpuWaitMs` | float | **CPUWait** = 本帧在 `Present` 内部停留（= `msInPresent`） | 同上 | 「低延迟」判定的回退判据（`< 1.6ms`）；「CPU Wait」行 | 活跃 |
 | `cpuWaitAvg` | float | 上面那个的 EMA | 同上 | 低延迟判定优先用平滑值 | 活跃 |
 | `p99Ms` / `p999Ms` | float | 帧时间百分位 ms（整个环形缓冲，不设窗口） | `UpdateTelemetryCommon()` | **无人读**（面板不显示百分位；诊断日志自己调 `gStats.percentileMs`） | 写-无读（保留） |
@@ -510,7 +510,7 @@ for (size_t i = 0; i < sizeof(c->reserved) / sizeof(c->reserved[0]); ++i) {
 | 方案被拆除 | `gpuFrameMs` 的**自主推算** | 逐批 GPU 时间戳夹取已删；现在只是 PDH `gpuBusyMs` 的镜像。**要恢复自主测量，别重做逐批插时间戳**（会把 allocator 拖死） |
 | 写-无读（在结构体里占 55296 字节 ≈ 54KB） | `frames[4096]`、`cpuFrames[4096]`、`gpuFrames[4096]`、`graphFrame/Cpu/Gpu[512]`、`graphWrite`、`graphCount` | 图表实际走 `NPHistory`（每 125ms 一个采样点、256 点）。这三个大数组是**每帧**精度，只适合离线导出/事后分析 |
 | 写-无读（小字段） | `p99Ms`、`p999Ms`、`simMs`、`submitMs`、`asBuilds`、`frameWrite` | 面板不显示；诊断日志自己调 `FrameStats` |
-| 只在特定条件下写 | `cpuFrames`/`gpuFrames`/`frameMs`（仅当合并判定通过、且间隔在 0.02~1000ms 之间）、`simMs`/`submitMs`（仅当渲染线程 + 时间戳有效）、`hookFlags` 的 `TIMESTAMP`（仅当查询堆就绪） | 读方必须**先判有效性**（`> 0.01f`、`!= 0`），不要直接当有效值显示 —— 「注入没成功时面板出现假的 0.00 ms」就是这么来的 |
+| 只在特定条件下写 | `cpuFrames`/`gpuFrames`/`frameMs`（仅当间隔在 0.02~1000ms 之间；**合并已回退**，不再吸收帧）、`simMs`/`submitMs`（仅当渲染线程 + 时间戳有效）、`hookFlags` 的 `TIMESTAMP`（仅当查询堆就绪） | 读方必须**先判有效性**（`> 0.01f`、`!= 0`），不要直接当有效值显示 —— 「注入没成功时面板出现假的 0.00 ms」就是这么来的 |
 
 ---
 

@@ -68,7 +68,7 @@
 | `dist\NextPerf.exe --selftest` | 全部通过（exit 0） |
 | `python tests\run_all.py --skip-build` | 全部通过（7 项，exit 0） |
 | 新日志文案确实编进 exe | ✅ 在 `dist\NextPerf.exe` 里能搜到 `钩子 1000ms 窗口平均`、`CPUBusy + CPUWait(PresentMon 口径`、`engtype_Compute / engtype_OFA`；旧文案 `最近1200帧样本推算` 已搜不到 |
-| 真实游戏实测 | ❌ 未做（用户测的是**已发布的 v1.6.3**，不是这一版） |
+| 真实游戏实测 | ✅ **已补做**：用户用**常驻上传缓冲环那一版**实测 —— 2755 帧 / 60fps ≈ 53 秒、含一次交换链重建，零 SEH、零闪烁（详见本段「用户实测确认」） |
 
 ### 追加：真机反馈的两个 bug（2026-10-11 晚，用户实测 · 商店版《生化危机8》DX12）
 

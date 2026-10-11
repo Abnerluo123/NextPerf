@@ -62,6 +62,7 @@
 | 文档 | 覆盖范围 | 什么时候看它 |
 |---|---|---|
 | [`CATALOG.md`](CATALOG.md) | **总目录**（本文） | 任何时候，先看这里 |
+| [`TODO.md`](TODO.md) | **已知缺口与待办总表**（未实现 / 未验证 / 条件性可用 / 死代码 / 口径债）——**状态唯一权威来源** | 想知道"还有什么没做完、什么读不到、为什么"时 |
 | [`ARCHITECTURE.md`](ARCHITECTURE.md) | 整体架构、Present 是怎么挂上的 | 想理解整体设计 |
 | [`HOOK.md`](HOOK.md) | **钩子层**：注入后干了什么、怎么挂钩、怎么采集、怎么画、怎么卸载 | 改钩子前必读 |
 | [`HOOK-FUNCTIONS.md`](HOOK-FUNCTIONS.md) | 钩子层函数速查表 | 找函数在哪 |
@@ -101,9 +102,9 @@
 | DXGI 工厂钩子 | `src/hook/np_hook.cpp` | `InstallDxgi`（`CreateSwapChain` / `ForCreateSwapChainForHwnd` / `ForComposition`） |
 | 交换链 vtable 钩子 | `src/hook/np_hook.cpp` | `PatchSwapChainVtable`、`Patch`、`SwapVtFor` |
 | Present / Present1 | `src/hook/np_hook.cpp` | `PresentCommon`（**核心**） |
-| ResizeBuffers | `src/hook/np_hook.cpp` | （见 `HOOK.md`） |
+| ~~ResizeBuffers~~ | — | ❌ **未挂钩**（全仓 grep 证实只出现在注释里）—— 见 `HOOK.md` §11 与 `TODO.md` 的 **F1** |
 | D3D12 命令队列/命令列表 | `src/hook/np_hook.cpp` | `EnsureD3D12Hooks`（注意函数实现在 **`D3D12Core.dll`**） |
-| ~~ResizeBuffers~~ | — | ❌ **未挂钩**（全仓 grep 证实只出现在注释里）。详见下方「下一版第一优先」 |
+| ~~ResizeBuffers（重复行，已合并到上面）~~ | — | 见上一行的 ❌ 未挂钩说明 |
 | **还原所有补丁（幂等）** | `src/hook/np_hook.cpp` | `RestoreAllHooks`（**两条卸载路径都必须调**） |
 | 干净卸载 | `src/hook/np_hook.cpp` | `SelfUnloadNow`、`NpHookDetach`、`detachPid` 机制 |
 
@@ -112,7 +113,7 @@
 | 功能 | 文件 | 关键函数 |
 |---|---|---|
 | 帧时间采集 | `src/hook/np_hook.cpp` | `PresentCommon` 里的 record 段 |
-| **帧内重复 Present 的合并** | `src/hook/np_hook.cpp` | 基准取自 `gRawStats.meanMs(240)`，避免正反馈 |
+| ~~帧内重复 Present 的合并~~ | `src/hook/np_hook.cpp` | ❌ **已回退（不再吸收）**：吸收那一行被注释掉（`// gAbsorbThisPresent = true;`），只有 `gMergedCount` 仍在自增 —— 所以日志里的 `frame merge: … merged=N` 是「**满足阈值的次数**」，**不是真的合并了 N 帧**。判据仍取自 `gRawStats.meanMs(240)` |
 | **Low 帧（窗口平均口径）** | `src/common/np_stats.h` | `lowWindowed`（1000ms 窗口平均、回看约 10s）；`lowPercentileFps`（1 秒窗口 + 对 FPS 取 P1）只做兜底 —— **以代码为准，别照抄文档** |
 | 环形缓冲与百分位 | `src/common/np_stats.h` | `FrameStats`、`push`、`recent`、`percentileMs` |
 | **CPU Busy / Wait 拆分** | `src/hook/np_hook.cpp` | Present 返回后**同一次减法**导出三个值 |
@@ -158,45 +159,46 @@
 
 | 文件 | 行数 | 职责 |
 |---|---|---|
-| `main.cpp` | ~1000 | 主循环、托盘、命令分发、前台跟踪、自动学习、陈旧遥测回收 |
-| `ui.cpp` | ~813 | 自绘 D2D 界面、控件系统、动作分发 |
-| `injector.cpp` | ~587 | 注入（含 WoW64 32 位）、看护扫描、HookControl |
-| `settings.cpp` | ~158 | 配置 JSON 存取 |
-| `overlay.cpp` | ~111 | 桌面分层叠加窗口 |
-| `np_app.h` | ~125 | `AppState` / `GameEntry` 等 |
+| `main.cpp` | 1265 | 主循环、托盘、命令分发、前台跟踪、自动学习、陈旧遥测回收 |
+| `ui.cpp` | 941 | 自绘 D2D 界面、控件系统、动作分发 |
+| `injector.cpp` | 772 | 注入（含 WoW64 32 位）、看护扫描、HookControl |
+| `settings.cpp` | 184 | 配置 JSON 存取 |
+| `overlay.cpp` | 135 | 桌面分层叠加窗口 |
+| `np_app.h` | 187 | `AppState` / `GameEntry` 等 |
 
 ### 3.2 钩子（`src/hook/`）
 
 | 文件 | 行数 | 职责 |
 |---|---|---|
-| `np_hook.cpp` | 2755 | **钩子主体**：探测、挂钩、采集、遥测、卸载 |
-| `np_draw.cpp` / `.h` | 610 / 104 | 游戏内叠加绘制（D3D11 / D3D12 两套） |
+| `np_hook.cpp` | 2971 | **钩子主体**：探测、挂钩、采集、遥测、卸载 |
+| `np_draw.cpp` / `.h` | 625 / 119 | 游戏内叠加绘制（D3D11 / D3D12 两套） |
 | `np_reflex.h` | 128 | NVAPI Reflex / 低延迟状态 |
 | `dllmain.cpp` | 26 | DLL 入口 |
 | `np_hook.h` | 7 | 导出声明 |
 
-> ⚠ **行数会漂移**。上面是 2026-10-11 的实测值（由子代理逐个核对）。
-> 用 `Get-Content | Measure-Object -Line` 数出来的值会**偏小**（它会吃掉
-> LF-only 文件的空行），不要用那个口径。
+> ⚠ **行数只作量级参考，引用代码一律用函数名**（`np_hook.cpp` 尤其不稳，正在被频繁修改）。
+> 上面的数字是 **2026-10-11 按 LF 字节数**出来的真行数 ——
+> **不要用 `Get-Content | Measure-Object -Line`**：它会把 LF-only 文件数少一截
+> （这张表上一版就是这么错的：写 ~1000，真值 1265）。
 
 ### 3.3 公共（`src/common/`）
 
 | 文件 | 行数 | 职责 |
 |---|---|---|
-| `np_common.h` | ~344 | **数据契约**：NPConfig / NPSensors / NPTelemetry / 宏 |
-| `np_stats.h` | ~208 | `FrameStats` 环形缓冲、百分位、Low 帧 |
-| `np_panel.cpp` / `.h` | ~408 / 89 | 面板渲染器 |
-| `np_build.cpp` / `.h` | ~396 / 7 | 面板行组装 |
+| `np_common.h` | 506 | **数据契约**：NPConfig / NPSensors / NPTelemetry / 宏 |
+| `np_stats.h` | 269 | `FrameStats` 环形缓冲、百分位、Low 帧 |
+| `np_panel.cpp` / `.h` | 545 / 130 | 面板渲染器 |
+| `np_build.cpp` / `.h` | 492 / 13 | 面板行组装 |
 | `np_json.h` | ~205 | 极简 JSON |
-| `np_bitmap.cpp` / `.h` | ~86 / 33 | 位图工具 |
+| `np_bitmap.cpp` / `.h` | 102 / 52 | 位图工具 |
 
 ### 3.4 传感器与 ETW
 
 | 文件 | 行数 | 职责 |
 |---|---|---|
-| `src/sensors/np_sensors.cpp` / `.h` | ~917 / 131 | NVML/PDH/WMI/HWiNFO 等采集与优选 |
-| `src/sensors/np_vendor.cpp` / `.h` | ~294 / 216 | NVAPI / ADL 动态加载与结构定义 |
-| `src/etw/np_etw.cpp` / `.h` | ~281 / 78 | ETW 会话（DxgKrnl Present） |
+| `src/sensors/np_sensors.cpp` / `.h` | 1132 / 199 | NVML/PDH/WMI/HWiNFO 等采集与优选 |
+| `src/sensors/np_vendor.cpp` / `.h` | 342 / 270 | NVAPI / ADL 动态加载与结构定义 |
+| `src/etw/np_etw.cpp` / `.h` | 339 / 121 | ETW 会话（DxgKrnl Present） |
 
 ### 3.5 测试（`tests/`）
 
