@@ -1304,6 +1304,26 @@ void UpdateTelemetryCommon(const NPConfig& cfg, uint64_t nowQpc, bool realPresen
         t.fpsLow1 = gStats.lowPercentileFps(99.0f, n1s);
         t.fpsLow01 = gStats.lowPercentileFps(99.9f, n1s);
     }
+    // ★ ETW 中继（2026-10-11）：主程序把**显示侧**的 (1%Low, 0.1%Low, 帧时间) 放进
+    //   NPConfig.reserved[]，新鲜就覆盖钩子自己的值 —— 否则**游戏内面板**画的还是
+    //   钩子那套"挂钩 Present"的脏样本（实测同一时刻：钩子 Low=39、ETW Low=59，
+    //   用户看到的就是 39）。fps 由帧时间反推，保证与帧时间自洽。
+    //   超过 1.5 秒没更新（ETW 关了 / 非管理员 / 游戏刚切）→ 自动回退钩子自己的数。
+    {
+        float l1 = 0, l01 = 0, fms = 0;
+        NPConfig rc = Cfg();
+        if (NPConfigGetEtwRelay(&rc, (uint32_t)GetTickCount(), &l1, &l01, &fms)) {
+            if (l1 > 0.1f) {
+                t.fpsLow1 = l1;
+                t.fpsLow01 = (l01 > 0.1f) ? l01 : l1;
+            }
+            if (fms > 0.02f && fms < 1000.0f) {
+                t.frameMs = fms;
+                t.frameMsAvg = fms;
+                t.fps = 1000.0f / fms;
+            }
+        }
+    }
     t.p99Ms = gStats.percentileMs(99.0f);
     t.p999Ms = gStats.percentileMs(99.9f);
 

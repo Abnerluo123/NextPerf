@@ -200,6 +200,38 @@ struct NPConfig {
     uint32_t reserved[4];
 };
 
+// ---------------------------------------------------------------------------
+// ETW 中继（2026-10-11）：主程序把**显示侧**的帧数据放进 NPConfig.reserved[]，
+// 钩子**新鲜就用它** —— 否则**游戏内面板**画的还是钩子自己那套"挂钩 Present"的样本，
+// 于是同一时刻桌面面板显示 59、游戏内显示 39（用户实测报过）。
+//
+// 为什么挤进 reserved[]：**零 ABI 改动** —— 结构体大小与布局一个字节不变，
+// 旧钩子 DLL 读不到这几个数就照旧用自己的（不会失配）；新钩子才用。
+//   reserved[0] = 采样时间戳（GetTickCount 低 32 位；0 = 无数据）
+//   reserved[1..3] = 1%Low / 0.1%Low / 帧时间 ms（float 的位模式）
+// ---------------------------------------------------------------------------
+inline void NPConfigSetEtwRelay(NPConfig* c, uint32_t tickMs, float low1, float low01, float frameMs) {
+    union { float f; uint32_t u; } a{low1}, b{low01}, d{frameMs};
+    c->reserved[0] = tickMs;
+    c->reserved[1] = a.u;
+    c->reserved[2] = b.u;
+    c->reserved[3] = d.u;
+}
+// 取回来；超过 1500ms 视为过期（返回 false）。nowMs 传 GetTickCount()。
+inline bool NPConfigGetEtwRelay(const NPConfig* c, uint32_t nowMs,
+                               float* low1, float* low01, float* frameMs) {
+    if (!c || !c->reserved[0]) return false;
+    if ((uint32_t)(nowMs - c->reserved[0]) > 1500u) return false;   // 无符号减法，回绕安全
+    union { float f; uint32_t u; } a{}, b{}, d{};
+    a.u = c->reserved[1];
+    b.u = c->reserved[2];
+    d.u = c->reserved[3];
+    *low1 = a.f;
+    *low01 = b.f;
+    *frameMs = d.f;
+    return true;
+}
+
 // 历史采样环形缓冲：图表曲线的数据源。
 // 主程序（桌面叠加）与钩子（游戏内）各自维护一份，容量约半分钟到一分钟。
 #define NP_HIST_CAP 256u

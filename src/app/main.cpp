@@ -137,6 +137,12 @@ void AppPollSensors() {
             // 帧率 / 帧时间：显示侧、无亚帧抖动 → 一并覆盖（实测比钩子准）
             if (er.frameMs > 0.02f && er.frameMs < 1000.0f) gApp.telemetry.frameMs = er.frameMs;
             if (er.fps > 1.0f) gApp.telemetry.fps = er.fps;
+            // ★ 回传给钩子（游戏内面板用的是钩子自己的数，不回传就会出现
+            //   "桌面 59 / 游戏内 39" 的双份数据）。见 NPConfigSetEtwRelay 的说明。
+            NPConfigSetEtwRelay(&gApp.cfg, (uint32_t)GetTickCount64(),
+                                er.low1Fps, er.low01Fps, er.frameMs);
+        } else {
+            gApp.cfg.reserved[0] = 0;   // 没有 ETW 数据 → 让钩子用自己的（不要留旧的）
         }
     }
 
