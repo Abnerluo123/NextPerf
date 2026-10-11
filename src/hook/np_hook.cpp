@@ -1916,10 +1916,23 @@ HRESULT PresentCommon(IDXGISwapChain* sc, UINT sync, UINT flags,
         }
     }
 
-    // 记下渲染线程和「本帧 Present 返回的时刻」——它就是下一帧模拟阶段的起点
+    // 记下渲染线程和「本帧 Present 返回的时刻」——它就是下一帧模拟阶段的起点。
+    //
+    // ★★ 2026-10-11 修（《漫威蜘蛛侠》实测）：这两个基准**只能在真实呈现时推进**。
+    //   该游戏每帧调两次 Present —— 先一次 `DXGI_PRESENT_TEST`（问一句"能不能呈现"），
+    //   再一次真的（日志 `present diag: calls=600 real=300 test=300`）。
+    //   原来这句写在 `realPresent` 判断**之外**，于是"上一帧返回时刻"被**探测调用**的
+    //   返回覆盖 → 基准落到帧中间 → `Busy + Wait` 只剩半个帧周期：
+    //       实测 busy=0.35 wait=7.88 sum=8.23，而帧周期是 16.7ms（正好一半）
+    //   面板「CPU 帧时间」取的是 `cpuBusyAvg`，于是显示 0.3ms（用户报"太异常"），
+    //   模拟阶段 `simMs` 用的也是这条基准，同样被切半。
+    //   修法：测试性 Present 不推进基准（帧记账那边的 `gLastPresentQpc` 本来就有这个判断，
+    //   这里是漏掉的一处 —— 判断标准要一致）。
     gRenderTid = GetCurrentThreadId();
-    gPresentRetQpc = tPresent1;
-    gSimEndQpc = 0;
+    if (realPresent) {
+        gPresentRetQpc = tPresent1;
+        gSimEndQpc = 0;
+    }
 
     // 帧边界放在 Present **返回之后**：阻塞期间后台线程提交的命令算下一帧，
     // 不然它们会被算进本帧，让「本帧第一次提交」的时刻变得毫无意义。
