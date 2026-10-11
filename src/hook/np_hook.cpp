@@ -393,6 +393,66 @@ uint64_t gPrevPresentQpc = 0;
 // 诊断用：自上次打印以来收到了几次真实 Present（见 frame merge 日志）
 static uint32_t gDbgPresents = 0;
 
+// ---------------------------------------------------------------------------
+// 帧识别（③）—— **诊断阶段**（2026-10-11）
+//
+//   目标：把"一帧"定义成**显示器上真正显示的那一帧**，而不是 Present 调用间隔。
+//   为什么需要：Spider-Man 实机数据里真呈现间隔呈 4 帧周期 10.7/16.3/16.6/23.0ms
+//   （和 = 66.6 = 4×16.65），于是按 Present 间隔统计得出 P50=10.1ms、1% Low≈42，
+//   而显示器和驱动面板明明是 60fps / Low≈59 —— **口径本身不对**。
+//
+//   ⚠ 我先试过"把间隔按垂直消隐周期量化成整数倍"，**结论是不成立，已放弃**：
+//     如果某帧 Present 之后游戏多睡了 6ms，它**确实错过了下一个垂直消隐**、
+//     那一帧在屏幕上就显示 2 个周期；而 round(interval/vblank) 会把它四舍五入回 1 个
+//     → **真卡顿被抹平**。这和历史上"按拍脑袋阈值吸收"翻车是同一类错误。
+//     量化只在"呈现与垂直消隐严格锁相"时才成立，而那正是我们要测的东西之一（循环论证）。
+//
+//   所以按本项目的老规矩**先加诊断再改行为**：把下面这些量打出来，
+//   用一局真游戏的数据决定"哪个信号能干净地识别一帧"：
+//     * 垂直消隐周期（刷新率）
+//     * 真呈现间隔 / 垂直消隐 的**对齐程度**（落在整数倍 ±0.25 以内的比例）
+//     * `IDXGISwapChain::GetFrameStatistics` 与 `GetLastPresentCount` 是否可用
+//       （前者在 flip 模型上通常不支持；如果能用，PresentCount/SyncRefreshCount
+//         就是权威的显示事件来源）
+//     * swapchain 是否带 FRAME_LATENCY_WAITABLE_OBJECT（带的话有"上一帧已被消费"的信号）
+// ---------------------------------------------------------------------------
+float    gVblankMs = 0.0f;        // 垂直消隐周期（ms）；0 = 未知
+static uint64_t gVblankCheckedMs = 0;
+uint32_t gAlignOk = 0, gAlignBad = 0;   // 间隔是否落在整数个垂直消隐上（每 5 秒清零打印）
+uint32_t gDupPresent = 0;               // 被判定为"同一垂直消隐内的重复呈现"的次数（诊断）
+uint64_t gPhaseRefQpc = 0;              // 累积相位重建的参考时刻（0 = 未启用）
+long     gPhaseNPrev = 0;               // 上一次的垂直消隐序号
+static int8_t gFsUsable = -1;           // GetFrameStatistics 是否可用（-1 = 还没试过）
+static int8_t gLpcUsable = -1;          // GetLastPresentCount 是否可用
+
+// 取当前显示刷新率 → 垂直消隐周期。5 秒最多重查一次（用户可能中途切刷新率）。
+static void EnsureVblankMs() {
+    uint64_t now = GetTickCount64();
+    if (gVblankMs > 0.0f && now - gVblankCheckedMs < 5000) return;
+    gVblankCheckedMs = now;
+    DEVMODEW dm{};
+    dm.dmSize = sizeof(dm);
+    if (EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &dm) && dm.dmDisplayFrequency > 1) {
+        float ms = 1000.0f / (float)dm.dmDisplayFrequency;
+        if (ms >= 2.0f && ms <= 100.0f) gVblankMs = ms;   // 夹在 10Hz..500Hz
+    }
+}
+
+// 一次性探测两条"显示事件"来源是否可用（结果缓存，只在第一次调用）。
+static void ProbeDisplayEventSources(IDXGISwapChain* sc) {
+    if (gFsUsable < 0) {
+        DXGI_FRAME_STATISTICS st{};
+        gFsUsable = SUCCEEDED(sc->GetFrameStatistics(&st)) ? 1 : 0;
+        Log("display event probe: GetFrameStatistics=%s (PresentCount=%u SyncRefreshCount=%u)",
+            gFsUsable ? "可用" : "不可用（flip 模型通常不支持）", st.PresentCount, st.SyncRefreshCount);
+    }
+    if (gLpcUsable < 0) {
+        UINT n = 0;
+        gLpcUsable = SUCCEEDED(sc->GetLastPresentCount(&n)) ? 1 : 0;
+        Log("display event probe: GetLastPresentCount=%s (%u)", gLpcUsable ? "可用" : "不可用", n);
+    }
+}
+
 // ---- Reflex 延迟标记
 //  游戏若启用 Reflex，会自己打 sim/submit/present 的标记，我们直接读它，
 //  这才是权威的 CPU 帧时间拆分（我们原来的公式只能算 Present 之间的残差）。
@@ -1428,27 +1488,55 @@ HRESULT PresentCommon(IDXGISwapChain* sc, UINT sync, UINT flags,
             if (mergeThresh < 2.0f) mergeThresh = 2.0f;      // 夹紧：别把 120fps 的帧吞了
             if (mergeThresh > 30.0f) mergeThresh = 30.0f;    // 夹紧：真卡顿时别乱合并
         }
-        // 判定用**原始**间隔（这一次呈现离上一次呈现多远）；
-        // 记账仍然用 fm（距上一次记账 —— 被合并时它自然覆盖整个帧）。
-        if (mergeThresh > 0.0f && fmRaw > 0.0f && fmRaw < mergeThresh) {
-            // ★★ 已回退（第二次）：**不再吸收**。
-            //
-            // 帧内合并曾被判定为回归并回退过一次（commit 37a2bf8
-            // 「回退帧内 Present 合并（回归）」），后来在 a709b37 又被加回来。
-            // 用户实测确认它带来了错误读数：稳 60 时帧时间显示 20+ms、
-            // Low 帧 40 多，而**体感完全不卡**、显卡驱动面板也不支持这个读数。
-            //
-            // 教训：我一度用模拟器得出「合并没有问题」的结论 —— 但那个模拟器
-            // **每帧只 Present 一次**（presents≈frames），合并逻辑**根本不会触发**。
-            // **用不触发某段代码的目标去验证那段代码，等于没验证。**
-            // 这个 bug 只能靠真实游戏验收（真实游戏会一帧多次 Present）。
-            //
-            // 若将来还要重新引入合并，前提是：
-            //   1) 先给模拟器加 --multi-present N 的能力，能在工作区内复现；
-            //   2) 用真实游戏 + 驱动面板数据交叉验证。
-            // 在那之前：每一次真实 Present 都记账（即合并之前的语义）。
-            // gAbsorbThisPresent = true;   // 已回退，见上
-            ++gMergedCount;
+        // 判定用**原始**间隔（这一次呈现离上一次呈现多远）。
+        // ⚠ 下面这个"间隔 < 0.6×均值"的阈值**只用于诊断计数**，不再拿它做吸收判定 ——
+        //   历史：按阈值吸收曾被判定为回归并回退过两次（commit 37a2bf8 / 用户实测
+        //   「稳 60 却显示 20+ms、Low 40 多」）。当时的结论是"按拍脑袋阈值吸收"这条路不行，
+        //   并且留下了两条前提：**① 工作区内能复现一帧多次 Present；② 真机 + 驱动面板交叉验证**。
+        //   本次按这两条重做（见下面的显示帧量化 + tests/verify_split_present.py）。
+        if (mergeThresh > 0.0f && fmRaw > 0.0f && fmRaw < mergeThresh) ++gMergedCount;
+
+        // ---- 以「显示帧」为准：**累积相位重建**（2026-10-11，③）
+        //
+        //   为什么是"累积"而不是"逐帧量化"：逐帧 round(interval/vblank) 的误差会**累积**
+        //   （实测宿主每帧偏 0.2 个周期 → 27fps 会被算成 30fps）。改成对**绝对时刻**取整：
+        //       N(k) = round( (t_k − t_ref) / P )        adv = N(k) − N(k−1)
+        //   误差被钉在 ±P/2 且不累积；帧在屏幕上待了 adv 个垂直消隐周期 → 时长 = adv × P。
+        //
+        //   它同时把两件事一起解决了（不用任何拍脑袋阈值）：
+        //     * 同一帧内的重复呈现：adv == 0 → 它不是新帧，**不记账**（时间自然归到下一帧）；
+        //     * 呈现时刻在帧内漂移（Spider-Man 的 10.7/16.3/16.6/23.0 四帧周期）：
+        //       重建后每帧都是 1 个周期 = 16.67ms，与显示器和驱动面板一致；
+        //     * 真掉帧（错过垂直消隐）：adv == 2 → 如实报 33.3ms，**不会被抹平**。
+        //
+        //   只在「同步呈现（SyncInterval ≥ 1）」且「刷新率已知」且「呈现确实是消隐节流」
+        //   （近 5 秒对齐率 ≥ 75%）时启用；否则回退原始间隔（不等垂直同步/撕裂的游戏）。
+        ProbeDisplayEventSources(sc);
+        EnsureVblankMs();
+        bool aligned = (gAlignOk + gAlignBad) < 30 ||
+                       (100.0 * gAlignOk / (gAlignOk + gAlignBad) >= 75.0);
+        if (gVblankMs > 0.0f && sync >= 1 && fm < 1000.0f) {
+            {
+                float periods = fm / gVblankMs;
+                float off = periods - (float)lround((double)periods);
+                if (off < 0.0f) off = -off;
+                if (off <= 0.25f) ++gAlignOk; else ++gAlignBad;
+            }
+            if (aligned) {
+                if (!gPhaseRefQpc) { gPhaseRefQpc = now; gPhaseNPrev = 0; }
+                double tms = QpcMs(now - gPhaseRefQpc);
+                long n = lround(tms / (double)gVblankMs);
+                long adv = n - gPhaseNPrev;
+                if (adv <= 0) {
+                    gAbsorbThisPresent = true;      // 与上一次同一个垂直消隐 → 不是新帧
+                    ++gDupPresent;
+                } else {
+                    fm = (float)((double)adv * (double)gVblankMs);
+                    gPhaseNPrev = n;
+                }
+            }
+        } else {
+            gPhaseRefQpc = 0;                       // 不等垂直同步 → 相位重建无意义，重置
         }
         // 超过 1 秒的间隔不是「一帧」，是切出去/加载/挂起留下的空档。
         // 把它塞进统计会把 1% Low / 0.1% Low 直接拖到个位数 ——
@@ -1602,9 +1690,13 @@ HRESULT PresentCommon(IDXGISwapChain* sc, UINT sync, UINT flags,
         if (ms - diagT0 >= 5000 && diagN > 0) {
             uint32_t real = diagN - diagTest;
             Log("present diag 5s: calls=%u real=%u test=%u sync0=%u sync1=%u other=%u "
-                "frameMs min=%.2f max=%.2f avg=%.2f",
+                "frameMs min=%.2f max=%.2f avg=%.2f | vblank=%.2fms aligned=%u/%u (%.0f%%) dup=%u",
                 diagN, real, diagTest, diagSync0, diagSync1, diagOther,
-                diagMin > 1e8f ? 0.0f : diagMin, diagMax, real ? (float)(diagSum / real) : 0.0f);
+                diagMin > 1e8f ? 0.0f : diagMin, diagMax, real ? (float)(diagSum / real) : 0.0f,
+                (double)gVblankMs, gAlignOk, gAlignOk + gAlignBad,
+                (gAlignOk + gAlignBad) ? 100.0 * gAlignOk / (gAlignOk + gAlignBad) : 0.0,
+                gDupPresent);
+            gAlignOk = gAlignBad = gDupPresent = 0;
             diagN = diagTest = diagSync0 = diagSync1 = diagOther = 0;
             diagMin = 1e9f; diagMax = 0.0f; diagSum = 0.0;
             diagT0 = ms;
