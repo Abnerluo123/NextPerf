@@ -419,11 +419,20 @@ static uint32_t gDbgPresents = 0;
 float    gVblankMs = 0.0f;        // 垂直消隐周期（ms）；0 = 未知
 static uint64_t gVblankCheckedMs = 0;
 uint32_t gAlignOk = 0, gAlignBad = 0;   // 间隔是否落在整数个垂直消隐上（每 5 秒清零打印）
+// ★ 对齐率的**滚动估计 + 迟滞开关**（2026-10-11 修）：原来闸门直接看"近 5 秒对齐率"，
+//   窗口每 5 秒清零一次 → 闸门可能**每 5 秒翻一次** → 帧时长在"量化值/原始值"之间来回切，
+//   画出来就是一串**周期性尖峰**（用户实测报过 ~20ms 波峰）。现在用 EMA + 迟滞：
+//   低于 60% 才关、高于 80% 才开，且估计是滚动的，不会周期性翻转。
+float    gAlignEma = 1.0f;
+bool     gQuantizeOn = true;
 uint32_t gDupPresent = 0;               // 被判定为"同一垂直消隐内的重复呈现"的次数（诊断）
 uint64_t gPhaseRefQpc = 0;              // 累积相位重建的参考时刻（0 = 未启用）
 long     gPhaseNPrev = 0;               // 上一次的垂直消隐序号
 static int8_t gFsUsable = -1;           // GetFrameStatistics 是否可用（-1 = 还没试过）
 static int8_t gLpcUsable = -1;          // GetLastPresentCount 是否可用
+// ⚠ 显示事件探测（`ProbeDisplayEventSources`）只做一次并缓存；**垂直消隐周期由 worker 线程刷新**
+//   （`EnsureVblankMs` 内部自己 5 秒限流）。两者都绝不能放在渲染线程的 Present 路径上 ——
+//   2026-10-11 踩过：每 5 秒一次 `EnumDisplaySettingsW` 让面板出现周期性的 ~20ms 波峰。
 
 // 取当前显示刷新率 → 垂直消隐周期。5 秒最多重查一次（用户可能中途切刷新率）。
 static void EnsureVblankMs() {
@@ -1493,9 +1502,22 @@ HRESULT PresentCommon(IDXGISwapChain* sc, UINT sync, UINT flags,
         //   历史：按阈值吸收曾被判定为回归并回退过两次（commit 37a2bf8 / 用户实测
         //   「稳 60 却显示 20+ms、Low 40 多」）。当时的结论是"按拍脑袋阈值吸收"这条路不行，
         //   并且留下了两条前提：**① 工作区内能复现一帧多次 Present；② 真机 + 驱动面板交叉验证**。
-        //   本次按这两条重做（见下面的显示帧量化 + tests/verify_split_present.py）。
+        //   本次按这两条重做（见下面的显示帧量化 + tests/repro_low_frame.py）。
         if (mergeThresh > 0.0f && fmRaw > 0.0f && fmRaw < mergeThresh) ++gMergedCount;
 
+        // ---- 帧识别诊断：**只读**（重活由 worker 线程做，见 EnsureVblankMs 的注释）
+        bool alignedNow = false;
+        if (gVblankMs > 0.0f && fm < 1000.0f) {
+            float periods = fm / gVblankMs;
+            float off = periods - (float)lround((double)periods);
+            if (off < 0.0f) off = -off;
+            alignedNow = (off <= 0.25f);
+            if (alignedNow) ++gAlignOk; else ++gAlignBad;
+        }
+        // 滚动估计 + 迟滞（见 gAlignEma 的注释）：避免闸门周期性翻转
+        gAlignEma += 0.02f * ((alignedNow ? 1.0f : 0.0f) - gAlignEma);
+        if (gQuantizeOn) { if (gAlignEma < 0.60f) gQuantizeOn = false; }
+        else if (gAlignEma > 0.80f) gQuantizeOn = true;
         // ---- 以「显示帧」为准：**累积相位重建**（2026-10-11，③）
         //
         //   为什么是"累积"而不是"逐帧量化"：逐帧 round(interval/vblank) 的误差会**累积**
@@ -1512,17 +1534,8 @@ HRESULT PresentCommon(IDXGISwapChain* sc, UINT sync, UINT flags,
         //   只在「同步呈现（SyncInterval ≥ 1）」且「刷新率已知」且「呈现确实是消隐节流」
         //   （近 5 秒对齐率 ≥ 75%）时启用；否则回退原始间隔（不等垂直同步/撕裂的游戏）。
         ProbeDisplayEventSources(sc);
-        EnsureVblankMs();
-        bool aligned = (gAlignOk + gAlignBad) < 30 ||
-                       (100.0 * gAlignOk / (gAlignOk + gAlignBad) >= 75.0);
-        if (gVblankMs > 0.0f && sync >= 1 && fm < 1000.0f) {
+        if (gVblankMs > 0.0f && sync >= 1 && fm < 1000.0f && gQuantizeOn) {
             {
-                float periods = fm / gVblankMs;
-                float off = periods - (float)lround((double)periods);
-                if (off < 0.0f) off = -off;
-                if (off <= 0.25f) ++gAlignOk; else ++gAlignBad;
-            }
-            if (aligned) {
                 if (!gPhaseRefQpc) { gPhaseRefQpc = now; gPhaseNPrev = 0; }
                 double tms = QpcMs(now - gPhaseRefQpc);
                 long n = lround(tms / (double)gVblankMs);
@@ -1537,6 +1550,26 @@ HRESULT PresentCommon(IDXGISwapChain* sc, UINT sync, UINT flags,
             }
         } else {
             gPhaseRefQpc = 0;                       // 不等垂直同步 → 相位重建无意义，重置
+        }
+        // ---- 尖峰探测器（2026-10-11）：用户报"固定周期出现 ~20ms 波峰"，
+        //   这里把"周期 + 幅度"直接量出来，别靠肉眼猜。测的是**量化后**的帧时长
+        //   （即显示帧时长），两个尖峰至少隔 1 秒才打一条，避免刷屏。
+        {
+            static uint64_t sLastSpikeMs = 0;
+            static float sBaseMs = 0.0f;
+            static uint32_t sSpikeN = 0;
+            if (sBaseMs <= 0.0f) sBaseMs = fm;
+            if (fm < sBaseMs * 1.15f) sBaseMs += 0.02f * (fm - sBaseMs);   // 基线只跟正常帧走
+            uint64_t tick = GetTickCount64();
+            // 灵敏度：>1.15 倍基线**且**多出 ≥2ms —— 用户报的"16.67 → 20ms 波峰"正好卡在这个门限上
+            // （原来写 1.35 倍，那种波峰根本不会被记录）。
+            if (fm > sBaseMs * 1.15f && fm > sBaseMs + 2.0f && tick - sLastSpikeMs > 1000) {
+                ++sSpikeN;
+                Log("spike: %.2fms (基线 %.2fms, 距上次尖峰 %.2fs, 第 %u 次)",
+                    (double)fm, (double)sBaseMs,
+                    sLastSpikeMs ? (double)(tick - sLastSpikeMs) / 1000.0 : -1.0, sSpikeN);
+                sLastSpikeMs = tick;
+            }
         }
         // 超过 1 秒的间隔不是「一帧」，是切出去/加载/挂起留下的空档。
         // 把它塞进统计会把 1% Low / 0.1% Low 直接拖到个位数 ——
@@ -2971,6 +3004,11 @@ static DWORD WINAPI Worker(LPVOID) {
 
     while (gReady) {
         Sleep(200);
+
+        // 垂直消隐周期：**只能在 worker 线程查**（`EnumDisplaySettingsW` 是重活，
+        //   放进 Present 路径会让面板出现周期性的 ~20ms 波峰 —— 2026-10-11 用户实测报过）。
+        //   内部 5 秒限流，所以每条心跳都调也没关系；Present 路径只读 gVblankMs。
+        EnsureVblankMs();
 
         // ---- 看门狗：回答「游戏卡住时到底卡在哪」（见 gPresentEnterMs 的说明）
         //   只在状态**变化**时打一条，避免刷屏。这是"先加诊断再改行为"那条规矩的落地：
