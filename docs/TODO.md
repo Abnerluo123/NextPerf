@@ -178,7 +178,7 @@
 | README 说静默机制"挂在一个永远不成立的条件上、等于从未生效" | 触发条件是 RTV 槽位攒满 8 个，而槽位按后台缓冲对象累加 → **会触发，只是要等到第二~三次重建**；准确说法是"来得太晚" | README 已知问题 |
 | 数据来源日志文案写"最近1200帧样本推算"、`CPU 帧时间 <- 帧周期 - Present 阻塞`、`engtype_compute/engtype_ofa` | 三处都已按代码实际口径改正 | `src/app/main.cpp` |
 | （2026-10-11 深夜）**纯 DX12 游戏被判成 Vulkan → 完全没数据**（《漫威蜘蛛侠》实测） | 根因：钩子自己静态导入 `d3d12.dll`/`d3d11.dll`，而 `SelfImports()` 把它们全跳过 → 最强 D3D 信号**永远失效** → `vulkan-1.dll` 命中 → `probe disabled` → `swapVt=0`（一次都没挂上）。**修法**：用 `D3D12Core.dll`（只在真建有 D3D12 设备时出现、我们没导入）作首要判据；`GuessApiFromModules()` 与 `HostApiGuess()` 口径统一 | `src/hook/np_hook.cpp`；回归用例 `tests/verify_dx12_decoyvk.py`（**修复前必 FAIL**）；`docs/HOOK.md` §7 教训 3 + §22 坑 6b |
-| （2026-10-11 深夜）**CPU 帧时间掉到 0.几 ms**（《漫威蜘蛛侠》实测"太异常"） | 根因：`gPresentRetQpc`（Busy 与模拟阶段的基准）漏在 `realPresent` 判断之外 → 被每帧那次 `DXGI_PRESENT_TEST` 探测调用的返回覆盖 → **`Busy + Wait` 只剩半个帧周期**（0.35+7.88=8.23 vs 16.7ms）；面板显示 `cpuBusyAvg` 故为 0.3ms。**修法**：只有真实呈现才推进该基准（帧记账的 `gLastPresentQpc` 本来就这么判） | `src/hook/np_hook.cpp`；回归用例 `tests/verify_present_test.py`（`host_run.exe --probe-present`，修复前比值 0.48 / 修复后 1.09）；`docs/HOOK.md` §22 坑 6c |
+| （2026-10-11 深夜）**CPU 帧时间掉到 0.几 ms**（《漫威蜘蛛侠》实测"太异常"） | ✅ **已修并经用户实测确认**（v1.6.5）：根因是 `gPresentRetQpc`（Busy 与模拟阶段的基准）漏在 `realPresent` 判断之外 → 被每帧那次 `DXGI_PRESENT_TEST` 探测调用的返回覆盖 → **`Busy + Wait` 只剩半个帧周期**（0.35+7.88=8.23 vs 16.7ms）；面板显示 `cpuBusyAvg` 故为 0.3ms。**修法**：只有真实呈现才推进该基准（帧记账的 `gLastPresentQpc` 本来就这么判）。用户验收原话：**"这个版本的 CPU 帧时间比以往任何一个版本都要正确"** | `src/hook/np_hook.cpp`；回归用例 `tests/verify_present_test.py`（`host_run.exe --probe-present`，修复前比值 0.48 / 修复后 1.09）；`docs/HOOK.md` §22 坑 6c |
 
 ---
 
