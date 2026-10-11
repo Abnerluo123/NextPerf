@@ -201,13 +201,15 @@ void AppPollSensors() {
                    "(系统/驱动, 单位100ns)", s.gpuBusyMs, (unsigned long)pid);
             if (!gApp.hub.gameGpuDiag().empty()) AppLog("  (PDH 未出数原因 : %s)", gApp.hub.gameGpuDiag().c_str());
             AppLog("  AI 引擎       : compute=%.1f%% ofa=%.1f%%  <- PDH \\GPU Engine(*)\\"
-                   "Utilization Percentage(engtype_compute / engtype_ofa)",
+                   "Utilization Percentage(engtype_Compute / engtype_OFA)",
                    s.engCompute, s.engOfa);
             AppLog("  帧率/帧时间   : %.1f fps / %.2f ms  <- IDXGISwapChain::Present 间隔"
                    "(钩子, 已滤 DXGI_PRESENT_TEST)", t.fps, t.frameMs);
-            AppLog("  CPU 帧时间    : %.2f ms       <- 帧周期 - Present 阻塞 %.2f ms(钩子推算)",
+            AppLog("  CPU 帧时间    : %.2f ms       <- CPUBusy + CPUWait(PresentMon 口径, 钩子);"
+                   " 本帧在 Present 内 %.2f ms",
                    t.cpuFrameMs, t.msInPresent);
-            AppLog("  Low 帧        : 1%%=%.1f 0.1%%=%.1f <- 最近1200帧样本推算(钩子)",
+            AppLog("  Low 帧        : 1%%=%.1f 0.1%%=%.1f <- 钩子 1000ms 窗口平均(回看约 10s);"
+                   " ETW 可用时由 ETW 覆盖",
                    t.fpsLow1, t.fpsLow01);
             AppLog("  GPU 占用/温度 : %.0f%% / %.0fC    <- NVML(厂商SDK)",
                    s.gpuUsage, s.gpuTemp);
