@@ -1280,37 +1280,29 @@ void UpdateTelemetryCommon(const NPConfig& cfg, uint64_t nowQpc, bool realPresen
     //（用户为此吃过亏：68 秒回看会让数值钉住近 70 秒）。
     {
         double fpsRef = t.fpsAvg > 1.0f ? (double)t.fpsAvg : 60.0;
-        uint32_t look = (uint32_t)(fpsRef * 10.0);
-        if (look < 200) look = 200;
-        if (look > np::FrameStats::kCap) look = np::FrameStats::kCap;
-        // ★ Low 口径按"帧序列是否可信"分流（2026-10-11，用户实测后定）：
+        // ★ Low 口径 = **照抄 Intel PresentMon 的动态查询实现**（2026-10-11 复核它的源码后定的；
+        //   之前我们自己发明的"1000ms 窗口平均 + 取最差窗口"、以及 250ms/30s 都不是它的做法）。
         //
-        //   * ③ 生效（呈现与垂直消隐**锁相**）→ 帧时长就是显示器上真实显示的那一帧
-        //     → 用**百分位**（渐变、1% 与 0.1% 不同）。
-        //   * ③ 不生效（例如《漫威蜘蛛侠》：呈现与消隐只是**同速**、并不锁相）→
-        //     帧序列里带着**亚帧级**的呈现抖动（10.7/16.3/16.6/23.0 交替、平均正好 16.65）。
-        //     此时严格百分位会把这种抖动当成掉帧（实测 Low≈42，而显示器明明是 60fps），
-        //     所以退回"窗口平均"口径 —— 它本来就是为吃掉这种抖动而存在的
-        //     （代价：数值会有台阶、且回看窗口太少导致 1% 与 0.1% 相同）。
-        if (gQuantizeOn) {
-            t.fpsLow1 = gStats.lowPercentileFps(99.0f, look);
-            t.fpsLow01 = gStats.lowPercentileFps(99.9f, look);
-        } else {
-            // ★ 2026-10-11 用户实测（关锁帧那局）：`1%=58.9 → 95.9 → 96.3 → 97.4` 一步跳、
-            //   且 `1%` 与 `0.1%` 恒等。原因是窗口**太粗**：1000ms 窗口 + 10 秒回看
-            //   → 只有约 10 个窗口 → `ceil(10×1%)` 与 `ceil(10×0.1%)` 都等于 1（同一个窗口）。
-            //   改细：**窗口 250ms、回看 30 秒** → 约 120 个窗口
-            //   → `ceil(120×1%)=2`（取最差两个窗口的平均）vs `ceil(120×0.1%)=1`（最差一个）
-            //   → **两行不再是同一个数** ✓；取两个窗口的平均也让过渡少一点"一步到位"。
-            //   250ms 仍能吃掉亚帧抖动（60fps 下约 15 帧 ≈ 3.75 个抖动周期）。
-            uint32_t look30 = (uint32_t)(fpsRef * 30.0);
-            if (look30 < 600) look30 = 600;
-            if (look30 > np::FrameStats::kCap) look30 = np::FrameStats::kCap;
-            t.fpsLow1 = gStats.lowWindowed(1.0f, 250.0f, look30);
-            t.fpsLow01 = gStats.lowWindowed(0.1f, 250.0f, look30);
-            if (t.fpsLow1 <= 0.0f) t.fpsLow1 = gStats.lowPercentileFps(99.0f, look);
-            if (t.fpsLow01 <= 0.0f) t.fpsLow01 = gStats.lowPercentileFps(99.9f, look);
-        }
+        //   * 窗口：**滑动 1000ms**（`--window-size` 默认值，SampleClient/CliOptions.h:49），
+        //     **每个轮询（每帧）都重算** —— PresentMonMiddleware/DynamicQuery.cpp:
+        //         newest = now − windowOffset;   oldest = newest − windowSize;
+        //   * 统计：在**窗口内的样本**上**直接取百分位** —— 没有"先把窗口求平均"这一步：
+        //       Core/source/pmon/StatisticsTracker.cpp 与
+        //       PresentMonMiddleware/DynamicStat.cpp::InputSortedSamples：
+        //         h = p × (N − 1);  i = floor(h);  g = h − i;  q = x[i] + g·(x[i+1] − x[i])
+        //     （我们的 percentileMs() 与它逐字一致：index = p/100 × (take−1) + 线性插值）
+        //   * 倒数指标排名反转（DynamicStat.cpp:323 `AdjustPercentileForReciprocation_`）：
+        //         FPS 的 P1 ≡ 帧时间的 P99 → 1% Low = 1000 / P99(帧时间)
+        //   * `1%` / `0.1%` = 同一个 1 秒窗口内的 p = 0.99 / 0.999
+        //     （PresentMon 有 PM_STAT_PERCENTILE_99；0.999 按同一定义补）
+        //
+        //   窗口按**帧数**近似 —— 最近 1 秒收到的帧数 ≈ fpsAvg（我们只存帧时间、不存时间戳）。
+        //   于是每帧都在动、回看只有 1 秒：不会像"取最差窗口"那样钉住好几秒再跳。
+        uint32_t n1s = (uint32_t)(fpsRef * 1.0);
+        if (n1s < 20) n1s = 20;
+        if (n1s > np::FrameStats::kCap) n1s = np::FrameStats::kCap;
+        t.fpsLow1 = gStats.lowPercentileFps(99.0f, n1s);
+        t.fpsLow01 = gStats.lowPercentileFps(99.9f, n1s);
     }
     t.p99Ms = gStats.percentileMs(99.0f);
     t.p999Ms = gStats.percentileMs(99.9f);

@@ -208,7 +208,7 @@ void AppPollSensors() {
             AppLog("  CPU 帧时间    : %.2f ms       <- CPUBusy + CPUWait(PresentMon 口径, 钩子);"
                    " 本帧在 Present 内 %.2f ms",
                    t.cpuFrameMs, t.msInPresent);
-            AppLog("  Low 帧        : 1%%=%.1f 0.1%%=%.1f <- 钩子 1000ms 窗口平均(回看约 10s);"
+            AppLog("  Low 帧        : 1%%=%.1f 0.1%%=%.1f <- 钩子 PresentMon 口径(滑动 1000ms 窗口内的 P99/P99.9 帧时间取倒数);"
                    " ETW 可用时由 ETW 覆盖",
                    t.fpsLow1, t.fpsLow01);
             AppLog("  GPU 占用/温度 : %.0f%% / %.0fC    <- NVML(厂商SDK)",
