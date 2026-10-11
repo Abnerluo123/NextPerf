@@ -1,12 +1,12 @@
 # NextPerf 钩子层（Hook Layer）技术文档
 
-> **行号基准（务必先读）**：本文档全部行号对照的是 **`src/hook/np_hook.cpp` = 2755 行**
-> （`np_draw.cpp` = 610 行、`np_draw.h` = 104 行、`np_reflex.h` = 128 行、`dllmain.cpp` = 26 行、
-> `np_common.h` = 497 行、`np_stats.h` = 269 行）时的版本。
+> **行号基准（务必先读）**：本文档全部行号对照的是 **`src/hook/np_hook.cpp` = 2755 行**时的版本。
 >
-> ⚠ **`np_hook.cpp` 正在被并行修改中**：本文档编写期间它先是从 2684 行变成 2744 行
-> （新增了「崩溃上下文快照」`gDbg*` + `SEH ctx:` 日志），又变成 2755 行。
-> **行号是全文最易过期的信息** —— 如果你发现某处对不上，**按函数名去搜**，不要去信行号：
+> 🚨 **这个基准已经失效**：`np_hook.cpp` 现在是 **2971 行**（`np_draw.cpp` = 625、`np_draw.h` = 119、
+> `np_common.h` = 506、`np_stats.h` = 269）—— 文档里的行号**整体下移了几十行**，
+> 而 `HOOK-FUNCTIONS.md` 用的是另一套（2755）基准，两份文档对同一函数常常差 11~43 行。
+> **这是一笔明确登记在案的口径债（`TODO.md` 的 D1）**，根治办法是**把行号全部删掉、只留函数名**。
+> 在那之前：**行号一律只当粗略参考，定位请按函数名搜**（见下例）。
 > ```
 > # 例：定位 PresentCommon / BeginList / RestoreAllHooks
 > Select-String -Path src\hook\np_hook.cpp -Pattern '^(HRESULT PresentCommon|ID3D12GraphicsCommandList\* BeginList|static void RestoreAllHooks)'

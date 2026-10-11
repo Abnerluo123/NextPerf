@@ -2,10 +2,10 @@
 
 > 配套文档：[`HOOK.md`](HOOK.md)（钩子层主文档，含每个功能的实现逻辑与坑）、[`CATALOG.md`](CATALOG.md)（全项目文件编目）。
 >
-> ⚠ **行号基准与过期风险**：本表按 **`src/hook/np_hook.cpp` = 2755 行**（`np_draw.cpp` 610 行、
-> `np_draw.h` 104 行、`np_reflex.h` 128 行、`dllmain.cpp` 26 行）核对。
-> 这个文件**正在被并行修改**（编写期间从 2684 → 2744 → 2755 行）。
-> **行号过期时请按函数名重新定位**，不要按行号猜：
+> 🚨 **行号基准已失效**：本表按 `src/hook/np_hook.cpp` = **2755 行**核对，而它现在是 **2971 行**
+> （`np_draw.cpp` = 625、`np_draw.h` = 119）。而且 `HOOK.md` 用的是另一套基准，
+> 两份文档对同一函数常差 11~43 行 —— 已登记为口径债（`TODO.md` 的 **D1**）。
+> **请一律按函数名重新定位，不要按行号猜**：
 > ```
 > Select-String -Path src\hook\np_hook.cpp -Pattern '^(HRESULT PresentCommon|bool BeginList|void __stdcall NpECL)'
 > ```
