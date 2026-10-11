@@ -13,6 +13,21 @@ namespace np {
 // Microsoft-Windows-DxgKrnl {802EC45A-1E99-4B83-9920-87C98277BA9D}
 static const GUID kDxgKrnl = {
     0x802ec45a, 0x1e99, 0x4b83, {0x99, 0x20, 0x87, 0xc9, 0x82, 0x77, 0xba, 0x9d}};
+
+// ★ 事件 ID 过滤所需的两样东西（官方定义在 evntrace.h，但**只在 NTDDI_WIN8 以上**才声明，
+//   而我们的交叉编译目标版本低于它 → 头文件里没有，于是自己补上，值取自 Windows SDK）。
+//   见 MS Learn「EnableTraceEx2 function (evntrace.h)」的 EVENT_FILTER_DESCRIPTOR 说明。
+#ifndef EVENT_FILTER_TYPE_EVENT_ID
+#define EVENT_FILTER_TYPE_EVENT_ID 0x80000200
+typedef struct _NP_EVENT_FILTER_EVENT_ID {
+    BOOLEAN FilterIn;      // TRUE = 只保留列出的这些 ID；FALSE = 排除
+    UCHAR   Reserved;
+    USHORT  Count;
+    USHORT  Events[1];     // 必须按**升序**排列（实现内部二分查找）
+} NP_EVENT_FILTER_EVENT_ID;
+#else
+typedef EVENT_FILTER_EVENT_ID NP_EVENT_FILTER_EVENT_ID;
+#endif
 // 关键字 Present = 0x0000000008000000（本机 logman query providers 实测）
 // Present = 0x8000000，Base = 0x1。
 // 只启用 Present 时实测抓到的是 PresentQueuePacket / PresentHistory 这类
@@ -301,7 +316,13 @@ bool EtwMonitor::Start() {
     //   类型 EVENT_FILTER_TYPE_EVENT_ID，数据是 EVENT_FILTER_EVENT_ID{FilterIn, Reserved,
     //   Count, Events[]}。见 MS Learn「EnableTraceEx2 function (evntrace.h)」。
     //   ⚠ 文档要求 Events[] **按升序排列**（内部二分查找）：171 < 172 < 184 ✓
-    EVENT_FILTER_EVENT_ID filter{};
+    //
+    //   ⚠ 传法要看**真实原型**（mingw 头文件 evntrace.h 里是 SDK 10 的版本）：
+    //       EnableTraceEx2(TRACEHANDLE, LPCGUID, ULONG, UCHAR, ULONGLONG, ULONGLONG,
+    //                      ULONG Timeout, PENABLE_TRACE_PARAMETERS EnableParameters)
+    //     过滤器描述符是放在 ENABLE_TRACE_PARAMETERS.EnableFilterDesc 里，
+    //     不是第 8 个参数直接传（那是老版本 EnableTraceEx 的形式）。
+    NP_EVENT_FILTER_EVENT_ID filter{};
     filter.FilterIn = TRUE;          // TRUE = 只保留列出的这些 ID
     filter.Count = 3;
     filter.Events[0] = 171;          // PresentHistory_Start（每帧一次的应用提交）
@@ -309,10 +330,14 @@ bool EtwMonitor::Start() {
     filter.Events[2] = 184;          // Present_Info
     EVENT_FILTER_DESCRIPTOR fd{};
     fd.Ptr = (ULONGLONG)&filter;
-    fd.Size = (ULONG)(sizeof(EVENT_FILTER_EVENT_ID) + (filter.Count - 1) * sizeof(USHORT));
+    fd.Size = (ULONG)(sizeof(NP_EVENT_FILTER_EVENT_ID) + (filter.Count - 1) * sizeof(USHORT));
     fd.Type = EVENT_FILTER_TYPE_EVENT_ID;
+    ENABLE_TRACE_PARAMETERS params{};
+    params.Version = 2;              // ENABLE_TRACE_PARAMETERS_VERSION_2（v2 起才有 FilterDescCount）
+    params.EnableFilterDesc = &fd;
+    params.FilterDescCount = 1;
     ULONG en = EnableTraceEx2(sh, &kDxgKrnl, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
-                              TRACE_LEVEL_INFORMATION, kKwPresent, 0, 0, &fd);
+                              TRACE_LEVEL_INFORMATION, kKwPresent, 0, 0, &params);
     if (en != ERROR_SUCCESS) {
         // 过滤失败就退回不过滤（宁可多收，也别收不到）。失败原因记在 status 里，
         // 由主程序每 5 秒那行 [ETW] 打出来。
