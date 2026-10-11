@@ -706,7 +706,27 @@ void SensorHub::PollCpu(NPSensors& out) {
     double perfFreq = -1;
     // 频率：优先 CallNtPowerInformation（直接给每核当前 MHz，无需猜标称频率）
     double mhz = 0;
-    if (CpuFreqFromPowerInfo(&mhz)) {
+    // ★ 优先用 PDH：当前频率 = 标称 × %Processor Performance(_Total) / 100
+    //
+    // 为什么不用 CallNtPowerInformation：用户实测它在本机（Intel HWP/Speed Shift）
+    // **恒定返回基准频率 2700MHz** —— 面板因此一直显示 2700，那不是当前频率。
+    //
+    // 用户给的 typeperf 实测（每秒一行，20 行）证明只有这个是活的：
+    //     Processor Frequency     = 2300.000000  （恒定，死值，只能当标称用）
+    //     % Processor Performance = 108.9 → 187.8（跟着负载变）
+    //   2300 × 187.8% = 4320MHz，与任务管理器量级一致。
+    //
+    // `_Total` 实例是 **Windows 自己给的多核聚合结果**，不需要我们拟合。
+    {
+        double pct = 0;
+        if (pdh_.SumInstance(L"\\Processor Information(*)\\% Processor Performance",
+                             L"_Total", L"", &pct) &&
+            pct > 1.0) {
+            double base = cpuBaseMHz_ > 100.0 ? cpuBaseMHz_ : 2300.0;
+            mhz = base * pct / 100.0;
+        }
+    }
+    if (mhz < 100.0 && CpuFreqFromPowerInfo(&mhz)) {
         out.cpuClock = (float)mhz;
         cpuFreqFromNt_ = true;
     } else if (pdh_.SumWhere(L"Processor Information", L"_Total", &perfFreq) &&
