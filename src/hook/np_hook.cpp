@@ -537,8 +537,11 @@ bool SelfImports(const char* modName) {
 }
 
 // 宿主（游戏）自己是否已经把图形栈拉起来了 —— 排掉我们自己导入的那些。
+// ★ 2026-10-11：加上 `D3D12Core.dll` —— 它只在宿主**真的建了 D3D12 设备**时才出现，
+//   而我们的导入表里没有它；否则纯 DX12 游戏的 d3d12/d3d11 都被 `SelfImports` 排掉，
+//   这里会误判成"图形还没起来"（探测因此白白等到 +6000ms）。
 bool HostGraphicsUp() {
-    static const char* kMods[] = {"dxgi.dll", "d3d12.dll", "d3d11.dll",
+    static const char* kMods[] = {"D3D12Core.dll", "dxgi.dll", "d3d12.dll", "d3d11.dll",
                                   "d3d10.dll", "d3d9.dll", "opengl32.dll", "vulkan-1.dll"};
     for (const char* m : kMods) {
         if (SelfImports(m)) continue;          // 是我们带进来的，不算数
@@ -553,12 +556,32 @@ bool HostGraphicsUp() {
 //   都加载了它**（引擎/启动器的视频或探测模块）。上一版把 vulkan 排在最前，
 //   于是 D3D12 游戏被判成 Vulkan → 探测被永久禁用 → 中途注入再也挂不上 Present。
 //   判据按可靠性排序：d3d12 > d3d11 > d3d10 > d3d9 > vulkan > opengl。
+//
+// ★★ 2026-10-11 补的坑（生化危机8 之外又踩了一次，这次是《漫威蜘蛛侠》）：
+//   上面那套顺序**单独用是不够的** —— 我们自己的 DLL 静态导入了 `d3d12.dll` / `d3d11.dll` /
+//   `dxgi.dll`，而 `SelfImports()` 会把"我们自己带进来的"模块全部跳过。
+//   于是最强的两个 D3D 信号（d3d12/d3d11）**永远被跳过**，只剩 `vulkan-1.dll`
+//   这种我们没导入的模块能命中 → **纯 DX12 游戏被判成 Vulkan** → `hostIsD3D=false`
+//   → 探测拒绝运行（`probe disabled: host api=20`）→ 交换链一次都挂不上
+//   （`RestoreAllHooks: swapVt=0`）→ 面板显示 Vulkan 且没有任何数据。
+//   为什么以前没事：以前是**早注入**，游戏还没建交换链，工厂钩子直接抓到创建过程，
+//   API 从**真实设备**上学到（不靠猜）。加了 10 秒自动注入延迟之后变成**晚注入**，
+//   只能靠探测这条后路，而这条路被错误的 API 猜测堵死了。
+//
+//   修法：把 `D3D12Core.dll` 放在最前面判 —— 它是 `d3d12.dll` **真正创建 D3D12 设备时**
+//   才拉起来的运行时，我们的导入表里没有它（实测：纯 DX12 进程里有，我们自己的进程里没有），
+//   所以它既是最强信号、又不会被自己污染。
 int HostApiGuess() {
     struct Item { const char* mod; int api; };
     static const Item kItems[] = {
+        // 不受我们污染的信号，优先（D3D12Core 存在 == 本进程真的建过 D3D12 设备）
+        {"D3D12Core.dll", NP_API_D3D12},
+        {"d3d9.dll", NP_API_D3D9},
+        {"vulkan-1.dll", NP_API_VULKAN},
+        {"opengl32.dll", NP_API_OPENGL},
+        // 下面这些我们自己也导入，只有"宿主也加载了"才有一点意义 —— 保留在最后
         {"d3d12.dll", NP_API_D3D12},     {"d3d11.dll", NP_API_D3D11},
-        {"d3d10.dll", NP_API_D3D11},     {"d3d9.dll", NP_API_D3D9},
-        {"vulkan-1.dll", NP_API_VULKAN}, {"opengl32.dll", NP_API_OPENGL},
+        {"d3d10.dll", NP_API_D3D11},
     };
     for (const Item& it : kItems) {
         if (SelfImports(it.mod)) continue;
@@ -2739,9 +2762,16 @@ static void SelfUnloadNow() {
 // 从进程里已加载的模块猜图形 API。
 // Present 挂不上时（Vulkan / OpenGL 游戏）也要能告诉主程序「为什么没数据」，
 // 否则界面上只能显示「已注入但没数据」，用户完全不知道为什么。
+//
+// ★ 2026-10-11：这里原来是**另一套顺序**（vulkan 排在最前、且完全没查 `SelfImports`），
+//   和上面的 `HostApiGuess()` 口径不一致 —— 那份旧顺序正是 `HostApiGuess()` 注释里
+//   被点名警告过的写法。结果同一个进程在两处得到不同结论：探测门禁说 Vulkan（禁用探测），
+//   显示这边也说 Vulkan。现在统一成"先问 `HostApiGuess()`"，只有它给不出答案时，
+//   才用我们自己也导入的 d3d12/d3d11 作**弱兜底**（只为给用户一句解释）。
 int GuessApiFromModules() {
-    if (GetModuleHandleW(L"vulkan-1.dll")) return NP_API_VULKAN;
-    if (GetModuleHandleW(L"opengl32.dll")) return NP_API_OPENGL;
+    int a = HostApiGuess();
+    if (a != NP_API_UNKNOWN) return a;
+    // 弱信号兜底：d3d11/d3d12 我们自己也会导入，所以只能排在上面都没命中之后。
     if (GetModuleHandleW(L"d3d12.dll")) return NP_API_D3D12;
     if (GetModuleHandleW(L"d3d11.dll")) return NP_API_D3D11;
     if (GetModuleHandleW(L"d3d9.dll")) return NP_API_D3D9;
