@@ -256,8 +256,9 @@
 **只写不读的成员**：`hwinfoTried_`（`np_sensors.h:160`，只在 `:495` 置 true）、
 `cpuFreqFromNt_`（`:155`，只在 `:708`、`:713` 写）、`override_`（`:147`）。
 
-**🔴 已知缺陷（不影响编译，但功能是死的）**：`engtype_compute`（`:401`）/ `engtype_ofa`（`:411`）
-大小写与真实实例名不符 → AI 引擎两个数永远是 `-1`（详见 SENSORS.md 3.4 与 6.1）。
+**✅ 已修复（2026-10-11，`53037bd`）**：原先 `:401` / `:411` 用的是全小写
+`engtype_compute` / `engtype_ofa`，与真实实例名大小写不符 → AI 引擎两个数永远是 `-1`。
+现为 `engtype_Compute` / `engtype_OFA`。**真机复验（`engOfa > 0`）仍未做**（详见 SENSORS.md 3.4 与 6.1）。
 
 ---
 

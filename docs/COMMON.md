@@ -170,8 +170,8 @@ float percentileMs(float p /* 0..100 */, uint32_t window = kCap) const {
 | --- | --- | --- | --- | --- |
 | ① 最差 x% 取平均 | `lowPct(pct, window)` | 取最慢 `ceil(take*pct/100)` 帧，求**帧时间**平均 → 换算 FPS | CapFrameX / OCAT 老口径 | **保留供对照**，当前无调用点 |
 | ② integral（按**时间**累加） | `lowIntegral(pct, window)` | 帧时间**降序**排，依次累加直到累计时间 ≥ 总时长的 `pct%`，取**刚越过边界的那一帧** → 换算 FPS | MSI Afterburner；CapFrameX ≥ 1.5.3 | 保留供对照，当前无调用点 |
-| ③ 百分位（按**帧数**） | `lowPercentileFps(pct, window)` | 帧时间的第 pct 百分位（线性插值）→ 换算 FPS | **NVIDIA 驱动面板 / FrameView**；Intel PresentMon（倒数指标排名反转） | ✅ **最终采用** |
-| ④ 窗口平均 | `lowWindowed(pct, windowMs, lookback)` | 先把帧时间按 `windowMs` 分组求**窗口平均**，再取最差 `pct%` 的窗口平均求平均 → 换算 FPS | 游戏内 overlay / 驱动面板显示的本来就是窗口平均 FPS | 保留供对照，当前无调用点 |
+| ③ 百分位（按**帧数**） | `lowPercentileFps(pct, window)` | 帧时间的第 pct 百分位（线性插值）→ 换算 FPS | **NVIDIA 驱动面板 / FrameView**；Intel PresentMon（倒数指标排名反转） | **兜底**：窗口数不足 4 个（刚进游戏）时才用它 |
+| ④ 窗口平均 | `lowWindowed(pct, windowMs, lookback)` | 先把帧时间按 `windowMs` 分组求**窗口平均**，再取最差 `pct%` 的窗口平均求平均 → 换算 FPS | 游戏内 overlay / 驱动面板显示的本来就是窗口平均 FPS | ✅ **当前实际使用的是它**（1000ms 窗口、回看约 10 秒） |
 
 **为什么会走这么多弯路（每一句都有实测依据）：**
 
@@ -186,36 +186,48 @@ float percentileMs(float p /* 0..100 */, uint32_t window = kCap) const {
   源码注释原话：*"刀刃效应，极不稳定"*。
 * **口径③（百分位）与驱动面板一致**，因为百分位是**按帧数**算的：
   掉垂直同步的帧若不足 1%，P99 落在正常帧上 → 60 FPS。
-* **口径④最贴近体感**（实测 RE8 锁 60：严格 53.8 vs 驱动 59 vs 窗口平均 57.1），
-  但用户最终明确要求：**只用 Intel PresentMon 的权威口径，不再提供可调开关。**
+* **口径④最贴近体感**（实测 RE8 锁 60：严格 53.8 vs 驱动 59 vs 窗口平均 57.1）。
+  真实游戏会把一帧拆成多次 Present（实测 8.4/24.9 交替、平均恰好 16.65），这时严格百分位
+  （口径③）**必然**取到那批假长帧、显示 40 多 —— 所以**当前实际用的是口径④**，
+  口径③ 只当「窗口数还不够」时的兜底。**不再提供可调开关。**
 
-**最终口径 = 口径③ + PresentMon 的窗口与实现细节**（`np_hook.cpp` `UpdateTelemetryCommon`）：
+**当前实际口径 = 口径④（窗口平均）+ 口径③ 兜底**（`np_hook.cpp` `UpdateTelemetryCommon`）：
 
 ```cpp
-// 窗口：对齐 Intel PresentMon 的 --window-size 默认值 1000ms
-//   （IntelPresentMon/SampleClient/CliOptions.h:49）
-//   （实现 PresentMonMiddleware/DynamicQuery.cpp:221: oldest = newest - windowSize）
-uint32_t lowWin = (uint32_t)(t.fpsAvg > 1.0f ? t.fpsAvg : 60.0f);  // 1 秒 → 帧数
-if (lowWin < 30)  lowWin = 30;      // 下限：低于 30fps 时也别把窗口压到几帧
-if (lowWin > 480) lowWin = 480;     // 上限：高刷屏别用几千帧的窗口
-t.fpsLow1  = gStats.lowPercentileFps(99.0f,  lowWin);
-t.fpsLow01 = gStats.lowPercentileFps(99.9f, lowWin);
+// 主路径：1000ms 窗口平均（对齐 Intel PresentMon 的 --window-size 默认值）
+//   回看长度按当前平均帧率换算成约 10 秒 —— 不能更长，否则一次卡顿会"钉住"很久
+double fpsRef = t.fpsAvg > 1.0f ? (double)t.fpsAvg : 60.0;
+uint32_t look = (uint32_t)(fpsRef * 10.0);           // ≈10 秒
+if (look < 200) look = 200;
+if (look > np::FrameStats::kCap) look = np::FrameStats::kCap;
+t.fpsLow1  = gStats.lowWindowed(1.0f, 1000.0f, look);
+t.fpsLow01 = gStats.lowWindowed(0.1f, 1000.0f, look);
+
+// 兜底：窗口数不足 4 个（刚进游戏）时 lowWindowed 会返回 0，才退到口径③ 严格百分位
+//   这里的 window 参数单位是**帧数**（1 秒 → 帧数，夹在 [30, 480]）
+uint32_t lowWin = (uint32_t)(t.fpsAvg > 1.0f ? t.fpsAvg : 60.0f);
+if (lowWin < 30)  lowWin = 30;
+if (lowWin > 480) lowWin = 480;
+if (t.fpsLow1  <= 0.0f) t.fpsLow1  = gStats.lowPercentileFps(99.0f,  lowWin);
+if (t.fpsLow01 <= 0.0f) t.fpsLow01 = gStats.lowPercentileFps(99.9f, lowWin);
+
 t.p99Ms    = gStats.percentileMs(99.0f);     // 全缓冲（不设窗口）—— 只是留档，无人读
 t.p999Ms   = gStats.percentileMs(99.9f);
 ```
 
 三个必须知道的细节：
 
-1. **窗口是"1 秒"，不是"20 秒"。** 原来用 1200 帧（60fps 下 20 秒），
+1. **窗口是「1 秒」（1000ms），不是「20 秒」。** 原来用 1200 帧（60fps 下 20 秒），
    比 PresentMon 默认大 20 倍 —— 窗口越长，历史里的偶发 spike 越容易被算进"最差 1%"，
    数值被压低；而且「进游戏那几秒的着色器编译卡顿」会在统计里**赖着不走一分钟**。
    1 秒窗口还有个附带好处：**卡顿约 1 秒后就被遗忘**，不会"钉住"很久。
-2. **窗口用 `fpsAvg` 换算成帧数**，因为 `window` 参数的单位是**帧数**，不是毫秒。
-   高刷（240fps）时 1 秒 = 240 帧，低帧（30fps）时 = 30 帧。夹在 `[30, 480]`。
+2. **两个「窗口」要分清**：`lowWindowed` 的 `windowMs = 1000` 是**分组窗口**；
+   `lookback` 是**回看长度**（按 `fpsAvg * 10` 换算 ≈10 秒，下限 200 帧、上限 `kCap`）。
+   只有兜底那一档 `lowPercentileFps` 的 `window` 参数单位才是**帧数**。
 3. **"对 FPS 取 P1 ≡ 1000 / P99(帧时间)"** 这个等价关系来自 PresentMon 的
    「倒数指标排名反转」（`PresentMonMiddleware/DynamicStat.cpp:323`）：
    帧时间是"越小越好"的指标、FPS 是"越大越好"的指标，对 FPS 取第 1 百分位
-   就等于对帧时间取第 99 百分位再取倒数。**`lowPercentileFps(99.0f)` 做的事就是这个**，
+   就等于对帧时间取第 99 百分位再取倒数。**这条只对应兜底那一档（口径③）**，
    所以不要另外去写一个 "P1 of fps[]" —— 那是另一个（错误的）统计量。
 
 **改口径的唯一正确姿势**：先在 `tests/` 里造一段可复现的帧时间序列，把四种口径的
@@ -668,9 +680,12 @@ void rowRange(label, value, level, active, series, h, dec, warnMinBelow, warnMax
     中位数在 50/50 双峰上随奇偶振荡 → 阈值跳 → "该合并的时而不合并"。
     正确答案：**从未被合并过的原始序列的长窗口均值** `meanMs(240)`。
 12. **不要凭感觉改 Low 帧口径。** 四种口径实测差异巨大（对照表见 §3.4：
-    口径① `38~42`/`53.8`、口径② `30`、口径④ `57.1`，而**驱动面板是 `59`**），
-    最终采用 Intel PresentMon 的权威口径（1 秒滑动窗口 + 对 FPS 取 P1 ≡ `1000/P99(帧时间)`），
-    **有源码出处**。用户在这一点上明确要求"不再提供可调开关"。
+    口径① `38~42`/`53.8`、口径② `30`、口径④ `57.1`，而**驱动面板是 `59`**）。
+    **当前实际使用的是口径④（窗口平均，1000ms 窗口 / 回看约 10 秒）**，
+    口径③（严格百分位 ≡ `1000/P99(帧时间)`）只在窗口数不足 4 个时兜底。
+    ⚠ **这里曾经改错过**：本文件有一版写"最终采用口径③"，而代码当时已经改回口径④
+    （见 `git log` 里「恢复窗口平均口径」那次提交）—— 文档没跟上代码，差点把后来者带沟里。
+    **改口径之前先读 `np_hook.cpp::UpdateTelemetryCommon`，别照文档抄。**
 13. **窗口越长，Low 帧越低。** 1200 帧（20 秒）会让"进游戏那几秒的着色器编译卡顿"
     在统计里赖着不走一分钟 → 用户看到"稳定 60fps 却显示 1% Low = 10"。
 14. **超过 1 秒的帧间隔不是"一帧"**（是切出去/加载/挂起留下的空档），
@@ -745,8 +760,9 @@ void rowRange(label, value, level, active, series, h, dec, warnMinBelow, warnMax
 ### 9.2 动 Low 帧 / 统计口径
 
 * 先在 `tests/` 里造一段**可复现**的帧时间序列，把四种口径的输出打出来对比；
-* 记住最终口径的出处（Intel PresentMon：1 秒窗口 + 对 FPS 取 P1）；
-* **不要**为了"看起来更准"把窗口调大、把口径改回"最差 x% 平均"；
+* **当前口径 = 口径④ 窗口平均（1000ms 窗口 / 回看约 10 秒）**，口径③ 严格百分位只做兜底；
+* **不要**为了"看起来更准"把窗口调大、也不要改回"最差 x% 平均"（口径①）；
+* **改完必须同步本节、§3.4 和 README 的「已知问题」** —— 这个口径已经因为文档没跟上而误导过一次；
 * 别把 `thread_local` 改回 `static`。
 
 ### 9.3 动面板视觉 / 排版

@@ -1343,15 +1343,18 @@ AppLog("notice[%d]: %s", level, text.c_str());
 
 | # | 位置 | 现状 | 影响 | 建议 |
 | --- | --- | --- | --- | --- |
-| G1 | `np_common.h:438` vs `:200` | `NPDefaultConfig` 的循环写 `reserved[0..7]`，但数组只有 4 个元素 —— **越界写 16 字节** | 调用点全在本层：`SettingsLoad`（每次启动）、UI `A_DEFAULT`、`RunSelfTest`。按字段宽度推算 `sizeof(NPConfig) = 136` 且尾部无填充，`AppState` 里 `sensors` 正好从偏移 136 开始 → 越界写的正是 `gApp.sensors` 的 `magic`(136-139)、`version`(140-143)、`tickMs`(144-151)。后果：在下一轮 `NPClearSensors` 之前，发布出去的 Sensors 是 `magic = 0`（读方钩子按 `magic == NP_MAGIC` 判断，会忽略该帧）。**静默、无崩溃、但语义被破坏** | 修数组大小或循环上界（**本次未改代码**）。属 common 层，改动需两侧回归；顺带核对 `sizeof(NPConfig)` 是否仍等于 136 |
-| G2 | `main.cpp:1093-1107` | 学习成功的 `gApp.games.push_back` **没有 `AppLock`** | 与 `ui.cpp:483-488` 的规则自相矛盾；守护线程正在遍历 `games` 时会踩迭代器失效（崩主程序） | 补 `AppLock`（**本次未改**） |
-| G3 | `ui.cpp:631` | 游戏列表状态仍用 `(GetTickCount64() - t.tickMs) < 2500` **跨进程时钟比较** | 回到 §16.2 第 7 条那个 bug：状态可能永远显示不正确（32 位钩子 tickMs 落在「未来」） | 改用与 `main.cpp` 一致的帧计数判据（**本次未改**） |
-| G4 | `main.cpp:66` | 打开遥测块时**只校验 `magic`，没校验 `version`** | 结构体布局不一致时（旧 DLL 残留）会读到错位字节，且不会被发现 —— 这正是 `version = sizeof` 想防的事 | 加 `v->version == (uint32_t)sizeof(NPTelemetry)` 判断（**本次未改**） |
+
+> **状态提醒（2026-10-11 复核）**：**G1 / G2 / G3 / G9 已修复**（各行"建议"列已标注）；
+> **G4 / G5 仍未改**。下表"现状"列保留的是**发现问题当时**的描述，不是当前状态。
+| G1 | `np_common.h:438` vs `:200` | `NPDefaultConfig` 的循环写 `reserved[0..7]`，但数组只有 4 个元素 —— **越界写 16 字节** | 调用点全在本层：`SettingsLoad`（每次启动）、UI `A_DEFAULT`、`RunSelfTest`。按字段宽度推算 `sizeof(NPConfig) = 136` 且尾部无填充，`AppState` 里 `sensors` 正好从偏移 136 开始 → 越界写的正是 `gApp.sensors` 的 `magic`(136-139)、`version`(140-143)、`tickMs`(144-151)。后果：在下一轮 `NPClearSensors` 之前，发布出去的 Sensors 是 `magic = 0`（读方钩子按 `magic == NP_MAGIC` 判断，会忽略该帧）。**静默、无崩溃、但语义被破坏** | ✅ **已修**：`np_common.h:445` 改成 `sizeof(c->reserved)/sizeof(c->reserved[0])`，跟着数组大小走。属 common 层，两侧已回归；`sizeof(NPConfig)` 仍为 136 |
+| G2 | `main.cpp:1093-1107` | 学习成功的 `gApp.games.push_back` **没有 `AppLock`** | 与 `ui.cpp:483-488` 的规则自相矛盾；守护线程正在遍历 `games` 时会踩迭代器失效（崩主程序） | ✅ **已修**：`main.cpp:1120` 学习成功那段已加 `AppLock` |
+| G3 | `ui.cpp:631` | 游戏列表状态仍用 `(GetTickCount64() - t.tickMs) < 2500` **跨进程时钟比较** | 回到 §16.2 第 7 条那个 bug：状态可能永远显示不正确（32 位钩子 tickMs 落在「未来」） | ✅ **已修**：`ui.cpp:633` 改用主循环算好的 `gApp.telemetryLive` |
+| G4 | `main.cpp:66` | 打开遥测块时**只校验 `magic`，没校验 `version`** | 结构体布局不一致时（旧 DLL 残留）会读到错位字节，且不会被发现 —— 这正是 `version = sizeof` 想防的事 | ❌ **仍未改**：应加 `v->version == (uint32_t)sizeof(NPTelemetry)` 判断 |
 | G5 | `NPDefaultConfig`（`np_common.h:413-439`） | **没有设置** `autoInject` / `pauseHook` / `learnedAutoHook` / `detachPid` | 点「恢复默认」**不会**重置「实验性自动注入」等开关（保留了用户当前值） | 确认是「有意」还是漏了；若有意请在注释里写明（**未确认**） |
 | G6 | `GameEntry::hooked`（`np_app.h:46`）、`AppState::overlayVisible/uiVisible/lastPoll/lastOverlay`（`np_app.h:60-61`、`101-102`） | **全代码库无任何读写**（死字段） | 无功能影响，但会误导后来者以为有状态机 | 清理或注明 |
 | G7 | `cfg.autoInject`（`np_common.h:185`） | 只在 settings 里读写，**没有任何行为**（`AppAutoInjectTick` 是空的） | 界面已无对应开关，配置里留着一个永远无效的键 | 未来做启发式自动注入时可复用；现在请当作无效字段 |
 | G8 | `NP_MUTEX_SENSORS`（`np_common.h:24`） | 定义了但**从未使用** | 写传感器无锁，靠「整块拷贝」约定 | 若将来要原子发布传感器，这是现成的名字 |
-| G9 | `docs/ARCHITECTURE.md:195` | 记录的 overlay 判据还是旧的 `(now - tickMs) < 2500` | 会把读者带到 G3 那个坑 | 该文件不在本次改动范围，未修改；改它时以 §4.4 为准 |
+| G9 | `docs/ARCHITECTURE.md:195` | 记录的 overlay 判据还是旧的 `(now - tickMs) < 2500` | 会把读者带到 G3 那个坑 | ✅ **已修**（2026-10-11）：`ARCHITECTURE.md` §2.4 已改写成「判活一律用帧计数增长 + `gApp.telemetryLive`」 |
 | G10 | `main.cpp:313` 与 `385` | `ProcessIsWow64(pid)` 被调用**两次**（选 DLL 一次、解析 `LoadLibraryW` 前又一次） | 微小冗余，无正确性问题（期间目标位数不会变） | 可选优化 |
 | G11 | `--inject` 的参数解析（`main.cpp:910-916`） | 只做「跳过非数字」，`--inject abc123` 也会注入 123 | 自动化脚本传错参数不会报错 | 需要严格解析时再改 |
 

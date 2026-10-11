@@ -490,7 +490,7 @@ pid_1234_luid_0x00000000_0x0000ABCD_phys_0_eng_0_engtype_3D
 * 端到端回归：`tests/verify_metrics.py` 断言"先开 NextPerf、后开游戏"这个顺序下
   日志出现「命中 N 个引擎实例」且 GPU 帧时间 > 0（**只验证有值，不验证准不准**）。
 
-### 3.4 AI 引擎：`engtype_compute` / `engtype_ofa`
+### 3.4 AI 引擎：`engtype_Compute` / `engtype_OFA`
 
 **设计意图**（`:398-417`、`np_build.cpp:356-365`）：
 
@@ -502,10 +502,13 @@ pid_1234_luid_0x00000000_0x0000ABCD_phys_0_eng_0_engtype_3D
 （`:400-401` 与 `:410-411`），结果分别落到 `out.engCompute` / `out.engOfa`，并留存到
 `lastCompute_` / `lastOfa_`。
 
-**🔴 当前这一路是坏的（本次核对发现，源码注释里没有）**
+**✅ 已修复（2026-10-11，提交 `53037bd`）** —— 但**真机复验仍未做**，见本节末尾。
 
-代码用的过滤器是**全小写**的 `L"engtype_compute"` 和 `L"engtype_ofa"`（`:401`、`:411`），
-而 `wcsstr` **大小写敏感**，真实实例名是**大写开头**的：
+原来这里用的是**全小写**的 `L"engtype_compute"` 和 `L"engtype_ofa"`（旧 `:401`、`:411`），
+而 `wcsstr` **大小写敏感**、真实实例名是**大写开头**，于是命中 0 个、面板上这两个数永远是 `-1.0%`。
+现在已改成 `L"engtype_Compute"` / `L"engtype_OFA"`（`np_sensors.cpp:401`、`:413`，源码注释留了证据）。
+
+当时用来定性的实测证据（保留，供以后核对匹配规则）：
 
 | 用代码同款 API（`PdhGetFormattedCounterArrayW`）实测 875 个实例 | 命中数 |
 | --- | --- |
@@ -515,15 +518,16 @@ pid_1234_luid_0x00000000_0x0000ABCD_phys_0_eng_0_engtype_3D
 | 含 `engtype_ofa`（代码用的关键字） | **0** |
 | 含 `engtype_`（`Running Time` 用的关键字，全小写但真实名里也是小写） | 875 ✅ |
 
-程序自身日志（`%TEMP%\NextPerf.log`，本机实测，连续多个采样）也印证：
+修复**前**程序自身日志长这样（`%TEMP%\NextPerf.log`，本机实测，连续多个采样）：
 
 ```
 AI 引擎 : compute=-1.0% ofa=-1.0%  <- PDH \GPU Engine(*)\Utilization Percentage(engtype_compute / engtype_ofa)
 （PDH 未出数原因 : 命中 16 个引擎实例，累计 333.495 秒）      ← 同一时刻 Running Time 是好的
 ```
 
-**修法**（本文只写结论，不改代码）：把两个关键字改成 `L"engtype_Compute"` / `L"engtype_OFA"`，
-或改用大小写不敏感的匹配；改完必须用真实游戏（或打开 DLSS 帧生成的进程）复验 `engOfa > 0`。
+**⚠ 仍未验证的部分**：把关键字改对之后，**没有在真实 DLSS 帧生成场景里复验过 `engOfa > 0`** ——
+所以"这一路现在能出数了"目前**只是代码层面的结论**。要复验就跑一个开了 DLSS 帧生成的游戏，
+看面板「AI 引擎」行的 OFA 是否 > 0，并把结果写回本节。
 
 **为什么 `Running Time` 那条路不受影响**：它的第二个关键字是 `engtype_`，
 真实名里这段前缀本身就是小写，所以能匹配全部引擎实例。
@@ -902,16 +906,17 @@ PresentMon / RTSS 这类成熟软件的做法是订阅 `Microsoft-Windows-DxgKrn
 
 以下三条是写本文时**新发现**的，源码注释与既有文档都没有记载。本文**只记录，不改代码**。
 
-### 6.1 AI 引擎（compute / OFA）过滤器大小写不匹配 → 这一路实际是死的 🔴
+### 6.1 AI 引擎（compute / OFA）过滤器大小写不匹配 ✅ 已修复（2026-10-11，`53037bd`）
 
-* 位置：`np_sensors.cpp:401`（`L"engtype_compute"`）、`np_sensors.cpp:411`（`L"engtype_ofa"`）。
+* 位置（修复前）：`np_sensors.cpp:401`（`L"engtype_compute"`）、`:411`（`L"engtype_ofa"`）；
+  现为 `L"engtype_Compute"`（`:401`）/ `L"engtype_OFA"`（`:413`）。
 * 证据：用代码同款 API 实测 875 个实例，`engtype_Compute` 命中 **5** 个、`engtype_OFA` 命中 **38** 个，
-  而小写写法命中 **0** 个；程序自身日志每次都打 `compute=-1.0% ofa=-1.0%`，
+  而小写写法命中 **0** 个；修复前程序日志每次都打 `compute=-1.0% ofa=-1.0%`，
   同一时刻 `Running Time`（关键字 `engtype_`）正常出数并"命中 16 个引擎实例"。
-* 影响：面板「AI 引擎」行的 Compute/OFA 两个数**永远不会出现**；
-  `docs/RT_TENSOR.md` 里"OFA 只要在动就说明帧生成在工作"的能力**目前拿不到**。
-* 建议修法：`L"engtype_Compute"` / `L"engtype_OFA"`（或改成大小写不敏感匹配），
-  并用真实 DLSS 帧生成场景复验。**详见 3.4。**
+* 影响（修复前）：面板「AI 引擎」行的 Compute/OFA 两个数**永远不会出现**；
+  `docs/RT_TENSOR.md` 里"OFA 只要在动就说明帧生成在工作"的能力拿不到。
+* **遗留**：未在真实 DLSS 帧生成场景复验 `engOfa > 0`，所以"现在能出数了"只是代码层面的结论。
+* 详见 3.4。
 
 ### 6.2 一批"采了没接线 / 写了没读"的死代码与死字段
 

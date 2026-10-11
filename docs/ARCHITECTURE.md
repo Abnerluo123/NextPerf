@@ -192,11 +192,18 @@ D3D11 用另一套：`TIMESTAMP_DISJOINT` + 两个 `TIMESTAMP` 查询，3 组轮
 **叠加模式的自动切换逻辑**：
 
 ```cpp
-bool attached = telemetry.attached && (now - telemetry.tickMs) < 2500;
+// ⚠ 判活一律用「帧计数是否增长」，**绝不能**跨进程比较 tickMs：
+//   钩子写的 GetTickCount64() 与主程序自己的钟不可比，曾算出 age=4294967265ms（32 位下的 -31，
+//   tickMs 落在「未来」）→ attached 恒假 → 桌面 HUD 永不关闭（见 CATALOG 血泪教训 1）。
+//   主循环算好后存进 gApp.telemetryLive，界面与叠加都读它（见 np_app.h 的说明）。
+bool attached = gApp.telemetryLive;   // = attached && 帧数在 2500ms 内增长过
 bool wantDesktop = monitoring && (overlayMode == 2 || (!attached && overlayMode != 1));
 ```
 
 也就是：钩子在线 → 交给游戏内叠加画；钩子不在线（比如 Vulkan 游戏）→ 退回桌面叠加。
+
+> 2.5 秒是统一的「钩子已死」阈值，**三处共用**：`detachPid` 超时清理、陈旧遥测回收、overlay 判活。
+> 改一处不算改完。
 
 ---
 
