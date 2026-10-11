@@ -172,6 +172,7 @@ void AppPollSensors() {
                 bool have = np::Etw().Snapshot(&er);
                 AppLog("  [ETW] %s | %s", np::Etw().active() ? "运行中" : "未运行",
                        np::Etw().status().c_str());
+                AppLog("  [ETW] 诊断: %s", np::Etw().diagText().c_str());
                 if (have) {
                     AppLog("  [ETW] 外置帧计时 : %.1f fps / %.2f ms | 1%%Low %.1f | 0.1%%Low %.1f "
                            "| present 累计 %u (窗口 %u)",

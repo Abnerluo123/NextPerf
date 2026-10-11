@@ -67,6 +67,12 @@ public:
     //   主线程同时读同一个 std::string 是未定义行为（SSO 缓冲/堆指针撕裂会崩）。
     std::string status() const;
 
+    // 诊断（2026-10-11）：用户实测"[ETW] 运行中，但还没有数据" —— 需要知道事件**到底有没有到**、
+    //   以及**事件头 pid 是不是目标进程**。DxgKrnl 是内核 provider，事件头里的 ProcessId
+    //   未必等于调用 Present 的进程（PresentMon 是按**事件载荷里的 ProcessId** 过滤的，
+    //   我们是按事件头过滤 —— 这可能就是"零命中"的原因）。
+    std::string diagText() const;
+
 private:
     static void __stdcall OnEvent(PEVENT_RECORD ev);
     static ULONG __stdcall OnBuffer(PEVENT_TRACE_LOGFILEW lf);
@@ -92,6 +98,13 @@ private:
     // 诊断用：记录匹配上的事件名（去重）
     wchar_t evNames_[6][96]{};
     int     evNameN_ = 0;
+
+    // 诊断计数（在**过滤之前**统计）：收到的全部事件 / 头部 pid 命中 / 头部 pid 不命中；
+    // 以及前几个不同的事件键（id/ver/op/pid），用来判断"到了但键不对"还是"根本没到"。
+    uint32_t diagRecv_ = 0, diagPidMatch_ = 0, diagOtherPid_ = 0;
+    struct DiagEv { uint16_t id; uint8_t ver; uint8_t op; uint32_t pid; };
+    DiagEv   diagSeen_[10]{};
+    int      diagSeenN_ = 0;
 
     uint32_t targetPid_ = 0;
     uint64_t lastQpc_ = 0;

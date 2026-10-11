@@ -94,9 +94,42 @@ static int ClassifyEvent(PEVENT_RECORD ev, uint8_t* opOut, wchar_t* nameOut, siz
     return (*opOut == 1) ? 1 : 0;
 }
 
+std::string EtwMonitor::diagText() const {
+    char buf[400];
+    int off = snprintf(buf, sizeof(buf), "收到事件 %u（头部 pid 命中 %u / 不命中 %u）",
+                       diagRecv_, diagPidMatch_, diagOtherPid_);
+    if (diagSeenN_ > 0 && off > 0 && off < (int)sizeof(buf) - 2) {
+        off += snprintf(buf + off, sizeof(buf) - (size_t)off, " | 事件键: ");
+        for (int i = 0; i < diagSeenN_ && off > 0 && off < (int)sizeof(buf) - 40; ++i) {
+            off += snprintf(buf + off, sizeof(buf) - (size_t)off, "%s(id=%u v=%u op=%u pid=%u)",
+                            i ? ", " : "", (unsigned)diagSeen_[i].id, (unsigned)diagSeen_[i].ver,
+                            (unsigned)diagSeen_[i].op, (unsigned)diagSeen_[i].pid);
+        }
+    }
+    return std::string(buf);
+}
+
 void __stdcall EtwMonitor::OnEvent(PEVENT_RECORD ev) {
     EtwMonitor& m = Etw();
     if (!m.active_ || !ev) return;
+    // ---- 诊断：在**任何过滤之前**先统计 + 记下事件键（2026-10-11）
+    {
+        ++m.diagRecv_;
+        if (m.targetPid_ && ev->EventHeader.ProcessId == m.targetPid_) ++m.diagPidMatch_;
+        else ++m.diagOtherPid_;
+        if (m.diagSeenN_ < 10) {
+            const auto& dd = ev->EventHeader.EventDescriptor;
+            bool dup = false;
+            for (int i = 0; i < m.diagSeenN_; ++i) {
+                if (m.diagSeen_[i].id == dd.Id && m.diagSeen_[i].op == dd.Opcode &&
+                    m.diagSeen_[i].pid == ev->EventHeader.ProcessId) { dup = true; break; }
+            }
+            if (!dup) {
+                m.diagSeen_[m.diagSeenN_] = {dd.Id, dd.Version, dd.Opcode, ev->EventHeader.ProcessId};
+                ++m.diagSeenN_;
+            }
+        }
+    }
     // ★ 没有目标进程时**一条都不算**。targetPid_ == 0 以前表示「全都算」，
     //   而主程序在还没注入任何游戏时正是这个状态 —— 于是全系统（桌面、浏览器、
     //   播放器）的 present 事件都被算进来，Low 帧被污染成别的程序的数字。
