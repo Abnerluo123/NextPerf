@@ -557,6 +557,19 @@ int ForgetLearned() {
     return n;
 }
 
+// 「探测到目标进程之后，等多久才自动注入」。
+//
+// 为什么需要它（2026-10-11 用户实测，生化危机8 · DX12）：
+//   * **自动**注入（进程一出现就注入）-> 游戏**闪退**；
+//   * 进到游戏里之后**手动**注入 -> 不闪退。
+// 早期注入正好撞上游戏自己初始化 D3D 设备/交换链，而我们的钩子在那时还要额外建一个
+// D3D11 设备 + 隐藏窗口去探测交换链 vtable —— 两边一起动 driver，代价就是闪退。
+// 等几秒（默认 10s）让游戏把图形初始化做完再注入，场景就等价于"手动注入"。
+//
+// ⚠ 这只是一个**时序缓解**，不是根因修复：根因是"探测 vtable 要自建 D3D11 设备"这件事
+//   本身在游戏初始化期不安全。想调就改这里（单位毫秒，0 = 关掉延迟、恢复旧行为）。
+static const DWORD kAutoInjectDelayMs = 10000;
+
 void InjectorScanNow() {
     {
         AppLock lk;      // gApp.monitoring / gApp.games 都是跨线程共享的
@@ -611,6 +624,8 @@ void InjectorScanNow() {
             if (pid != g.pid) {
                 if (pid) AppLog("watch: %ls is running (pid=%lu)", want.c_str(), (unsigned long)pid);
                 else if (g.pid) AppLog("watch: %ls exited", want.c_str());
+                // ★ 新出现的进程从这一刻开始计时；注入要等 kAutoInjectDelayMs（见上面的说明）。
+                g.seenAtMs = pid ? GetTickCount() : 0;
             }
             g.pid = pid;
             g.injected = pid && IsInjected(pid);
@@ -626,6 +641,26 @@ void InjectorScanNow() {
             }
             for (auto& g : gApp.games) {
                 if (g.pid == p.pid) {      // 只注入这一轮匹配上的那个进程
+                    // ★ 不要「一看到进程就注入」。
+                    //   实测（2026-10-11，生化危机8 · DX12）：进程刚起来就注入 -> **游戏闪退**；
+                    //   进到游戏里再手动注入 -> 不闪退。原因是早期注入正好撞上游戏自己
+                    //   初始化 D3D 设备/交换链，而我们的钩子还要**额外建一个 D3D11 设备**
+                    //   去探测交换链 vtable（ProbeSwapChainVtable），两边一起动 driver。
+                    //   所以等 kAutoInjectDelayMs 再动手。
+                    //   手动注入（「注入到上一个游戏」/`--inject`）**不受影响** —— 那是用户
+                    //   自己按的，本来就是"游戏已经在跑"的场景。
+                    DWORD age = g.seenAtMs ? GetTickCount() - g.seenAtMs : 0;
+                    if (g.seenAtMs && age < kAutoInjectDelayMs) {
+                        static DWORD sLastWaitLog = 0;
+                        DWORD tk = GetTickCount();
+                        if (tk - sLastWaitLog > 5000) {
+                            sLastWaitLog = tk;
+                            AppLog("auto-inject delay: 等 pid=%lu 启动满 %us 再注入（现在 %u.%us）",
+                                   (unsigned long)p.pid, (unsigned)(kAutoInjectDelayMs / 1000),
+                                   (unsigned)(age / 1000), (unsigned)((age % 1000) / 100));
+                        }
+                        break;
+                    }
                     toInject.push_back(p.pid);
                     break;
                 }

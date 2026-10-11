@@ -42,6 +42,10 @@ struct GameEntry {
     // 商店（UWP）应用的 exe 在 WindowsApps 下，普通用户读不了，只能按名字匹配。
     std::wstring name;
     DWORD pid = 0;        // 当前匹配到的进程，0 = 没在运行
+    // 这个进程**第一次**被看到的时刻（GetTickCount）。用于「别一看到进程就注入」：
+    // 进程刚起来时游戏自己还在初始化 D3D 设备/交换链，那时注入实测会让游戏闪退
+    // （2026-10-11，生化危机8 DX12）。纯运行时字段，不持久化。
+    DWORD seenAtMs = 0;
     bool  injected = false;
     bool  hooked = false; // 钩子已接管画面（有新鲜遥测）
     // true = 由「注入成功后自动学习」加的（见 main.cpp 的学习逻辑）；
