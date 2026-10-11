@@ -139,6 +139,7 @@
 | `watchdog: 已有 X.Xs 没有 Present 调用 …（最近一次命令列表提交 X.Xs 前 —— 它还在提交/连提交都停了）` | **游戏侧停住了**（不再调 Present），不是卡在我们的路径里。后半句用来区分"图形侧还活着但没呈现"与"整个图形侧都停了" |
 | `watchdog: Present 已恢复` | 上面两种异常结束 |
 | `swapchain desc: fmt=… buffers=… swapEffect=… flags=…` | 每条交换链**第一次** Present 时打一条。判下一行 `bbIdx` 正不正常要用它做参照 |
+| `spike: 20.10ms (基线 16.67ms, 距上次尖峰 5.02s, 第 3 次)` | **尖峰探测器**（2026-10-11，用户报"固定周期出现 ~20ms 波峰"）：帧时长 > 基线×1.15 **且**多出 ≥2ms 时打一条（≥1 秒一条）。`距上次尖峰` 就是**周期** —— 用来把"固定周期"量出来，别靠肉眼判断 |
 | `display event probe: GetFrameStatistics=… / GetLastPresentCount=…` | **每条交换链只打一次**：两条"显示事件"来源是否可用。实测 **flip 模型下 `GetFrameStatistics` 不可用**、`GetLastPresentCount` 可用（2026-10-11）——`np_hook.cpp` 里"以显示帧为准"那段就是据此选路的 |
 | `present diag 5s: … \| vblank=16.67ms aligned=206/216 (95%) dup=26` | `vblank` = 垂直消隐周期（来自当前显示刷新率）；`aligned` = 真呈现间隔落在**整数个垂直消隐 ±0.25** 内的比例（高 → 呈现确实被消隐节流）；`dup` = 被判定为"同一消隐内重复呈现"、**没有**记成新帧的次数 |
 | `overlay 5s: … bbIdx=[a,b,c,d\|e]` | 这 5 秒里我们**画进了哪几张后台缓冲**。`drawn` 正常但人眼看到面板闪 => 看它：flip 模型（`buffers=2/3`）下应**均匀分布**；只落在 1 个下标上说明 `GetCurrentBackBufferIndex()` 拿到的不是被呈现的那张（成因B） |
