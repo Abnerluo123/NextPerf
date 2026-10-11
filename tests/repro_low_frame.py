@@ -104,8 +104,13 @@ def main():
     time.sleep(1.5)
 
     print("=== 2. 起宿主（呈现时刻抖动）并注入 ===")
-    host = subprocess.Popen([HOST_EXE, "--jitter-present", "--seconds", str(seconds + 15)],
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    host_args = [HOST_EXE, "--seconds", str(seconds + 15)]
+    if "--no-jitter" in sys.argv:
+        # 稳态负载：宿主不做呈现抖动 —— 用来量"固定周期的错误波峰"（用户报的 ~20ms 尖峰）
+        host_args = [HOST_EXE, "--seconds", str(seconds + 15)]
+    else:
+        host_args = [HOST_EXE, "--jitter-present", "--seconds", str(seconds + 15)]
+    host = subprocess.Popen(host_args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     STARTED.append(host)
     hpid = host.pid
     if not find_window("NpHostCls", hpid, 15):
@@ -137,6 +142,7 @@ def main():
     diags = [l for l in mine if "present diag 5s" in l]
     dists = [l for l in mine if "frame dist" in l]
     lows = [l for l in mine if "SELFCHECK fpsLowLeAvg" in l]
+    spikes = [l for l in mine if "spike:" in l]
 
     for l in probes:
         print("  [探测] " + l.strip())
@@ -146,6 +152,13 @@ def main():
         print("  [分布] " + l.strip())
     for l in lows[-1:]:
         print("  [Low ] " + l.strip())
+    if spikes:
+        print("  [尖峰] 共 %d 条（找「固定周期」就看它们的时间间隔）：" % len(spikes))
+        for l in spikes[-12:]:
+            print("    " + l.strip())
+    else:
+        print("  [尖峰] 这一段里**没有**超过基线 1.35 倍的帧（若用户报的周期波峰属于我们，"
+              "这里应当能看到规律性间隔）")
 
     if not probes and not diags:
         print("环境不满足：没收到诊断行（钩子没接管？）")
