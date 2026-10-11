@@ -104,6 +104,8 @@ private:
     // 用它一次就能确定"哪个 ID/名字才是真正的 Present"（2026-10-11 实测：
     // 会话开着时 5 秒收到 1140 万条事件，全是杂项，说明关键字开宽了）。
     uint32_t diagRecv_ = 0, diagPidMatch_ = 0, diagOtherPid_ = 0;
+    // 目标进程上三个 Present 家族事件各自的计数（用来核对"哪个 ID 才是每帧一次"）
+    uint32_t diagId171_ = 0, diagId172_ = 0, diagId184_ = 0;
     struct DiagEv { uint16_t id; uint8_t op; uint32_t pid; uint32_t n; wchar_t nm[40]; };
     DiagEv   diagSeen_[12]{};
     int      diagSeenN_ = 0;

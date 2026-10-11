@@ -64,6 +64,20 @@ std::string EtwMonitor::status() const {
 static int ClassifyEvent(PEVENT_RECORD ev, uint8_t* opOut, wchar_t* nameOut, size_t nameCap) {
     *opOut = ev->EventHeader.EventDescriptor.Opcode;
     if (nameOut && nameCap) nameOut[0] = 0;
+    // ★★ 权威判定（2026-10-11）：按**清单里的事件 ID**，不再靠名字猜。
+    //   来源：PresentMon 的 `PresentData/ETW/Microsoft_Windows_DxgKrnl.h`（由 `collect_etw_info.cmd`
+    //   从 provider 清单生成）：
+    //     EVENT_DESCRIPTOR_DECL(PresentHistory_Info , 0x00ac, ... opcode 0x00 ...);
+    //     EVENT_DESCRIPTOR_DECL(PresentHistory_Start, 0x00ab, ... opcode 0x01 ...);
+    //     EVENT_DESCRIPTOR_DECL(Present_Info       , 0x00b8, ... opcode 0x00 ...);
+    //   → 171(0xab) = PresentHistory_Start（应用把一帧交给 DWM，每帧一次）
+    //     172(0xac) = PresentHistory_Info （伴随信息，不是"一帧的开始"）
+    //     184(0xb8) = Present_Info        （DxgKrnl 的 Present 事件）
+    //   实测日志证实：id=171 op=1 的名字正是 [PresentHistory]，而我们的名字启发式
+    //   （要求 "Present" 后跟 0 或 '_'）把它拒了 —— 名字猜测这条路就是不可靠的。
+    const uint16_t id = ev->EventHeader.EventDescriptor.Id;
+    if (id == 171 || id == 184) return 1;
+    if (id == 172) return 0;
     DWORD need = 0;
     ULONG st = TdhGetEventInformation(ev, 0, nullptr, nullptr, &need);
     if (st != ERROR_INSUFFICIENT_BUFFER || need == 0) return -1;
@@ -96,8 +110,10 @@ static int ClassifyEvent(PEVENT_RECORD ev, uint8_t* opOut, wchar_t* nameOut, siz
 
 std::string EtwMonitor::diagText() const {
     char buf[700];
-    int off = snprintf(buf, sizeof(buf), "收到事件 %u（头部 pid 命中 %u / 不命中 %u）| ID 直方图: ",
-                       diagRecv_, diagPidMatch_, diagOtherPid_);
+    int off = snprintf(buf, sizeof(buf),
+                       "收到事件 %u（头部 pid 命中 %u / 不命中 %u）| 目标进程 Present 家族计数: "
+                       "171(PresentHistory_Start)=%u 172(Info)=%u 184(Present_Info)=%u | ID 直方图: ",
+                       diagRecv_, diagPidMatch_, diagOtherPid_, diagId171_, diagId172_, diagId184_);
     for (int i = 0; i < diagSeenN_ && off > 0 && off < (int)sizeof(buf) - 90; ++i) {
         char nm[128] = {0};
         if (diagSeen_[i].nm[0])
@@ -120,6 +136,11 @@ void __stdcall EtwMonitor::OnEvent(PEVENT_RECORD ev) {
         if (m.targetPid_ && ev->EventHeader.ProcessId == m.targetPid_) ++m.diagPidMatch_;
         else ++m.diagOtherPid_;
         const auto& dd = ev->EventHeader.EventDescriptor;
+        if (m.targetPid_ && ev->EventHeader.ProcessId == m.targetPid_) {
+            if (dd.Id == 171) ++m.diagId171_;
+            else if (dd.Id == 172) ++m.diagId172_;
+            else if (dd.Id == 184) ++m.diagId184_;
+        }
         int slot = -1;
         for (int i = 0; i < m.diagSeenN_; ++i) {
             if (m.diagSeen_[i].id == dd.Id && m.diagSeen_[i].op == dd.Opcode) { slot = i; break; }
@@ -271,9 +292,38 @@ bool EtwMonitor::Start() {
     }
     session_ = sh;
 
-    // 只订阅 Present 关键字，级别 Information
+    // 只订阅 Present 关键字，级别 Information。
+    //
+    // ★ 再加一层**会话级事件 ID 过滤**（2026-10-11）：关键字 0x8000001(Present|Base) 是
+    //   DxgKrnl 里一大批事件共用的（实测 5 秒收到 **1140 万条**，其中 GetDeviceState 一条就
+    //   1200 万/5 秒）—— 这些事件要跨内核→用户态复制，是**游戏运行时真占开销**的。
+    //   官方机制：EnableTraceEx2 的第 8 个参数传 EVENT_FILTER_DESCRIPTOR，
+    //   类型 EVENT_FILTER_TYPE_EVENT_ID，数据是 EVENT_FILTER_EVENT_ID{FilterIn, Reserved,
+    //   Count, Events[]}。见 MS Learn「EnableTraceEx2 function (evntrace.h)」。
+    //   ⚠ 文档要求 Events[] **按升序排列**（内部二分查找）：171 < 172 < 184 ✓
+    EVENT_FILTER_EVENT_ID filter{};
+    filter.FilterIn = TRUE;          // TRUE = 只保留列出的这些 ID
+    filter.Count = 3;
+    filter.Events[0] = 171;          // PresentHistory_Start（每帧一次的应用提交）
+    filter.Events[1] = 172;          // PresentHistory_Info
+    filter.Events[2] = 184;          // Present_Info
+    EVENT_FILTER_DESCRIPTOR fd{};
+    fd.Ptr = (ULONGLONG)&filter;
+    fd.Size = (ULONG)(sizeof(EVENT_FILTER_EVENT_ID) + (filter.Count - 1) * sizeof(USHORT));
+    fd.Type = EVENT_FILTER_TYPE_EVENT_ID;
     ULONG en = EnableTraceEx2(sh, &kDxgKrnl, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
-                              TRACE_LEVEL_INFORMATION, kKwPresent, 0, 0, nullptr);
+                              TRACE_LEVEL_INFORMATION, kKwPresent, 0, 0, &fd);
+    if (en != ERROR_SUCCESS) {
+        // 过滤失败就退回不过滤（宁可多收，也别收不到）。失败原因记在 status 里，
+        // 由主程序每 5 秒那行 [ETW] 打出来。
+        char msg[192];
+        snprintf(msg, sizeof(msg),
+                 "运行中（DxgKrnl Present 事件；⚠ 事件 ID 过滤不可用，Win32 %lu → 未过滤，事件量大）",
+                 (unsigned long)en);
+        SetStatus(msg);
+        en = EnableTraceEx2(sh, &kDxgKrnl, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
+                            TRACE_LEVEL_INFORMATION, kKwPresent, 0, 0, nullptr);
+    }
     if (en != ERROR_SUCCESS) {
         char msg[256];
         snprintf(msg, sizeof(msg), "EnableTraceEx2(DxgKrnl) 失败，Win32 错误 %lu",
