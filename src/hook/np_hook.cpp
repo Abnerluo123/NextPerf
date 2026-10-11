@@ -373,6 +373,8 @@ uint32_t       gMergedCount = 0;   // 被合并掉的呈现数（诊断用）
 //   （数值模拟抓到过：形态 A 只吸收了 80 次而非约 200 次，合并后均值 20.81 而非 33.3。）
 //   真正的原始间隔只能从"上一次呈现"算，因此单独记一个。
 uint64_t gPrevPresentQpc = 0;
+// 诊断用：自上次打印以来收到了几次真实 Present（见 frame merge 日志）
+static uint32_t gDbgPresents = 0;
 
 // ---- Reflex 延迟标记
 //  游戏若启用 Reflex，会自己打 sim/submit/present 的标记，我们直接读它，
@@ -1323,7 +1325,28 @@ HRESULT PresentCommon(IDXGISwapChain* sc, UINT sync, UINT flags,
 
         // 基准用**长窗口均值**（不是中位数 —— 双峰分布上中位数会振荡，
         // 数值模拟实测到过，会导致该合并的时而不合并）。
+        // ★ 诊断计数：每 5 秒把「收到几次 Present / 原始间隔均值 / 当轮阈值 /
+        //   累计吸收数 / 累计记账数」一起打出来。
+        //   为什么需要它：实测模拟器 1113 帧而钩子只记账 241 帧、P50 正好翻倍，
+        //   但按代码反推要求的均值（>27.8ms）与实测的 18ms 对不上 ——
+        //   说明理解有误。与其继续推演，不如把输入与判定直接打出来看。
+        ++gDbgPresents;
+        static uint32_t sMergeLogAt = 0;
+        uint32_t mergeNow = GetTickCount();
+        if (sMergeLogAt == 0) sMergeLogAt = mergeNow ? mergeNow : 1;
+
         float meanMs = gRawStats.meanMs(240);
+        if (mergeNow - sMergeLogAt >= 5000) {
+            sMergeLogAt = mergeNow;
+            Log("frame merge: presents=%u rawMean=%.2fms thresh=%.2fms merged=%u frames=%u "
+                "rawN=%u",
+                (unsigned)gDbgPresents, (double)meanMs,
+                (double)(meanMs * 0.6f < 2.0f ? 2.0f : (meanMs * 0.6f > 30.0f ? 30.0f
+                                                        : meanMs * 0.6f)),
+                (unsigned)gMergedCount, (unsigned)(gTel ? gTel->frameTotal : 0),
+                (unsigned)gRawStats.count());
+            gDbgPresents = 0;
+        }
         float mergeThresh = 0.0f;
         if (meanMs > 1.0f) {
             mergeThresh = meanMs * 0.6f;
