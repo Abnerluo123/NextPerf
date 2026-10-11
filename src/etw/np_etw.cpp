@@ -284,14 +284,15 @@ void EtwMonitor::RecalcLow() {
     if (lowCalcAt_ && now - lowCalcAt_ < 200) return;
     lowCalcAt_ = now;
 
-    // 窗口 = 帧数近似。**两行用不同窗口**（这是有意的，理由见下）：
-    //   1%   Low：PresentMon 的默认窗口 1000ms（≈60 个样本）
-    //   0.1% Low：**10 秒**（≈600 个样本）
+    // 窗口 = 帧数近似。**两行用不同窗口**（有意）：
+    //   1%   Low：PresentMon 的默认窗口 1000ms（60fps 下 ≈60 个样本）
+    //   0.1% Low：**3 秒**（60fps 下 ≈180 个样本、105fps 下 ≈315 个）
     // ⚠ 为什么 0.1% 不能也用 1 秒：60 个样本下 P99 = 第 58.41 个、P99.9 = 第 58.94 个，
-    //   两者插值用的就是**同样那两个最差样本** → 两行必然几乎相同（用户反复报过这个现象）。
-    //   600 个样本下 P99 ≈ 第 6 差、P99.9 ≈ 最差那一帧 → 两行才真正不同。
-    //   （PresentMon 的动态查询只有 1% 档、窗口也是可配的 --window-size，这里按同一套
-    //     "窗口内取百分位" 的定义、只把 0.1% 的窗口放长，不引入新统计量。）
+    //   插值用的是**同样那两个最差样本** → 两行必然几乎相同（用户反复报过）。
+    // ⚠ 也**不能太长**：我先用过 10 秒，结果"关垂直同步那一下"的卡顿（实测 P99.9≈69ms）
+    //   被钉住近 10 秒，读数长期停在 14.4 —— 用户报"low帧异常"。3 秒既够 0.1% 分辨出
+    //   "最差那一帧"，又能几秒内恢复。（PresentMon 的动态查询只有 1% 档、窗口可配；这里
+    //   沿用同一套"窗口内取百分位"的定义，只调窗口长度。）
     auto percentileOverLast = [&](int n, double p) -> float {
         if (n < 20) n = 20;
         if (n > ringN_) n = ringN_;
@@ -311,9 +312,9 @@ void EtwMonitor::RecalcLow() {
         return (float)(v[lo] * (1.0 - g) + v[hi] * g);
     };
     int n1s = (int)(fps_ > 1.0f ? fps_ : 60.0f);
-    int n10s = n1s * 10;
+    int n3s = n1s * 3;
     float m1 = percentileOverLast(n1s, 0.99);
-    float m01 = percentileOverLast(n10s, 0.999);
+    float m01 = percentileOverLast(n3s, 0.999);
     low1_ = m1 > 0.0001f ? 1000.0f / m1 : 0.0f;
     low01_ = m01 > 0.0001f ? 1000.0f / m01 : 0.0f;
 }
