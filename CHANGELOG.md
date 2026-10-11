@@ -14,6 +14,43 @@
 
 ---
 
+## 未发布（main，2026-10-11 深夜）
+
+> ⚠️ **未经用户完整测试**，未打 tag、未发布。**当前发布版仍是 v1.6.4。**
+
+### 修掉一个回归：纯 DX12 游戏被判成 Vulkan → 完全没数据
+
+**用户实测现象**（《漫威蜘蛛侠》，纯 DX12 游戏）：「以前读出来是 DX12，现在显示 Vulkan，而且完全没有数据。」
+
+**根因**（`src/hook/np_hook.cpp`，两处 API 判定口径不一致 + 自我导入排除的副作用）：
+
+1. 我们的钩子 DLL 静态导入 `d3d12.dll` / `d3d11.dll` / `dxgi.dll`，而 `SelfImports()`
+   会把「我们自己带进来的」模块**全部跳过** → 最强的两个 D3D 信号**永远被跳过**；
+2. 剩下 `vulkan-1.dll`（我们没导入）就命中了 → 纯 DX12 被判成 Vulkan → `hostIsD3D=false`
+   → `probe disabled: host api=20 (non-D3D)` → **交换链一次都没挂钩**（`RestoreAllHooks: swapVt=0`）
+   → 面板显示 Vulkan、`attached=0 帧数=0`；
+3. 而这时**只有探测能救**：加了 10 秒自动注入延迟之后属于「晚注入」，游戏的交换链早就建好了，
+   工厂钩子抓不到创建过程。所以这个 latent bug 被延迟暴露了出来。
+   另外 `GuessApiFromModules()`（显示用）用的是**另一套顺序**（vulkan 排最前）——
+   正是 `HostApiGuess()` 注释里点名警告过的写法，两处结论还互相矛盾。
+
+**修法**：把 `D3D12Core.dll` 放在判定最前面。它是 `d3d12.dll` **真正创建 D3D12 设备时**才拉起的
+运行时，我们的导入表里没有它（实测：纯 DX12 进程里有、我们自己的进程里没有）——既是最强信号，
+又不会被自己污染。`GuessApiFromModules()` 改成先问 `HostApiGuess()`，口径统一；
+`HostGraphicsUp()` 也一并加上这个信号。
+
+**验证（在工作区内确定性复现，不用开游戏）**：新用例 `tests/verify_dx12_decoyvk.py`
+用 `host_run.exe --decoy-vulkan`（照常跑 DX12 + 额外 `LoadLibrary("vulkan-1.dll")`）复现该组合。
+
+| | API 判定 | 探测 | 结果 |
+| --- | --- | --- | --- |
+| 修复前 | `hostApi=20` | `probe disabled … (non-D3D)` | `attached=0 frameTotal=0 gfxApi=20` ❌ |
+| 修复后 | `hostApi=12` | `probe attempt 1/3` | `attached=1 frameTotal=18 gfxApi=12` ✅ |
+
+`selftest` 通过；该用例已纳入 `tests/run_all.py`。
+
+---
+
 ## v1.6.4（tag `v1.6.4`，2026-10-11 发布）—— 修掉 D3D12 游戏内叠加的驱动崩溃
 
 > ✅ **已由用户实测确认**（2026-10-11，商店版《生化危机8》DX12）：

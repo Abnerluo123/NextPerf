@@ -145,8 +145,10 @@
 | T6 | **`run_all.py` 只断言"有值"** | 7 项用例都不验"准不准" | 见 V6 |
 | T7 | **`NPConfig::reserved` 只剩 4 个槽位** | 再无槽位可用时加字段**必须**改 `sizeof` → 两侧必须同时升级 | 建议改成递增布局版本号 |
 | T8 | **"恢复默认"不重置运行时开关**（G5） | `NPDefaultConfig` 不碰 `autoInject`/`pauseHook`/`learnedAutoHook`/`detachPid`（已在代码里核实） | 确认是"有意"还是漏了，并在注释写明 |
-| T9 | **文档行号漂移** | `HOOK.md` 头部写 2755 行、§1.3 写 2744；两份文档同一函数行号互不相同；`CATALOG.md` 的 `src/app` 行数也是旧估值 | ✅ **已根治（2026-10-11）**：两份文档共 707 处行号引用全部清掉，改为只引用函数名/变量名（见 §9 D1、`CATALOG.md` §6 的维护约定） |
+| T9 | **文档行号漂移** | `HOOK.md` 头部写 2755 行、§1.3 写 2744；两份文档同一函数行号互不相同；`CATALOG.md` 的 `src/app` 行数也是旧估值 | ✅ **已根治（2026-10-11）**：两份文档共 707 处行号引用全部清掉，改为只引用函数名/变量名（见 §8 D1、`CATALOG.md` §6 的维护约定） |
 | T10 | **`tests/verify_quit_noinject.py` 用错了配置文件名** | 它预置 `%APPDATA%\NextPerf\settings.json`，而程序读的是 **`config.json`**（`settings.cpp` 的 `SettingsPath()`）→ 看护线程永远拿不到维护目标，**用例的前置条件恒不成立**，主判据有可能空跑 | 🚧 待修：文件名改成 `config.json`，并**顺手备份/还原它**（主程序经「退出」路径结束时会 `AppSaveSettings()` 重写该文件）。已记进 `docs/CLEANUP.md` §7 的 C1/C2 |
+| T11 | ~~**"DX12 被判成 Vulkan"没有自动化覆盖**~~ ✅ **已补（2026-10-11）** | 新用例 `tests/verify_dx12_decoyvk.py` + 测试宿主新开关 `host_run.exe --decoy-vulkan`（照常跑 DX12、额外加载 `vulkan-1.dll`）。**修复前的钩子跑它必 FAIL**（已实测：`hostApi=20` / `probe disabled` / `attached=0`），修复后 `hostApi=12` / `probe attempt 1/3` / `attached=1` | 已纳入 `run_all.py` |
+| T12 | **`verify_metrics.py` 依赖"应用有一个游戏目标"** | 该用例用裸 `LoadLibrary` 注入，应用要靠**学习机制**才知道该轮询哪个进程；而学习又依赖游戏名单/前台等条件。2026-10-11 用户清空名单后，应用日志里**根本没有「数据来源」块** → 用例判 FAIL。⚠ 这**不是产品问题**（清空名单后不轮询是合理的），但用例的失败信息会误导 | 让用例自己造目标（像 T1 那样预置名单，且**必须备份/还原 `config.json`**），或把"没有目标"与"目标存在但读不到 PDH"两种失败分开报 |
 
 ---
 
@@ -175,10 +177,11 @@
 | `ARCHITECTURE.md` 的判活片段用跨进程时钟 `(now - tickMs) < 2500` | 已改成帧计数增长 + `gApp.telemetryLive` | `ARCHITECTURE.md` §2.4 |
 | README 说静默机制"挂在一个永远不成立的条件上、等于从未生效" | 触发条件是 RTV 槽位攒满 8 个，而槽位按后台缓冲对象累加 → **会触发，只是要等到第二~三次重建**；准确说法是"来得太晚" | README 已知问题 |
 | 数据来源日志文案写"最近1200帧样本推算"、`CPU 帧时间 <- 帧周期 - Present 阻塞`、`engtype_compute/engtype_ofa` | 三处都已按代码实际口径改正 | `src/app/main.cpp` |
+| （2026-10-11 深夜）**纯 DX12 游戏被判成 Vulkan → 完全没数据**（《漫威蜘蛛侠》实测） | 根因：钩子自己静态导入 `d3d12.dll`/`d3d11.dll`，而 `SelfImports()` 把它们全跳过 → 最强 D3D 信号**永远失效** → `vulkan-1.dll` 命中 → `probe disabled` → `swapVt=0`（一次都没挂上）。**修法**：用 `D3D12Core.dll`（只在真建有 D3D12 设备时出现、我们没导入）作首要判据；`GuessApiFromModules()` 与 `HostApiGuess()` 口径统一 | `src/hook/np_hook.cpp`；回归用例 `tests/verify_dx12_decoyvk.py`（**修复前必 FAIL**）；`docs/HOOK.md` §7 教训 3 + §22 坑 6b |
 
 ---
 
-## 9. 还没修的口径债（本轮扫描发现，**已登记未动手**）
+## 8. 还没修的口径债（本轮扫描发现，**已登记未动手**）
 
 > 这些都是"文档之间/文档与代码之间还对不上"的地方。按 `CATALOG.md` 的规矩：
 > 动它们的时候**顺便把两边都改掉**，别只改一处。
@@ -201,18 +204,7 @@
 
 ---
 
-| 曾经的错误说法 | 事实 | 修在哪 |
-| --- | --- | --- |
-| Low 帧"最终采用口径③ 严格百分位"、口径④"无调用点" | 实际用**口径④ 窗口平均**（1000ms 窗口 / 回看约 10s），口径③ 只在窗口数不足 4 个时兜底 | `COMMON.md` §3.4/§8.2/§9.2、`CATALOG.md` §2.3/§5-10、README |
-| AI 引擎 `engtype` 大小写 bug"是现存缺陷" | 已在 `53037bd` 修复（`engtype_Compute`/`engtype_OFA`）；**真机复验仍未做**（见 V3） | `SENSORS.md` §3.4/§6.1、`SENSORS-FUNCTIONS.md` |
-| APP.md §17 把 G1/G2/G3 记为"本次未改" | 都已修好（`np_common.h` 越界、学习路径加锁、UI 改用 `telemetryLive`） | `APP.md` §17（连 G9 一起） |
-| `ARCHITECTURE.md` 的判活片段用跨进程时钟 `(now - tickMs) < 2500` | 已改成帧计数增长 + `gApp.telemetryLive` | `ARCHITECTURE.md` §2.4 |
-| README 说静默机制"挂在一个永远不成立的条件上、等于从未生效" | 触发条件是 RTV 槽位攒满 8 个，而槽位按后台缓冲对象累加 → **会触发，只是要等到第二~三次重建**；准确说法是"来得太晚" | README 已知问题 |
-| 数据来源日志文案写"最近1200帧样本推算"、`CPU 帧时间 <- 帧周期 - Present 阻塞`、`engtype_compute/engtype_ofa` | 三处都已按代码实际口径改正 | `src/app/main.cpp` |
-
----
-
-## 8. 一句话版：现在还剩什么
+## 9. 一句话版：现在还剩什么
 
 * **拿不到的数**：RT/Tensor **硬件**占用率（民用卡不提供，❌ 永久）；NVAPI 的 FB/VID/BUS 三域（本机驱动拒绝，❌ 暂时）；
   Vulkan/OpenGL 游戏的帧数据（设计边界）。

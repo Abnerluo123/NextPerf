@@ -256,6 +256,20 @@ vtable 探测与周期性维护；`DllMain` 本身几乎不做事。
    实测 D3D12 与 Vulkan 游戏**都**加载了它。上一版把 vulkan 排在最前，
    于是 D3D12 游戏被判成 Vulkan → 探测被永久禁用 → 中途注入再也挂不上 Present。
    判据按可靠性排序：`d3d12 > d3d11 > d3d10 > d3d9 > vulkan > opengl`。
+3. **★★ 上面那两条教训合起来还会互相咬（2026-10-11《漫威蜘蛛侠》实测）**：
+   教训 1 说要跳过"我们自己带进来的"模块，教训 2 说要按 `d3d12 > d3d11 > … > vulkan` 排序 ——
+   可我们**正好静态导入了 `d3d12.dll` / `d3d11.dll` / `dxgi.dll`**，于是那两个最强的 D3D 信号
+   **永远被跳过**，剩下的 `vulkan-1.dll` 永远是赢家 → **纯 DX12 游戏被判成 Vulkan**
+   → `probe disabled: host api=20 (non-D3D)` → `RestoreAllHooks: swapVt=0`（一次都没挂上）
+   → 面板显示 Vulkan 且没有任何数据。
+   为什么以前没暴露：以前是**早注入**，游戏还没建交换链，工厂钩子直接抓到创建过程、
+   API 从**真实设备**学到（不靠猜）；加了 10 秒自动注入延迟之后变成**晚注入**，
+   只剩探测这条后路，于是被错误的猜测堵死。
+   **修法与判据**：把 **`D3D12Core.dll`** 放在判定最前面 —— 它是 `d3d12.dll`
+   **真正创建 D3D12 设备时**才拉起的运行时，我们没导入它（实测：纯 DX12 进程里有、
+   我们自己的进程里没有），既是最强信号又不会被自己污染。
+   回归用例：`tests/verify_dx12_decoyvk.py`（用 `host_run.exe --decoy-vulkan` 复现该组合；
+   **修复前的钩子跑它必 FAIL**）。
 
 ---
 
@@ -1137,6 +1151,7 @@ FreeLibraryAndExitThread(gSelf, 0)   // 6. 从宿主进程卸载自己并结束�
 | 4 | **D3D12 的实现在 `D3D12Core.dll`**，不在 `d3d12.dll`。按模块名做健全性检查 → 光追/DLSS 钩子一个都装不上 | `InModule()` / `PatchSwapChainVtable` 的健全性检查 |
 | 5 | **本 DLL 静态导入 dxgi/d3d11/d3d12**，所以 `GetModuleHandleW(L"d3d12.dll") != nullptr` 永远为真 → 所有「让宿主工厂钩子先跑」的保护失效。必须读自己的 PE 导入表 | `SelfImports()` / `HostHasVulkan()` |
 | 6 | **不能拿 `vulkan-1.dll` 当「这是 Vulkan 游戏」的证据**：D3D12 游戏也加载它，上一版因此把 D3D12 游戏判成 Vulkan → 探测永久禁用 | `HostHasVulkan()` |
+| 6b | **★ 与上一条互相咬的坑**：我们自己静态导入了 d3d12/d3d11/dxgi，而 `SelfImports()` 会把它们跳过 → 最强信号永远被跳过 → `vulkan-1.dll` 永远赢 → **纯 DX12 被判成 Vulkan**（`probe disabled` / `swapVt=0` / 面板显示 Vulkan 且无数据）。修法：把 **`D3D12Core.dll`**（只在真建有 D3D12 设备时出现、我们没导入）排在最前 | `HostApiGuess()` 的注释；回归用例 `tests/verify_dx12_decoyvk.py` |
 | 7 | **上一次卸载没还干净 → 「原函数」其实是上一次的钩子 → 调用自己 → 无限递归 → 栈溢出**（实测 `0xC0000005`，地址 = DLL 基址 + `0xA040`） | `PatchSwapChainVtable` / `InstallDxgi` / `NpHookDetach` |
 | 8 | 探测用的窗口类**必须注册在宿主 exe 模块**上；绑 `gSelf` 会留下指向已卸载内存的野类，并且**永久留在游戏进程里** | `ProbeSwapChainVtable` 的窗口类注册 |
 | 9 | **绝不在 Vulkan 进程里创建 D3D 设备**（实测某款 Vulkan 游戏：注入成功，一秒后闪退且无任何报错）。探测次数因此要分级限制 | `HostHasVulkan()`、`Worker` 里的探测次数分级 |

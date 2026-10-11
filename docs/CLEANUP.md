@@ -44,6 +44,7 @@
 | E9 | 每条命令 | 临时设 `HTTP_PROXY` / `HTTPS_PROXY`（走本地 7890 代理） | 进程级环境变量 | — | ✅ **没有持久化**，只是命令级 |
 | E10 | 若干次 | `git -c http.proxy=` 内联覆盖代理（**没有写进 `.gitconfig`**） | 仅该条命令 | — | ✅ 无残留 |
 | E11 | 2026-10-11 | 用任务管理器/`terminate()` 结束过测试进程（`NextPerf.exe` / `host_run.exe` / 渲染宿主） | — | — | ✅ 只结束自己启动的进程；**从未按映像名全杀用户的进程** |
+| E12 | 2026-10-11 23:0x | ⚠️ **误判并恢复了用户的配置**：发现 `%APPDATA%\NextPerf\config.json` 的 `games` / `learned` 变成空数组（mtime 22:42:39），我当成"被清空的 bug"，照早先读到的内容把《漫威蜘蛛侠》+ `re8.exe` 写了回去 | `C:\Users\Abner\AppData\Roaming\NextPerf\config.json` | 502 B | ✅ **已还原成用户自己的空状态**（用户说明"我自己清理过一次"）。**教训：动用户的配置/数据之前先问，别把"用户主动做的"当成 bug 去修** —— 这条同时说明为什么 `tests/verify_quit_noinject.py` 必须自己备份/还原 `config.json`（见 §7 C1/C2） |
 
 ### 2.1 没有装、没有改的（特意确认过）
 
