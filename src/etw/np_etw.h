@@ -111,6 +111,10 @@ private:
     int      diagSeenN_ = 0;
 
     uint32_t targetPid_ = 0;
+    // ★ 事件优先级（2026-10-11 审计）：171(PresentHistory_Start) 优先，只有该进程
+    //   **从不产生** 171 时才用 184(Present_Info)。两个都算的话，某游戏每帧两个事件
+    //   都发时会**每帧计两次** → 帧率翻倍、帧时间减半、Low 全错。
+    bool     saw171_ = false;
     uint64_t lastQpc_ = 0;
     uint32_t presentN_ = 0;
 

@@ -174,6 +174,14 @@ void __stdcall EtwMonitor::OnEvent(PEVENT_RECORD ev) {
     //   播放器）的 present 事件都被算进来，Low 帧被污染成别的程序的数字。
     if (!m.targetPid_ || ev->EventHeader.ProcessId != m.targetPid_) return;
 
+    // ★ 审计修正 1（2026-10-11）：**事件优先级**。不能 171/184 都算 ——
+    //   若某游戏每帧两个事件都发，就会每帧计两次（帧率翻倍 / 帧时间减半 / Low 全错）。
+    //   171(PresentHistory_Start) 是"应用把一帧交给 DWM"，语义最准；只有该进程
+    //   从不产生 171 时才退回 184(Present_Info)。
+    //   （Spider-Man 实测：171=0、184=299/5s，正是走 184 的情形。）
+    if (ev->EventHeader.EventDescriptor.Id == 171) m.saw171_ = true;
+    else if (ev->EventHeader.EventDescriptor.Id == 184 && m.saw171_) return;
+
     uint8_t op = 0;
     wchar_t evName[96] = {0};
     const auto& d = ev->EventHeader.EventDescriptor;
@@ -216,11 +224,26 @@ void __stdcall EtwMonitor::OnEvent(PEVENT_RECORD ev) {
 
 ULONG __stdcall EtwMonitor::OnBuffer(PEVENT_TRACE_LOGFILEW) { return Etw().stop_ ? FALSE : TRUE; }
 
+// ★ 审计修正 2（2026-10-11）：时间戳换算**必须用 QueryPerformanceFrequency**。
+//   `EVENT_TRACE_PROPERTIES.Wnode.ClientContext = 1` 时，事件时间戳是 **QPC 刻度**，
+//   而 QPC 频率**不保证是 10MHz**（本机恰好是，所以之前"看着对"）。
+//   原来写死 `/10000.0`（= 假定 100ns 一个刻度）→ 换台频率不同的机器，
+//   所有 ETW 帧时间都会按比例错。
+static double QpcToMs() {
+    static double k = 0.0;
+    if (k == 0.0) {
+        LARGE_INTEGER f{};
+        QueryPerformanceFrequency(&f);
+        k = f.QuadPart ? (1000.0 / (double)f.QuadPart) : 0.0001;   // 兜底：按 10MHz
+    }
+    return k;
+}
+
 void EtwMonitor::OnPresent(uint64_t qpc) {
     EnterCriticalSection(&lock_);
     ++presentN_;
     if (lastQpc_ && qpc > lastQpc_) {
-        double ms = (double)(qpc - lastQpc_) / 10000.0;   // 100ns → ms
+        double ms = (double)(qpc - lastQpc_) * QpcToMs();
         // 和钩子那边同样的道理：超过 1 秒的间隔不是「一帧」，是切出去/加载
         if (ms > 0.02 && ms < 1000.0) {
             frameMs_ = (float)ms;
@@ -232,10 +255,11 @@ void EtwMonitor::OnPresent(uint64_t qpc) {
     lastQpc_ = qpc;
 
     // 1 秒窗口计数 → 帧率（锁 60 时就是稳定 60.0，不做逐帧换算）
+    const uint64_t oneSec = (uint64_t)(1000.0 / QpcToMs());
     if (!winStart_) winStart_ = qpc;
     ++winN_;
-    if (qpc > winStart_ && qpc - winStart_ >= 10000000ull) {   // 1 秒 = 1e7 * 100ns
-        fps_ = (float)((double)winN_ * 10000000.0 / (double)(qpc - winStart_));
+    if (qpc > winStart_ && qpc - winStart_ >= oneSec) {
+        fps_ = (float)((double)winN_ * (double)oneSec / (double)(qpc - winStart_));
         winN_ = 0;
         winStart_ = qpc;
     }
