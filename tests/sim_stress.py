@@ -63,7 +63,7 @@ def read_hook_log(pid):
     if not os.path.exists(HOOK_LOG):
         return []
     with open(HOOK_LOG, "rb") as f:
-        txt = f.read().decode("gbk", "replace")
+        txt = f.read().decode("utf-8", "replace")    # 日志是 UTF-8（曾误记为 GBK）
     return [l for l in txt.splitlines() if ("pid=%d " % pid) in l]
 
 

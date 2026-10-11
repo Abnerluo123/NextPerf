@@ -110,10 +110,15 @@ def find_window(cls, pid, timeout=15.0):
 
 
 def hook_lines(pid):
-    """钩子日志是 GBK，而且**所有被注入进程共用**：只挑这个 pid 的行。"""
+    """钩子日志是 **UTF-8**（2026-10-11 实测核实；本文件曾写 GBK，是错的），
+    而且**所有被注入进程共用**：只挑这个 pid 的行。"""
     if not os.path.exists(LOG):
         return []
-    txt = open(LOG, "rb").read().decode("gbk", "replace")
+    raw = open(LOG, "rb").read()
+    try:
+        txt = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        txt = raw.decode("gbk", "replace")
     key = "pid=%d" % pid
     return [l for l in txt.splitlines() if key in l]
 

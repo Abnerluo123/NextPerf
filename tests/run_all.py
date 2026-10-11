@@ -19,6 +19,13 @@ STEPS = [
     ("「注入到前台进程」按钮", [sys.executable, os.path.join(HERE, "verify_frontinject.py")]),
     # 指标链路：原来这套「回归」只覆盖注入，传感器与计算一概没验证过。
     ("指标链路 · PDH GPU 帧时间端到端", [sys.executable, os.path.join(HERE, "verify_metrics.py")]),
+    # 2026-10-11 抓到的两个真 bug 的回归（此前只有手工验证，没人守着）：
+    #   1) 退出流程里反复注入 —— 会把**正在关停**的游戏挂死在 loader lock 上
+    #      （用户现象：游戏窗口消失、后台进程杀不掉）
+    #   2) Present 看门狗自己会不会报 —— 永不触发的诊断等于没有诊断
+    ("退出流程不再注入 · 主程序退出链路", [sys.executable, os.path.join(HERE, "verify_quit_noinject.py")]),
+    ("Present 看门狗 · 挂起渲染线程应报「游戏侧停住了」",
+     [sys.executable, os.path.join(HERE, "verify_watchdog.py")]),
 ]
 
 

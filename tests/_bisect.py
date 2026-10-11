@@ -84,7 +84,7 @@ try:
     if not os.path.exists(LOG):
         valid = False; why.append("钩子日志不存在")
     else:
-        logtxt = io.open(LOG, encoding="gbk", errors="replace").read()
+        logtxt = io.open(LOG, encoding="utf-8", errors="replace").read()
         if "attach" not in logtxt:
             valid = False; why.append("日志无 attach")
     if "交换链" not in out and "generation" not in out:
