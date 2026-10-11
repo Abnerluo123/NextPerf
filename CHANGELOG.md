@@ -45,10 +45,10 @@
 
 | 文件 | SHA-256 | 与 v1.6.3 相比 |
 |---|---|---|
-| `NextPerf.exe` | `69B8C3B7505D5099B56AE01ADE5469897CFC95563BE4173613D3A44FFAA9DEE7` | **变了**（日志文案 + 判活修复 + 自动注入延迟） |
-| `NextPerfHook.dll` | `4CF0E808747F28F9023ED2100534AA156BB0E2DDB32B0783D965B2738C4B2459` | **变了**（新增 DETACH/worker 诊断日志 + 日志上限 512KB→4MB） |
-| `NextPerfHook32.dll` | `66BA423B54010F513DB293F9FC50FFC209BE192C0E0EB11DDDBD94F9B6766405` | 同上 |
-| `NextPerfHook64.dll` | `4CF0E808747F28F9023ED2100534AA156BB0E2DDB32B0783D965B2738C4B2459` | 同上 |
+| `NextPerf.exe` | `5DF96CB621EBF8E466B75B66FC42DF32583894A365DC1CF1DDDEC6160B1D397E` | **变了**（日志文案 + 判活修复 + 自动注入延迟 + 退出顺序根因修复） |
+| `NextPerfHook.dll` | `4C42988F0C5FC79E6A9B76C8E4735EDCC8F2E121DD65520AA0DD81465D655F65` | **变了**（DETACH/worker 诊断 + 看门狗 + 日志上限 4MB） |
+| `NextPerfHook32.dll` | `8DF645033C693249D8B924EE4BA9FC142360CDDA1F2B3D559532ED17A82DEF49` | 同上 |
+| `NextPerfHook64.dll` | `4C42988F0C5FC79E6A9B76C8E4735EDCC8F2E121DD65520AA0DD81465D655F65` | 同上 |
 
 > 这一版 `src/app` 与 `src/hook` **都动过**，所以四个产物都和 v1.6.3 不同。
 > 哈希只能同机同路径比（见 v1.6.3 段落里的第 3 条事实）。
@@ -66,18 +66,51 @@
 
 用户报了三件事，性质完全不同：
 
-| Bug | 现象 | 本轮做到了什么 |
+| Bug | 现象 | 状态 |
 |---|---|---|
-| **状态栏每 2.5 秒跳变** | 关窗后 NextPerf 在「钩上 / 没钩上」之间反复翻 | ✅ **根因已定位并修复** —— 是主程序自己的逻辑 bug：判定"钩子已死"后把 `sLastFt` 清成 0，于是下一次读到的**冻结帧数**（888）与 0 不相等 → 被当成"帧数又长了" → 复活 → 2.5 秒后再判死。现在**只清计时器、保留冻结帧数**（用户日志里 20:52:07 判死 / 20:52:09 再判死 / 20:52:11 又 attached=1 正是这个周期） |
-| **关窗后游戏进程不退** | 窗口消失，后台进程留着 | ⚠️ **只加了诊断，未定性**。工作区里的测试宿主 **D3D11 与 D3D12 都复现不出来**（`python tests\_exitprobe.py`：关窗 0.5 秒内干净退出，`DETACH: enter` → `RestoreAllHooks` → `SELFCHECK unloadClean = OK` → `DETACH: worker wait -> exited` 链条完整）。新增 `DETACH: enter` / `DETACH: worker wait` / `worker: enter\|exit` 日志 + `tests/_exitprobe.py`，**下次复现即可判定是不是我们挡的** |
+| **状态栏每 2.5 秒跳变** | 关窗后 NextPerf 在「钩上 / 没钩上」之间反复翻 | ✅ **根因已定位并修复** —— 是主程序自己的逻辑 bug：判定"钩子已死"后把 `sLastFt` 清成 0，于是下一次读到的**冻结帧数**（888）与 0 不相等 → 被当成"帧数又长了" → 复活 → 2.5 秒后再判死。现在**只清计时器、保留冻结帧数** |
+| **关窗后游戏进程不退** | 窗口消失，后台进程留着 | 🔶 **一半已根因修复、一半待定性**，见下 |
 | **自动注入让游戏闪退** | 自动盯 re8 → 启动即闪退；进游戏后手动注入不闪退 | ✅ **已缓解**：探测到进程后**等 10 秒**再自动注入（`kAutoInjectDelayMs`，手动注入不受影响）。⚠️ **根因未解** —— 早期注入撞上游戏自己的 D3D 初始化，而我们还要自建 D3D11 设备去探 vtable |
 
-顺带把**钩子日志上限从 512 KB 提到 4 MB**：这次查"进程不退"时，512 KB 回绕把整场 re8 会话
-冲成了**只剩 1 行**，害得只能靠推断。同时改掉 `docs/LOGGING.md` 里"最新在开头"那个过于
-简化的说法 —— 回绕之后文件**不是按时间排的**，必须按关键字搜，并且**一复现就先复制日志**。
+#### 「关窗后进程不退」：用户复现后的日志给出了确凿答案
 
-这一轮的验证：`selftest` 通过；回归套件 **7/7 全绿**；`tests\_exitprobe.py` 在 D3D11/D3D12
-宿主上**都未复现**（这本身就是结论的一部分：简单场景下卸载路径是好的）。
+**已根因修复的一半 —— 退出时的注入/卸载死循环。** 用户点「退出」之后，日志里仍有注入：
+
+```
+21:07:30.150  quit from UI button
+21:07:30.794  inject pid 20124 (re8.exe): remote LoadLibrary returned 0xE2F50000
+21:07:31.618  inject pid 20124 (re8.exe): remote LoadLibrary returned 0xE2F50000
+```
+
+机制：广播 `quit` → 钩子看到 `quit` 立刻自卸载 → 注入标记互斥量消失 → 看护线程 800ms 后
+认为"它没被注入" → **又注入** → 新钩子一启动又自卸载……**0.8 秒一轮，停不下来**。
+后果是**往一个正在关停的游戏进程里反复 `LoadLibrary`**：撞上 loader lock 就是永久挂死。
+
+修法（三处，都是根因级而不是缓解）：
+1. `CleanupAndExit`：**先 `InjectorShutdown()`（停看护线程），再 `cfg.quit = 1`**；
+2. `InjectorScanNow`：`cfg.quit` 置位后**直接 return**，退出流程中绝不再注入；
+3. `InjectorScanNow`：**正在请求卸载的 pid 不注入**（这是同一个死循环的另一半：
+   注入 → 钩子看到 `detachPid == 自己` → 立刻卸载 → 下一轮又注入）。
+
+**仍未定性的一半 —— 关窗那一刻渲染线程就静了。** 从 `21:07:01.5` 起钩子**连续 29 秒零日志**，
+而该进程一直活着、loader 也正常（我们后来两次注入都成功了）。两种解释改法完全不同：
+"游戏自己停住（不再调 Present）" vs "渲染线程卡在我们的 Present 路径里"。
+按本项目「先加诊断再改行为」的规矩**没有猜着改**，而是加了看门狗：
+
+* `PresentCommon` 进出时维护 `gPresentEnterMs` / `gLastPresentMs` / `gPresentStage`；
+* worker 每 200ms 检查一次，超时**只在状态变化时**打一条：
+  * `watchdog: PresentCommon 进入后 X.Xs 未返回 (stage=…)` → 卡在我们这条路径，并按 stage
+    定位（`0=帧统计段 / 1=叠加绘制段 / 2=原始 Present(驱动) / 3=收尾段`）；
+  * `watchdog: 已有 X.Xs 没有 Present 调用` → **游戏侧停住了**，别动钩子的 Present 代码。
+
+#### 这一轮的验证
+
+| 验证 | 结果 |
+|---|---|
+| `selftest` | 通过（exit 0） |
+| 回归套件 | **7/7 全绿**（exit 0） |
+| 看门狗不误报 | ✅ 跑了一次真实会话（`tests\_exitprobe.py`，宿主正常跑 5 秒后关窗），日志里**没有任何 `watchdog:` 行**；`DETACH: enter → worker wait -> exited` 链条完整 |
+| 看门狗确实会报（正例） | ❌ **未做** —— 需要一个"渲染线程停住但 worker 还活着"的靶子（例如只挂起渲染线程），已记进 `docs/APP.md` G14 |
 
 ---
 

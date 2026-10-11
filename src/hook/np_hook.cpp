@@ -264,6 +264,22 @@ NPTelemetry* gTel = nullptr;
 
 CRITICAL_SECTION gCs;
 bool             gInPresent = false;
+
+// ---------------------------------------------------------------------------
+// 「游戏卡住时到底卡在哪」看门狗（2026-10-11，用户实测「关窗后进程不退」）
+//
+// 现场日志里只能看到"钩子突然不再说话"（29 秒零日志），但那有两种**完全不同**的解释，
+// 必须能区分，否则只能靠猜：
+//   * 游戏自己停住了（不再调 Present）  -> 卡点不在我们这条路径上，别乱改钩子；
+//   * PresentCommon 进去了没出来        -> 卡在我们的代码，或它调用的**原始 Present**里。
+// worker 每 200ms 看一次，超时打一条（只在状态变化时打，避免刷屏）。
+// stage 用来定位卡在 PresentCommon 的哪一段，见 kPresentStageName。
+// ---------------------------------------------------------------------------
+std::atomic<uint64_t> gPresentEnterMs{0};   // 0 = 当前不在 Present 里
+std::atomic<uint64_t> gLastPresentMs{0};    // 最近一次进入 Present 的时刻
+std::atomic<int>      gPresentStage{0};
+const char* const     kPresentStageName[] = {
+    "0=帧统计段", "1=叠加绘制段", "2=原始 Present(驱动)", "3=收尾段" };
 // 崩溃快照里的 inPresent 是镜像 gInPresent 的（见文件前面 gDbg* 的说明）。
 // ⚠ 它原来只声明、从不赋值 -> SEH ctx 里 inPresent 恒为 0（子代理审计发现）。
 //   凡是镜像量都必须在**每一处**赋值点同步，否则比不报还糟（会误导定位）。
@@ -1247,10 +1263,18 @@ HRESULT PresentCommon(IDXGISwapChain* sc, UINT sync, UINT flags,
     if (gInPresent) return CallOriginal();
     gInPresent = true;
     gDbgInPresent = 1;   // 镜像给崩溃快照（漏了会让 SEH ctx 的 inPresent 恒报 0）
-    if (!SehReady()) { gInPresent = false; gDbgInPresent = 0; return CallOriginal(); }
+    // 看门狗：标记"进入 Present"。worker 发现它迟迟不清就说明卡在这条路径里。
+    {
+        uint64_t wn = GetTickCount64();
+        gPresentEnterMs.store(wn);
+        gLastPresentMs.store(wn);
+        gPresentStage.store(0);
+    }
+    if (!SehReady()) { gInPresent = false; gDbgInPresent = 0; gPresentEnterMs.store(0); return CallOriginal(); }
     if (setjmp(gJmp) != 0) {
         gJmpArmed = false;
         gInPresent = false;
+        gPresentEnterMs.store(0);
         return CallOriginal();
     }
     gJmpArmed = true;
@@ -1637,6 +1661,7 @@ HRESULT PresentCommon(IDXGISwapChain* sc, UINT sync, UINT flags,
     //   于是 gInPresent 永远是 true，之后每一帧都在开头「已在 Present 中」分支里
     //   直通原函数 —— 叠加和 GPU 时间戳**永久失效**，帧时间也不再更新。
     //   现在改成置一个标志跳过本帧叠加，收尾照常执行。
+    gPresentStage.store(1);          // 看门狗：从这一段起就是"叠加绘制"
     bool stateOk = true;
     if (wantOverlay) {
         uint64_t ms = GetTickCount64();
@@ -1794,8 +1819,10 @@ HRESULT PresentCommon(IDXGISwapChain* sc, UINT sync, UINT flags,
     // 原始 Present 的耗时（`Present(1,0)` 会阻塞到垂直消隐）。
     // 下一帧算 CPU 帧时间时把它扣掉 —— 那是等显示器，不是 CPU 在干活。
     uint64_t tPresent0 = NowQpc();
+    gPresentStage.store(2);          // 看门狗：接下来这一段是**原始 Present**（驱动里的等待）
     HRESULT hr = CallOriginal();
     uint64_t tPresent1 = NowQpc();
+    gPresentStage.store(3);          // 看门狗：回来了，正在收尾
     gLastInPresentMs = (float)QpcMs(tPresent1 - tPresent0);
     if (gTel) gTel->msInPresent = gLastInPresentMs;
 
@@ -1851,6 +1878,8 @@ HRESULT PresentCommon(IDXGISwapChain* sc, UINT sync, UINT flags,
     gFrameStarted = false;
     gInPresent = false;
     gDbgInPresent = 0;
+    gPresentEnterMs.store(0);        // 看门狗：正常出来了
+    gPresentStage.store(0);
     return hr;
 }
 
@@ -2777,6 +2806,40 @@ static DWORD WINAPI Worker(LPVOID) {
 
     while (gReady) {
         Sleep(200);
+
+        // ---- 看门狗：回答「游戏卡住时到底卡在哪」（见 gPresentEnterMs 的说明）
+        //   只在状态**变化**时打一条，避免刷屏。这是"先加诊断再改行为"那条规矩的落地：
+        //   没有这条日志，就无法区分"游戏不再 Present"和"卡在我们的 Present 路径里"。
+        {
+            static uint64_t sWdLast = 0;
+            static int sWdState = 0;      // 0=正常 1=卡在 Present 里 2=没有 Present
+            uint64_t wnow = GetTickCount64();
+            if (wnow - sWdLast >= 1000) {
+                sWdLast = wnow;
+                uint64_t enter = gPresentEnterMs.load();
+                uint64_t last = gLastPresentMs.load();
+                int want = 0;
+                if (enter && wnow - enter > 3000) want = 1;
+                else if (!enter && last && wnow - last > 5000) want = 2;
+                if (want != sWdState) {
+                    sWdState = want;
+                    if (want == 1) {
+                        int st = gPresentStage.load();
+                        if (st < 0 || st > 3) st = 3;
+                        Log("watchdog: PresentCommon 进入后 %.1fs 未返回 (stage=%s) "
+                            "—— 卡在我们这条路径里，按 stage 继续查",
+                            (double)(wnow - enter) / 1000.0, kPresentStageName[st]);
+                    } else if (want == 2) {
+                        Log("watchdog: 已有 %.1fs 没有 Present 调用 —— 游戏侧停住了，"
+                            "不是卡在我们的 Present 路径里",
+                            (double)(wnow - last) / 1000.0);
+                    } else {
+                        Log("watchdog: Present 已恢复");
+                    }
+                }
+            }
+        }
+
         // 主程序退出：完成自卸载（不再返回）
         if (gCfg && gCfg->magic == NP_MAGIC && gCfg->quit) SelfUnloadNow();
         // ★ 主程序要求本进程卸载钩子（清空名单 / 移除某个游戏时会置这个字段）。

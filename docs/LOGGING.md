@@ -129,6 +129,9 @@
 | `overlay 5s: drawn=… skipped=… heapSwaps=…` | 叠加层绘制统计（`heapSwaps` 增长说明交换链被重建过） |
 | `cpu split avg: busy=… wait=… sum=…` | CPU 帧时间拆分自检（**sum 必须等于 busy+wait**） |
 | `detachPid matched -> SelfUnloadNow (asked by host)` | 钩子收到卸载请求 |
+| `watchdog: PresentCommon 进入后 X.Xs 未返回 (stage=…)` | **渲染线程卡在我们的 Present 路径里**，`stage` 指出卡在哪一段（`0=帧统计段` / `1=叠加绘制段` / `2=原始 Present(驱动)` / `3=收尾段`）。只在状态变化时打一条 |
+| `watchdog: 已有 X.Xs 没有 Present 调用` | **游戏侧停住了**（不再调 Present），不是卡在我们的路径里 —— 别去改钩子的 Present 代码 |
+| `watchdog: Present 已恢复` | 上面两种异常结束 |
 | `worker: enter (200ms 心跳)` / `worker: exit (gReady=false)` | 钩子工作线程的起止 |
 | `DETACH: enter (worker=…)` | **进程正在卸载 DLL**（`DLL_PROCESS_DETACH`）。查「关了游戏窗口进程却不退」就看它：**没有这一行** = 游戏卡在卸载 DLL **之前**，与钩子无关；**有这一行但没有下一行** = 卡在 `RestoreAllHooks` 里 |
 | `DETACH: worker wait -> exited / TIMEOUT(500ms)` | 卸载时等钩子工作线程的结果。`TIMEOUT` = 工作线程没在 500ms 内退出（它可能正卡在探测/加载驱动库） |

@@ -1363,8 +1363,9 @@ AppLog("notice[%d]: %s", level, text.c_str());
 | G8 | `NP_MUTEX_SENSORS`（`np_common.h:24`） | 定义了但**从未使用** | 写传感器无锁，靠「整块拷贝」约定 | 若将来要原子发布传感器，这是现成的名字 |
 | G9 | `docs/ARCHITECTURE.md:195` | 记录的 overlay 判据还是旧的 `(now - tickMs) < 2500` | 会把读者带到 G3 那个坑 | ✅ **已修**（2026-10-11）：`ARCHITECTURE.md` §2.4 已改写成「判活一律用帧计数增长 + `gApp.telemetryLive`」 |
 | G10 | `main.cpp:313` 与 `385` | `ProcessIsWow64(pid)` 被调用**两次**（选 DLL 一次、解析 `LoadLibraryW` 前又一次） | 微小冗余，无正确性问题（期间目标位数不会变） | 可选优化 |
-| G12 | 钩子 + 游戏关停 | **用户实测（2026-10-11，re8 DX12）：钩子开着时点叉关游戏，窗口消失但后台进程不退**。帧数停在 888 后再没涨；20 秒后钩子仍能响应卸载并报 `SELFCHECK unloadClean = OK` | 用户必须去任务管理器结束进程 | **未定性**。测试宿主（D3D11/D3D12）**都复现不出来**（关窗 0.5s 干净退出，`DETACH` 链条完整）。排查手段已就位：`python tests\_exitprobe.py` + 钩子日志里的 `DETACH: enter` / `DETACH: worker wait`（**没有 enter = 卡在卸载 DLL 之前，与我们无关**）。见 README「已知问题」 |
+| G12 | 钩子 + 游戏关停 | **用户实测（2026-10-11，re8 DX12）：钩子开着时点叉关游戏，窗口消失但后台进程不退**。已定位到一条确凿原因：**NextPerf 退出时看护线程还在反复注入**（`quit from UI button` 之后仍有两条 `inject pid …`，0.8s 一轮；每次注入的钩子看到 `quit=1` 立刻自卸载 → 互斥量消失 → 又注入）。往正在关停的进程里反复 `LoadLibrary`，撞 loader lock 即永久挂死 | 用户必须去任务管理器结束进程 | ✅ **根因已修**：`CleanupAndExit` 改成**先 `InjectorShutdown()` 再 `cfg.quit=1`**；`InjectorScanNow` 加两道闸门（`cfg.quit` 直接 return / `detachPid == pid` 不注入）。⚠ **另一部分未定性**：关窗那一刻起钩子连续 29 秒零日志，而进程还活着且 loader 正常 —— 是"游戏自己停住"还是"卡在我们的 Present 路径"，已用看门狗（worker 每 200ms 检查 `gPresentEnterMs` / `gPresentStage`）等下次复现给结论 |
 | G13 | `injector.cpp` | **用户实测（同次）：自动注入（进程一出现就注入）会让 re8 启动即闪退；进游戏后手动注入不闪退** | 自动注入实际不可用于这类游戏 | 已缓解：`kAutoInjectDelayMs = 10000`，探测到进程后等 10s 再注入（手动注入不受影响）。**根因未解** —— 早期注入撞上游戏自己的图形初始化，而我们还要自建 D3D11 设备探 vtable |
+| G14 | `tests/_exitprobe.py` | 只覆盖"手动注入 + 关窗"，**没覆盖**"看护线程在退出时反复注入"这条链（那需要在游戏列表里放一个宿主） | 上面 G12 的修复目前**没有自动化回归** | 待补：让探针把宿主写进游戏列表、退出 NextPerf、断言此后不再出现 `attach:` 行 |
 | G11 | `--inject` 的参数解析（`main.cpp:910-916`） | 只做「跳过非数字」，`--inject abc123` 也会注入 123 | 自动化脚本传错参数不会报错 | 需要严格解析时再改 |
 
 ---
