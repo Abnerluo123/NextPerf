@@ -571,9 +571,15 @@ void Log(const char* fmt, ...) {
     // ⚠ 超过上限就回到**文件开头**覆盖重写 —— 也就是说写满之后，
     //   **最新的行在文件开头，结尾反而是旧内容**。排查时请用 Ctrl+F 搜关键字，
     //   或者看文件开头，不要只看末尾（我们就因为只看末尾而误判过"日志里没有这一行"）。
-    //   上限从 64KB 提到 512KB：present diag / frame dist 每 5 秒各一条，
-    //   64KB 只能存几分钟，加上其它日志很快就把关键行冲掉。
-    if (size > 512 * 1024) SetFilePointer(h, 0, nullptr, FILE_BEGIN);
+    // ⚠ 超过上限就回到**文件开头**覆盖重写 —— 也就是说写满之后，**最新的行在文件开头**，
+    //   但它后面紧跟的**不是**"刚刚发生的事"，而是**上一轮**的旧内容；而且这个文件是
+    //   所有被注入进程共用的，多次会话会互相穿插。所以：
+    //     1) 排查时**用 Ctrl+F 搜关键字**（含 pid / exe 名），不要只看开头或只看末尾；
+    //     2) **一旦复现出问题，立刻把日志复制一份**（覆盖是随时可能发生的）。
+    //   2026-10-11 查「游戏退不掉」时就是因为回绕，整场 re8 会话只剩 1 行。
+    //   上限从 512KB 提到 **4MB**：512KB 大约只够跑一小时，而查一个问题往往要看前后
+    //   几分钟的连续上下文，回绕一下就没了。
+    if (size > 4 * 1024 * 1024) SetFilePointer(h, 0, nullptr, FILE_BEGIN);
     else SetFilePointer(h, 0, nullptr, FILE_END);
 
     char buf[1024];
@@ -2766,6 +2772,8 @@ static DWORD WINAPI Worker(LPVOID) {
         if (gClHooked) gTel->hookFlags |= NP_HOOK_CMDLIST;
     }
     gReady = true;
+    // 诊断：进出各一条，配合下面的 DETACH 日志就能判断"游戏退不掉"时我们处在哪一步。
+    Log("worker: enter (200ms 心跳)");
 
     while (gReady) {
         Sleep(200);
@@ -2822,6 +2830,7 @@ static DWORD WINAPI Worker(LPVOID) {
             if (gHeap) gTel->hookFlags |= NP_HOOK_TIMESTAMP;
         }
     }
+    Log("worker: exit (gReady=false)");
     return 0;
 }
 
@@ -2832,6 +2841,13 @@ void NpHookAttach(HMODULE self) {
 }
 
 void NpHookDetach() {
+    // ★ 诊断（2026-10-11 加）：这一段**只在进程正在卸载 DLL 时**才会跑（DLL_PROCESS_DETACH）。
+    //   它的唯一价值是回答用户报的「关了游戏窗口，进程却退不掉」到底卡在哪：
+    //     * 日志里**根本没有 "DETACH: enter"** -> 游戏卡在卸载 DLL **之前**，与我们无关
+    //       （要继续查的是游戏自己的线程/等待，不是钩子）；
+    //     * 有 "DETACH: enter" 但没有 "DETACH: done" -> **是我们把进程卡住了**，
+    //       重点看下面那行 worker wait 是不是 TIMEOUT。
+    Log("DETACH: enter (worker=%p)", (void*)gWorker);
     gReady = false;
     // ★★ 关键：把 vtable 补丁还回去。
     //
@@ -2846,8 +2862,11 @@ void NpHookDetach() {
     RestoreAllHooks();
     if (gWorker) {
         // 自卸载路径下 detach 发生在 worker 线程自己身上，不能等自己
+        DWORD wr = WAIT_OBJECT_0;
         if (GetThreadId(gWorker) != GetCurrentThreadId())
-            WaitForSingleObject(gWorker, 500);
+            wr = WaitForSingleObject(gWorker, 500);
+        Log("DETACH: worker wait -> %s",
+            wr == WAIT_OBJECT_0 ? "exited" : "TIMEOUT(500ms)");
         CloseHandle(gWorker);
         gWorker = nullptr;
     }
