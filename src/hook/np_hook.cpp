@@ -1143,8 +1143,29 @@ void UpdateTelemetryCommon(const NPConfig& cfg, uint64_t nowQpc, bool realPresen
     //     对 FPS 取 **P1**，等价于 1000 / P99(帧时间) —— 正是 lowPercentileFps(99) 做的事
     //
     // 1 秒窗口还有个附带好处：**卡顿约 1 秒后就被遗忘**，不会「钉住」很久。
-    t.fpsLow1 = gStats.lowPercentileFps(99.0f, lowWin);
-    t.fpsLow01 = gStats.lowPercentileFps(99.9f, lowWin);
+    // ★ 恢复「窗口平均」口径（1000ms 窗口）—— 严格百分位在真实游戏里必然是错的。
+    //
+    // 为什么：真实游戏会把一帧拆成多次 Present（实测交替 8.4 / 24.9ms，
+    // 平均恰好 16.65）。此时：
+    //     帧时间【平均】 = 16.65  ✓ 正常
+    //     帧时间【P99】  = 24.9ms -> 1000/24.9 = 40 fps  ✗
+    // 于是「严格百分位」口径下 1% Low 一定是 40 多（用户实测正是如此）。
+    // 窗口平均先把 1000ms 内的帧时间分组求平均，8.4+24.9 会被平均回 16.65，
+    // 假短帧与假长帧一起消失 —— 这才是能反映体感的口径。
+    //
+    // 回看长度按帧率换算成约 10 秒：不能太长，否则一次卡顿会「钉住」很久
+    //（用户为此吃过亏：68 秒回看会让数值钉住近 70 秒）。
+    {
+        double fpsRef = t.fpsAvg > 1.0f ? (double)t.fpsAvg : 60.0;
+        uint32_t look = (uint32_t)(fpsRef * 10.0);
+        if (look < 200) look = 200;
+        if (look > np::FrameStats::kCap) look = np::FrameStats::kCap;
+        t.fpsLow1 = gStats.lowWindowed(1.0f, 1000.0f, look);
+        t.fpsLow01 = gStats.lowWindowed(0.1f, 1000.0f, look);
+    }
+    // 样本还不够（lowWindowed 少于 4 个窗口会返回 0）时用严格百分位兜底
+    if (t.fpsLow1 <= 0.0f) t.fpsLow1 = gStats.lowPercentileFps(99.0f, lowWin);
+    if (t.fpsLow01 <= 0.0f) t.fpsLow01 = gStats.lowPercentileFps(99.9f, lowWin);
     t.p99Ms = gStats.percentileMs(99.0f);
     t.p999Ms = gStats.percentileMs(99.9f);
 
