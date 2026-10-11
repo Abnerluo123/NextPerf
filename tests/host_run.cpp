@@ -39,6 +39,15 @@ static int gDelayMs = 0;
 // 这个模式曾把钩子的基准切到帧中间，使 Busy+Wait 只剩半个帧周期。
 static int gProbePresent = 0;
 
+// --jitter-present：让**呈现时刻在帧内抖动**（隔帧先 Sleep 8ms 再 Present）。
+// 复现真机实测的形态：真呈现的间隔交替成 8.4 / 24.9ms，而**平均恰好 16.65** ——
+// 也就是说帧是均匀的 60fps，抖动只来自"这次 Present 落在帧内哪个位置"。
+// ⚠ 按 Present 间隔直接统计会得出 P50≈8.6ms、1% Low≈40，而显示器明明是 60fps：
+//   这正是《漫威蜘蛛侠》上 1% Low 显示 42~46 的原因（口径不对，不是算错）。
+// 回归用例：tests/verify_jitter_present.py
+static int gJitterPresent = 0;
+static unsigned gFrameNo = 0;
+
 // 并发提交线程（实现在文件末尾，这里先声明）
 static volatile LONG gSubmitRun = 0;
 static DWORD WINAPI SubmitThread(LPVOID param);
@@ -94,8 +103,9 @@ static int Run11(HINSTANCE inst, int seconds) {
             ctx->ClearRenderTargetView(rtv, c);
         }
         if (gProbePresent) sc->Present(0, DXGI_PRESENT_TEST);
+        if (gJitterPresent && ((++gFrameNo) & 1)) Sleep(6);
         sc->Present(1, 0);
-        Sleep(16);
+        Sleep(gJitterPresent ? 0 : 16);      // 抖动模式跑 ~60fps（复现"显示 60 但间隔乱跳"）
     }
     return 0;
 }
@@ -255,8 +265,9 @@ static int Run12(HINSTANCE inst, int seconds) {
             CloseHandle(ev);
         }
         if (gProbePresent) sc->Present(0, DXGI_PRESENT_TEST);
+        if (gJitterPresent && ((++gFrameNo) & 1)) Sleep(6);
         sc->Present(1, 0);
-        Sleep(16);
+        Sleep(gJitterPresent ? 0 : 16);      // 抖动模式跑 ~60fps（复现"显示 60 但间隔乱跳"）
     }
 
     InterlockedExchange(&gSubmitRun, 0);
@@ -323,6 +334,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmd, int) {
     //   `Busy + Wait` 只剩半个帧周期（8.23ms vs 16.7ms）、面板 CPU 帧时间掉到 0.3ms。
     //   回归用例：tests/verify_present_test.py（实现见 Run12 的 gProbePresent）
     if (strstr(cmd, "--probe-present")) gProbePresent = 1;
+    if (strstr(cmd, "--jitter-present")) gJitterPresent = 1;
     // --decoy-vulkan：**在正常跑 DX12 / D3D11 的同时**额外加载 vulkan-1.dll。
     //   模拟真实游戏《漫威蜘蛛侠》：纯 DX12，但进程里确实有 vulkan-1.dll
     //   （引擎/启动器/视频模块带进来的）。
