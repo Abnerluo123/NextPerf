@@ -1186,6 +1186,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdLine, int cmdShow) {
                 static uint64_t sLastFt = 0;
                 static uint64_t sLastGrowMs = 0;
                 uint64_t ft = gApp.telemetry.frameTotal;
+                DWORD    telPid = gApp.telemetry.pid;
                 if (ft != sLastFt) {
                     sLastFt = ft;
                     sLastGrowMs = now;
@@ -1195,20 +1196,25 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdLine, int cmdShow) {
                 //   （实测日志 tele=1 ft=5023 growAge=86469ms）。
                 //   判据：遥测连着但帧数超过 2.5 秒不再增长 -> 该钩子已死 -> 清掉。
                 //   这样状态栏、面板、图表都不会再念旧数据，而且不依赖跨进程时钟。
-                if (gApp.telemetry.attached && gApp.telemetry.pid != 0 && sLastGrowMs &&
+                if (gApp.telemetry.attached && telPid != 0 && sLastGrowMs &&
                     (now - sLastGrowMs) > 2500) {
                     AppLog("telemetry: pid=%lu 帧数停增 %.1f 秒 -> 判定钩子已死，清空遥测",
-                           (unsigned long)gApp.telemetry.pid,
+                           (unsigned long)telPid,
                            (double)(now - sLastGrowMs) / 1000.0);
                     {
                         AppLock lk;
-                        DWORD dead = gApp.telemetry.pid;
+                        DWORD dead = telPid;
                         NPClearTelemetry(&gApp.telemetry);
                         for (size_t i = gApp.injected.size(); i-- > 0;) {
                             if (gApp.injected[i] == dead) gApp.injected.erase(gApp.injected.begin() + i);
                         }
                     }
-                    sLastFt = 0;
+                    // ★ 只清计时器，**绝不要把 sLastFt 清成 0**。
+                    //   清 0 之后下一次读到的"冻结帧数"（比如 888）与 0 不相等，会被当成
+                    //   "帧数又增长了" -> 立刻重新判活 -> 2.5 秒后再判死，于是状态栏在
+                    //   「钩上 / 没钩上」之间**每 2.5 秒翻一次**（用户 2026-10-11 实测：
+                    //   20:52:07 判死、20:52:09 再判死、20:52:11 又 attached=1）。
+                    //   保留冻结值：只有帧数真的变化（含新钩子实例从 0 重新计数）才会复活。
                     sLastGrowMs = 0;
                 }
                 bool attached = gApp.telemetry.attached && sLastGrowMs != 0 &&
