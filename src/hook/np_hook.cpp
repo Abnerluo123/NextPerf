@@ -277,6 +277,7 @@ bool             gInPresent = false;
 // ---------------------------------------------------------------------------
 std::atomic<uint64_t> gPresentEnterMs{0};   // 0 = 当前不在 Present 里
 std::atomic<uint64_t> gLastPresentMs{0};    // 最近一次进入 Present 的时刻
+std::atomic<uint64_t> gLastEclMs{0};        // 最近一次 ExecuteCommandLists（游戏还在提交吗）
 std::atomic<int>      gPresentStage{0};
 const char* const     kPresentStageName[] = {
     "0=帧统计段", "1=叠加绘制段", "2=原始 Present(驱动)", "3=收尾段" };
@@ -1655,6 +1656,12 @@ HRESULT PresentCommon(IDXGISwapChain* sc, UINT sync, UINT flags,
     bool wantOverlay = !paused && (cfg.overlayMode != 2) && (gDev11 || gDev12) &&
                        !(gDev12 && !d12ok) && !settling;
     bool panelOk = false, drawnOk = false;
+    // 诊断（2026-10-11 用户报「面板闪烁」）：我们到底画进了哪几张后台缓冲？
+    //   `overlay 5s` 显示 drawn=300 / skipped=0（每帧都画），人眼却看到闪烁 ——
+    //   按 docs/HOOK.md 的判据这就指向「成因B：画进了最终没被呈现的那张缓冲」。
+    //   要证实只能看这个直方图：flip 模型下 BufferCount=2/3 时它应当**均匀分布**；
+    //   若长期只有 1 个下标非零，说明我们拿到的 GetCurrentBackBufferIndex() 有问题。
+    static uint32_t sBbIdxHist[16] = {};
     // ★ 原来这里（后台缓冲属于别的设备时）是 `bb->Release(); return CallOriginal();`
     //   —— 从 PresentCommon 的**中间**直接返回，把函数尾部的一整套收尾全跳过了：
     //     gInPresent = false / gFrameStarted = false / gLastPresentQpc / gLastInPresentMs。
@@ -1687,6 +1694,7 @@ HRESULT PresentCommon(IDXGISwapChain* sc, UINT sync, UINT flags,
                     bbIndex = sc3->GetCurrentBackBufferIndex();
                     sc3->Release();
                 }
+                if (bbIndex < 16) ++sBbIdxHist[bbIndex];
                 ID3D11Texture2D* bb = nullptr;
                 if (SUCCEEDED(sc->GetBuffer(bbIndex, IID_PPV_ARGS(&bb))) && bb) {
                     ID3D11Device* bdev = nullptr;
@@ -1710,6 +1718,19 @@ HRESULT PresentCommon(IDXGISwapChain* sc, UINT sync, UINT flags,
                 if (SUCCEEDED(sc->QueryInterface(IID_PPV_ARGS(&sc3))) && sc3) {
                     idx = sc3->GetCurrentBackBufferIndex();
                     sc3->Release();
+                }
+                if (idx < 16) ++sBbIdxHist[idx];
+                // 交换链参数只在第一次打一条：BufferCount / SwapEffect / 格式直接决定
+                // "每帧该画进哪张缓冲"，判 bbIdx 直方图正不正常要用它做参照。
+                static bool sScDescLogged = false;
+                if (!sScDescLogged) {
+                    DXGI_SWAP_CHAIN_DESC d{};
+                    if (SUCCEEDED(sc->GetDesc(&d))) {
+                        sScDescLogged = true;
+                        Log("swapchain desc: fmt=%u buffers=%u swapEffect=%u flags=0x%X",
+                            (unsigned)d.BufferDesc.Format, (unsigned)d.BufferCount,
+                            (unsigned)d.SwapEffect, (unsigned)d.Flags);
+                    }
                 }
                 ID3D12Resource* bb = nullptr;
                 if (SUCCEEDED(sc->GetBuffer(idx, IID_PPV_ARGS(&bb))) && bb) {
@@ -1806,9 +1827,13 @@ HRESULT PresentCommon(IDXGISwapChain* sc, UINT sync, UINT flags,
         uint64_t tstat = GetTickCount64();
         if (sOvStatMs == 0) sOvStatMs = tstat;
         if (tstat - sOvStatMs >= 5000) {
-            Log("overlay 5s: drawn=%u skipped=%u heapSwaps=%d (skipped 多 => 成因A 没画上；"
-                "drawn 正常但画面闪 => 成因B 画错缓冲)",
-                sOvDrawn, sOvSkip, gOv12.HeapSwaps());
+            Log("overlay 5s: drawn=%u skipped=%u heapSwaps=%d bbIdx=[%u,%u,%u,%u|%u] "
+                "(skipped 多 => 成因A 没画上；drawn 正常但画面闪 => 成因B 画错缓冲；"
+                "正常 flip 模型下 bbIdx 应均匀分布)",
+                sOvDrawn, sOvSkip, gOv12.HeapSwaps(),
+                sBbIdxHist[0], sBbIdxHist[1], sBbIdxHist[2], sBbIdxHist[3],
+                sBbIdxHist[4] + sBbIdxHist[5] + sBbIdxHist[6] + sBbIdxHist[7]);
+            for (int i = 0; i < 16; ++i) sBbIdxHist[i] = 0;
             sOvDrawn = sOvSkip = 0;
             sOvStatMs = tstat;
         }
@@ -2347,6 +2372,11 @@ HRESULT __stdcall NpCreateSwapChainComp(IDXGIFactory2* f, IUnknown* dev,
 
 void __stdcall NpECL(ID3D12CommandQueue* q, UINT n, ID3D12CommandList* const* lists) {
     if (gUnloading || !q) { if (gOrigECL) gOrigECL(q, n, lists); return; }
+    // 诊断（2026-10-11「关窗后进程不退」）：记下"最近一次有人提交命令列表"的时刻。
+    //   看门狗会把它和"最近一次 Present"一起打出来，用来区分两种完全不同的卡法：
+    //     游戏**还在提交**但不呈现 -> 它的渲染/提交线程还活着，卡在别处（多半是它自己的等待）；
+    //     游戏**连提交都没了**   -> 整个图形侧都停了，才可能是被我们拖住的。
+    gLastEclMs.store(GetTickCount64(), std::memory_order_relaxed);
 
     // 只认 3D 直连队列。复制 / 计算队列拿去做叠加和 GPU 时间戳都是错的，
     // 而且游戏常常先提交复制队列，先到先得会把 gQueue12 记错。
@@ -2830,9 +2860,13 @@ static DWORD WINAPI Worker(LPVOID) {
                             "—— 卡在我们这条路径里，按 stage 继续查",
                             (double)(wnow - enter) / 1000.0, kPresentStageName[st]);
                     } else if (want == 2) {
+                        uint64_t ecl = gLastEclMs.load();
                         Log("watchdog: 已有 %.1fs 没有 Present 调用 —— 游戏侧停住了，"
-                            "不是卡在我们的 Present 路径里",
-                            (double)(wnow - last) / 1000.0);
+                            "不是卡在我们的 Present 路径里（最近一次命令列表提交 %.1fs 前%s）",
+                            (double)(wnow - last) / 1000.0,
+                            ecl ? (double)(wnow - ecl) / 1000.0 : -1.0,
+                            (ecl && wnow - ecl < 2000) ? " —— 它还在提交，图形侧没死"
+                                                       : " —— 连提交都停了");
                     } else {
                         Log("watchdog: Present 已恢复");
                     }
