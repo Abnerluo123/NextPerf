@@ -99,6 +99,21 @@ private:
     struct Pending { IUnknown* res; UINT64 value; };
     Pending pending_[16]{};
     int     pendingN_ = 0;
+
+    // ---------------------------------------------------------------- 上传缓冲环
+    //
+    // 原来**每帧** CreateCommittedResource 一个约 300KB 的 UPLOAD 资源。两个理由不能留：
+    //   1) 纯浪费：60fps × 300KB ≈ 18MB/s 的分配/释放抖动；
+    //   2) 更要紧：它在崩溃二分的嫌疑名单上 —— 历史二分显示崩溃需要「绑定我们的 RTV」
+    //      与「上传那一半」**同时**存在，而把 CopyTextureRegion 去掉**仍然崩**；
+    //      于是"每帧新建上传资源"就是上传那一半里剩下的唯一动作。改成复用常驻缓冲，
+    //      等于把这个动作从每帧路径上彻底删掉。
+    // 复用前必须等 fence：GPU 还在读上一版内容时 memcpy 进去会让面板撕裂。
+    enum { kUploadRing = 4 };
+    ID3D12Resource* uploadRing_[kUploadRing] = {};
+    UINT64          uploadRingSize_[kUploadRing] = {};    // 已创建大小（0 = 还没建）
+    UINT64          uploadRingFence_[kUploadRing] = {};   // 用它的那一帧会 Signal 到这个值
+    int             uploadRingNext_ = 0;
 };
 
 }  // namespace npg

@@ -358,6 +358,13 @@ bool Overlay12::EnsurePso(ID3D12Device* dev, DXGI_FORMAT rtvFormat) {
 void Overlay12::Release() {
     for (int i = 0; i < pendingN_; ++i) if (pending_[i].res) pending_[i].res->Release();
     pendingN_ = 0;
+    // 常驻上传缓冲环（它们不再挂在 pending_ 上，必须在这里显式放掉）
+    for (int i = 0; i < (int)kUploadRing; ++i) {
+        if (uploadRing_[i]) { uploadRing_[i]->Release(); uploadRing_[i] = nullptr; }
+        uploadRingSize_[i] = 0;
+        uploadRingFence_[i] = 0;
+    }
+    uploadRingNext_ = 0;
     if (tex_) { tex_->Release(); tex_ = nullptr; }
     if (srvHeap_) { srvHeap_->Release(); srvHeap_ = nullptr; }
     if (rtvHeap_) { rtvHeap_->Release(); rtvHeap_ = nullptr; }
@@ -436,16 +443,39 @@ bool Overlay12::Record(ID3D12Device* dev, ID3D12GraphicsCommandList* list,
     UINT64 rowPitch = ((UINT64)stride + (D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1)) /
                       D3D12_TEXTURE_DATA_PITCH_ALIGNMENT * D3D12_TEXTURE_DATA_PITCH_ALIGNMENT;
     UINT64 uploadSize = rowPitch * (UINT64)h;
-    D3D12_RESOURCE_DESC ud{};
-    ud.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    ud.Width = uploadSize; ud.Height = 1; ud.DepthOrArraySize = 1; ud.MipLevels = 1;
-    ud.SampleDesc.Count = 1; ud.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    D3D12_HEAP_PROPERTIES up = NpHeapProps(D3D12_HEAP_TYPE_UPLOAD);
+
+    // ★ 常驻上传缓冲环（见 np_draw.h 里的说明）：**不再每帧 CreateCommittedResource**。
+    //   挑一个 fence 已确认"GPU 用完"的缓冲；一个都挑不到就这一帧不更新面板
+    //   （纹理里还是上一帧的内容，不是"不画"）。
+    UINT64 doneNow = fence_->GetCompletedValue();
     ID3D12Resource* upload = nullptr;
-    if (FAILED(dev->CreateCommittedResource(&up, D3D12_HEAP_FLAG_NONE, &ud,
-                                            D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
-                                            IID_PPV_ARGS(&upload))))
-        return false;
+    int slotIdx = -1;
+    for (int k = 0; k < (int)kUploadRing; ++k) {
+        int i = (uploadRingNext_ + k) % (int)kUploadRing;
+        if (uploadRing_[i] && uploadRingFence_[i] > doneNow) continue;   // 还在 GPU 手里
+        if (uploadRing_[i] && uploadRingSize_[i] != uploadSize) {        // 面板尺寸变了，重建
+            Retire(uploadRing_[i]);
+            uploadRing_[i] = nullptr;
+            uploadRingSize_[i] = 0;
+        }
+        if (!uploadRing_[i]) {
+            D3D12_RESOURCE_DESC ud{};
+            ud.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            ud.Width = uploadSize; ud.Height = 1; ud.DepthOrArraySize = 1; ud.MipLevels = 1;
+            ud.SampleDesc.Count = 1; ud.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            D3D12_HEAP_PROPERTIES up = NpHeapProps(D3D12_HEAP_TYPE_UPLOAD);
+            if (FAILED(dev->CreateCommittedResource(&up, D3D12_HEAP_FLAG_NONE, &ud,
+                                                    D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                                    IID_PPV_ARGS(&uploadRing_[i]))))
+                return false;
+            uploadRingSize_[i] = uploadSize;
+        }
+        upload = uploadRing_[i];
+        slotIdx = i;
+        break;
+    }
+    if (!upload || slotIdx < 0) return false;
+
     void* dst = nullptr;
     if (SUCCEEDED(upload->Map(0, nullptr, &dst))) {
         for (int r = 0; r < h; ++r)
@@ -453,23 +483,8 @@ bool Overlay12::Record(ID3D12Device* dev, ID3D12GraphicsCommandList* list,
                    (size_t)stride);
         upload->Unmap(0, nullptr);
     }
-    if (pendingN_ < 15) {
-        pending_[pendingN_].res = upload;
-        pending_[pendingN_].value = fenceValue_ + 1;  // 调用方执行后会 Signal 到这个值
-        ++pendingN_;
-    } else {
-        // 回收队列满了：先清掉已完成的，还满就放弃这一帧的叠加。
-        // 绝不能在这里直接 Release —— 那个上传缓冲十有八九还在 GPU 手里。
-        OnFrameCompleted();
-        if (pendingN_ < 15) {
-            pending_[pendingN_].res = upload;
-            pending_[pendingN_].value = fenceValue_ + 1;
-            ++pendingN_;
-        } else {
-            upload->Release();
-            return false;
-        }
-    }
+    uploadRingFence_[slotIdx] = fenceValue_ + 1;     // 调用方执行后会 Signal 到这个值
+    uploadRingNext_ = (slotIdx + 1) % (int)kUploadRing;
 
     D3D12_TEXTURE_COPY_LOCATION srcLoc{};
     srcLoc.pResource = upload;
