@@ -425,6 +425,13 @@ uint32_t gAlignOk = 0, gAlignBad = 0;   // 间隔是否落在整数个垂直消�
 //   低于 60% 才关、高于 80% 才开，且估计是滚动的，不会周期性翻转。
 float    gAlignEma = 1.0f;
 bool     gQuantizeOn = true;
+// ★ 2026-10-11 重做启用闸门：判据不是"每帧是否落在整数个消隐上" ——
+//   Spider-Man 的 10.7/16.3/16.6/23.0 四帧周期只有约 50% 落在 ±0.25 内，但它**确实是**
+//   被消隐节流的，累积重建对它是正确的（实测：按 75% 对齐率设闸门 → ③ 在她身上完全不生效）。
+//   正确判据 = **呈现是否被消隐节流**：同步呈现 + 近期**中位间隔 ≥ 0.9 × 消隐周期**。
+//   （不等垂直同步（sync0）时中位间隔会远小于周期 → 自动关掉；VRR 同理。）
+float    gPaceEma = 1.0f;
+float    gLastMedRaw = 0.0f;            // 诊断用：最近的中位原始间隔
 uint32_t gDupPresent = 0;               // 被判定为"同一垂直消隐内的重复呈现"的次数（诊断）
 uint64_t gPhaseRefQpc = 0;              // 累积相位重建的参考时刻（0 = 未启用）
 long     gPhaseNPrev = 0;               // 上一次的垂直消隐序号
@@ -1275,12 +1282,21 @@ void UpdateTelemetryCommon(const NPConfig& cfg, uint64_t nowQpc, bool realPresen
         uint32_t look = (uint32_t)(fpsRef * 10.0);
         if (look < 200) look = 200;
         if (look > np::FrameStats::kCap) look = np::FrameStats::kCap;
-        t.fpsLow1 = gStats.lowWindowed(1.0f, 1000.0f, look);
-        t.fpsLow01 = gStats.lowWindowed(0.1f, 1000.0f, look);
+        // ★ 2026-10-11：Low 帧改回**百分位**（在"显示帧"序列上取）—— 窗口平均那套补丁退休。
+        //
+        //   为什么现在可以：③ 让帧时长变成"显示器上真实显示的那一帧"，帧内多次 Present
+        //   造成的假长短帧已经被相位重建吃掉，严格百分位不再被它骗。
+        //
+        //   为什么必须改（用户实测）：「关掉锁帧后 Low 帧等好几秒**突然跳到**新值」——
+        //   因为"把 1 秒窗口求平均、再取最差的窗口"是 **max 型统计**：只要回看里还剩一个
+        //   旧的慢窗口，数值就被它钉住，直到那一整块滑出回看（约 10 秒）才跳过去 —— 是台阶。
+        //   百分位是在滑动回看上取的：老帧一帧一帧被换出去 → **必然是渐变** ✓
+        //   （用户的原话就是"应该混合了跳变前和跳变后的部分，一定有一个渐变过程"）。
+        //   附带：600/1360 个样本下 1% 与 0.1% 取到的是**不同位置**的帧 → 两行不再相同。
+        t.fpsLow1 = gStats.lowPercentileFps(99.0f, look);
+        t.fpsLow01 = gStats.lowPercentileFps(99.9f, look);
     }
-    // 样本还不够（lowWindowed 少于 4 个窗口会返回 0）时用严格百分位兜底
-    if (t.fpsLow1 <= 0.0f) t.fpsLow1 = gStats.lowPercentileFps(99.0f, lowWin);
-    if (t.fpsLow01 <= 0.0f) t.fpsLow01 = gStats.lowPercentileFps(99.9f, lowWin);
+    // 样本太少（<20 帧）时百分位没有意义 → 保持 0（面板显示 —），不再用窗口平均兜底。
     t.p99Ms = gStats.percentileMs(99.0f);
     t.p999Ms = gStats.percentileMs(99.9f);
 
@@ -1514,10 +1530,13 @@ HRESULT PresentCommon(IDXGISwapChain* sc, UINT sync, UINT flags,
             alignedNow = (off <= 0.25f);
             if (alignedNow) ++gAlignOk; else ++gAlignBad;
         }
-        // 滚动估计 + 迟滞（见 gAlignEma 的注释）：避免闸门周期性翻转
-        gAlignEma += 0.02f * ((alignedNow ? 1.0f : 0.0f) - gAlignEma);
-        if (gQuantizeOn) { if (gAlignEma < 0.60f) gQuantizeOn = false; }
-        else if (gAlignEma > 0.80f) gQuantizeOn = true;
+        // 启用闸门（见 gPaceEma 的注释）：**中位间隔 ≥ 0.9×消隐周期** 才算"被消隐节流"
+        float medRaw = gRawStats.medianMs(240);
+        gLastMedRaw = medRaw;
+        bool paceOk = (gVblankMs > 0.0f && sync >= 1 && medRaw >= gVblankMs * 0.9f);
+        gPaceEma += 0.02f * ((paceOk ? 1.0f : 0.0f) - gPaceEma);
+        if (gQuantizeOn) { if (gPaceEma < 0.60f) gQuantizeOn = false; }
+        else if (gPaceEma > 0.80f) gQuantizeOn = true;
         // ---- 以「显示帧」为准：**累积相位重建**（2026-10-11，③）
         //
         //   为什么是"累积"而不是"逐帧量化"：逐帧 round(interval/vblank) 的误差会**累积**
@@ -1558,11 +1577,14 @@ HRESULT PresentCommon(IDXGISwapChain* sc, UINT sync, UINT flags,
             static uint64_t sLastSpikeMs = 0;
             static float sBaseMs = 0.0f;
             static uint32_t sSpikeN = 0;
-            if (sBaseMs <= 0.0f) sBaseMs = fm;
-            if (fm < sBaseMs * 1.15f) sBaseMs += 0.02f * (fm - sBaseMs);   // 基线只跟正常帧走
+            // 基线用**近期中位数**，不用 EMA —— EMA 会被 1ms 级的重复呈现拖到 1.5ms 左右，
+            // 于是每一帧都被误报成尖峰（Spider-Man 实测刷了 137 条）。
+            float base = gRawStats.medianMs(120);
+            if (base <= 0.0f) base = fm;
+            if (sBaseMs <= 0.0f) sBaseMs = base;
+            sBaseMs = base;
             uint64_t tick = GetTickCount64();
-            // 灵敏度：>1.15 倍基线**且**多出 ≥2ms —— 用户报的"16.67 → 20ms 波峰"正好卡在这个门限上
-            // （原来写 1.35 倍，那种波峰根本不会被记录）。
+            // 灵敏度：>1.15 倍基线**且**多出 ≥2ms —— 用户报的"16.67 → 20ms 波峰"正好卡在这个门限上。
             if (fm > sBaseMs * 1.15f && fm > sBaseMs + 2.0f && tick - sLastSpikeMs > 1000) {
                 ++sSpikeN;
                 Log("spike: %.2fms (基线 %.2fms, 距上次尖峰 %.2fs, 第 %u 次)",
@@ -1723,10 +1745,12 @@ HRESULT PresentCommon(IDXGISwapChain* sc, UINT sync, UINT flags,
         if (ms - diagT0 >= 5000 && diagN > 0) {
             uint32_t real = diagN - diagTest;
             Log("present diag 5s: calls=%u real=%u test=%u sync0=%u sync1=%u other=%u "
-                "frameMs min=%.2f max=%.2f avg=%.2f | vblank=%.2fms aligned=%u/%u (%.0f%%) dup=%u",
+                "frameMs min=%.2f max=%.2f avg=%.2f | vblank=%.2fms med=%.2fms q=%d "
+                "aligned=%u/%u (%.0f%%) dup=%u",
                 diagN, real, diagTest, diagSync0, diagSync1, diagOther,
                 diagMin > 1e8f ? 0.0f : diagMin, diagMax, real ? (float)(diagSum / real) : 0.0f,
-                (double)gVblankMs, gAlignOk, gAlignOk + gAlignBad,
+                (double)gVblankMs, (double)gLastMedRaw, gQuantizeOn ? 1 : 0,
+                gAlignOk, gAlignOk + gAlignBad,
                 (gAlignOk + gAlignBad) ? 100.0 * gAlignOk / (gAlignOk + gAlignBad) : 0.0,
                 gDupPresent);
             gAlignOk = gAlignBad = gDupPresent = 0;
