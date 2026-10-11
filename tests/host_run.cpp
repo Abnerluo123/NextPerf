@@ -309,6 +309,16 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmd, int) {
         int v = atoi(p + 7);
         if (v > 0) gDelayMs = v * 1000;
     }
+    // --decoy-vulkan：**在正常跑 DX12 / D3D11 的同时**额外加载 vulkan-1.dll。
+    //   模拟真实游戏《漫威蜘蛛侠》：纯 DX12，但进程里确实有 vulkan-1.dll
+    //   （引擎/启动器/视频模块带进来的）。
+    //   ⚠ 历史上这个组合会让钩子把 DX12 判成 Vulkan → `probe disabled` → 交换链一次都挂不上
+    //   （面板显示 Vulkan 且没有任何数据）。回归用例：tests/verify_dx12_decoyvk.py
+    if (strstr(cmd, "--decoy-vulkan")) {
+        HMODULE vk = LoadLibraryW(L"vulkan-1.dll");
+        printf("host: decoy vulkan-1.dll loaded=%d (still rendering with D3D)\n", vk ? 1 : 0);
+        fflush(stdout);
+    }
     // --nogfx：模拟 Vulkan / OpenGL 游戏 —— 只开窗口，加载 vulkan-1.dll，
     // 完全不碰 DXGI。用来验证「Present 挂不上时钩子也要说明原因」这条路。
     if (strstr(cmd, "--nogfx")) {

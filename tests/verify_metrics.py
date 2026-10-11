@@ -107,21 +107,27 @@ def main():
 
     kill_all()
 
-    if hits is None:
-        print("  ❌ 日志里没有『命中 N 个引擎实例』—— PDH 根本没读到该进程的引擎")
-        print("     GPU 帧时间行：%s" % [l for l in read_log_tail("数据来源") if "GPU 帧时间" in l][-1:])
-        return 1
-    if hits <= 0:
-        print("  ❌ 命中引擎实例数为 0（PDH 动态实例没抓到该 pid）")
-        return 1
+    # ⚠ 判据只认**用户实际能看到的结果**（GPU 帧时间出了正数）。
+    #   注：原来这里还硬要求日志里出现『命中 N 个引擎实例』—— 但那行**只打印在
+    #   "PDH 未出数原因" 这条诊断里**，也就是只在"还没出数"时出现。
+    #   2026-10-11 把探测时机提前（+6000ms → +800ms）之后，钩子挂得更快、
+    #   应用第一轮轮询就拿到了正常值 → 那条诊断根本不出现 → 这个用例反而判 FAIL。
+    #   断言必须落在结果上，不能落在"曾经出现过某条失败诊断"上。
     if not ok:
-        print("  ❌ 命中了 %d 个引擎实例，但 GPU 帧时间始终没有正数" % hits)
-        if reason:
-            print("     最后的原因行：%s" % reason)
+        if hits is None:
+            print("  ❌ 等了 25 秒 GPU 帧时间始终没有正数，日志里也没有『命中 N 个引擎实例』"
+                  "—— PDH 根本没读到该进程的引擎")
+            print("     GPU 帧时间行：%s" % [l for l in read_log_tail("数据来源") if "GPU 帧时间" in l][-1:])
+        elif hits <= 0:
+            print("  ❌ 命中引擎实例数为 0（PDH 动态实例没抓到该 pid）")
+        else:
+            print("  ❌ 命中了 %d 个引擎实例，但 GPU 帧时间始终没有正数" % hits)
+            if reason:
+                print("     最后的原因行：%s" % reason)
         return 1
 
-    print("  ✅ 命中 %d 个引擎实例，GPU 帧时间 = %.2f ms（先开 NextPerf、后开游戏的顺序）"
-          % (hits, value))
+    extra = ("（诊断行显示命中 %d 个引擎实例）" % hits) if hits is not None else ""
+    print("  ✅ GPU 帧时间 = %.2f ms%s（先开 NextPerf、后开游戏的顺序）" % (value, extra))
     print("结果：PASS —— PDH 指标链路端到端可用")
     print("注意：本用例只验证『有值』，不验证『值准不准』（那需要真实游戏对照）")
     return 0

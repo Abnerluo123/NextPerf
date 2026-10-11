@@ -26,6 +26,11 @@ STEPS = [
     ("退出流程不再注入 · 主程序退出链路", [sys.executable, os.path.join(HERE, "verify_quit_noinject.py")]),
     ("Present 看门狗 · 挂起渲染线程应报「游戏侧停住了」",
      [sys.executable, os.path.join(HERE, "verify_watchdog.py")]),
+    # 2026-10-11 用户实测《漫威蜘蛛侠》：纯 DX12 被判成 Vulkan → 探测被禁 → 完全没数据。
+    # 这个用例用 `host_run.exe --decoy-vulkan`（照常跑 DX12 + 额外加载 vulkan-1.dll）
+    # 在工作区内复现那个组合；**修复前的钩子跑它必 FAIL**（已验证）。
+    ("DX12 + 进程里有 vulkan-1.dll · 仍须认出 DX12 并挂上",
+     [sys.executable, os.path.join(HERE, "verify_dx12_decoyvk.py")]),
 ]
 
 
