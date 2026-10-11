@@ -150,8 +150,11 @@ void AppPollSensors() {
     uint32_t frameCount = gApp.telemetry.frameTotal;
     {
         np::EtwMonitor::Result er{};
-        if (np::Etw().active() && np::Etw().Snapshot(&er) && er.presentN > frameCount)
-            frameCount = er.presentN;
+        // ⚠ 只在**钩子没挂上**时才用 ETW 的计数（它本来就是"外置兜底"的定位）。
+        //   原来写的是"取两者大的那个" —— 那是个**真 bug**，只是以前 ETW 没数据所以从没触发：
+        //   ETW 的 presentN 是**从会话启动累计**的、跨游戏局不清零，而 GPU 帧时间 =
+        //   累计 GPU 时间 ÷ 帧数 → 第二局起分母掺进上一局的帧数 → **GPU 帧时间必然偏小**。
+        if (frameCount == 0 && np::Etw().active() && np::Etw().Snapshot(&er)) frameCount = er.presentN;
     }
     if (pid) {
         gApp.hub.PollGameGpu(pid, frameCount, gApp.sensors);
