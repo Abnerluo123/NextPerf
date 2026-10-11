@@ -211,6 +211,8 @@
 | `verify_x86_inject.py` | 32 位注入 |
 | `verify_frontinject.py` / `verify_early.py` / `verify_metrics.py` | 其它注入场景 |
 | `struct_check.py` | 校验 ctypes 镜像与 C++ 结构体一致 |
+| `verify_dx12_decoyvk.py` / `verify_present_test.py` / `verify_watchdog.py` / `verify_quit_noinject.py` | 2026-10-11 补的四条回归（`--decoy-vulkan` 的 DX12 识别、`--probe-present` 的帧基准、看门狗正例、退出不再注入），都在 `run_all.py` 里 |
+| `repro_low_frame.py` | **诊断工具（不在套件里）**：起宿主 `--jitter-present` 复现"显示 60fps 但 Present 间隔乱跳"，打出"显示事件探测 / vblank / 对齐率 / 重复呈现次数"——这是 ③「以显示帧为准」的取数工具 |
 | `merge_algo_check.py` | 帧内合并算法的数值验证 |
 | `low_recover_check.py` | Low 帧恢复时间的量化（历史分析） |
 | `panel_width_check.py` / `row_metrics_check.py` | 面板布局 |

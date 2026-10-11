@@ -464,7 +464,7 @@ for (size_t i = 0; i < sizeof(c->reserved) / sizeof(c->reserved[0]); ++i) {
 | `fpsAvg` | float | 平均 FPS = 最近 600 帧的平均帧时间换算（`gStats.avgFps(600)`） | 同上 | 仪表/日志/`NPHistory`；**也用于把 1 秒窗口换算成帧数** | 活跃 |
 | `fpsLow1` | float | **1% Low（FPS）**。**最终口径 = `lowWindowed(1.0, 1000ms, look)`（窗口平均，回看约 10s）**；只有窗口数不足 4 个时才回退 `lowPercentileFps(99.0, lowWin)` 兜底（`np_hook.cpp` 1186-1191） | 同上 | 面板「1% Low」行；**主程序会用 ETW 读数覆盖**（见下） | 活跃 |
 | `fpsLow01` | float | **0.1% Low（FPS）**。同 `fpsLow1`：`lowWindowed(0.1, 1000ms, look)` 为主，`lowPercentileFps(99.9, lowWin)` 兜底 | 同上 | 面板「0.1% Low」行 | 活跃 |
-| `frameMs` | float | **最近一帧的原始帧生成时间** ms（未平滑）。参与统计、合并判定、图表 | `PresentCommon` | `UpdateTelemetryCommon()`（喂 `gStats`、算 EMA、算 `rtLoad` 分母）、`np_build` 兜底显示 | 活跃 |
+| `frameMs` | float | **最近一帧的帧生成时间** ms。★ 2026-10-11 起 = **显示帧时长**（累积相位重建：`(N−N_prev) × 垂直消隐周期`），不再是 Present 调用间隔 —— 前者会在帧内漂移（Spider-Man 实测 10.7/16.3/16.6/23.0 交替），后者才是显示器上真实的帧时长。不满足"同步呈现 + 刷新率已知 + 对齐率≥75%"时回退原始间隔 | `PresentCommon` | `UpdateTelemetryCommon()`（喂 `gStats`、算 EMA、算 `rtLoad` 分母）、`np_build` 兜底显示 | 活跃 |
 | `frameMsAvg` | float | 平滑后的帧时间（`np::Ema(0.10f)`）。**面板显示用这个** | `UpdateTelemetryCommon()` | `np_build.cpp`「帧时间」行（`frameMsAvg > 0.0001 ? frameMsAvg : frameMs`） | 活跃 |
 | `cpuFrameMs` | float | CPU 帧时间 = **`CPUBusy + CPUWait`**（PresentMon 口径）= 帧周期。⚠ 必须扣掉卡在 `Present` 里的等待，否则锁 60 时恒等于 16.66ms —— 那是帧周期，不是 CPU 的活 | `PresentCommon` 尾部（`busyMs + waitMs`）；首帧兜底 `= frameMs` | 主程序 `NPHistoryPush`（桌面曲线的 `latCpu`）；`np_build` 在 `cpuBusyAvg` 还没建立时兜底 | 活跃。⚠ **这是遥测字段**；**面板「CPU 帧时间」显示的不是它**，而是 `cpuBusyAvg`（用户定的口径，见下） |
 | `cpuFrameMsAvg` | float | 平滑后的 CPU 帧时间（EMA） | `PresentCommon` | 钩子侧 `NPHistoryPush`（游戏内曲线的 `latCpu`，用平滑值避免锯齿看着像剧烈波动） | 活跃 |
