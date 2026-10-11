@@ -431,6 +431,7 @@ bool     gQuantizeOn = true;
 //   正确判据 = **呈现是否被消隐节流**：同步呈现 + 近期**中位间隔 ≥ 0.9 × 消隐周期**。
 //   （不等垂直同步（sync0）时中位间隔会远小于周期 → 自动关掉；VRR 同理。）
 float    gPaceEma = 1.0f;
+bool     gQuantizeBanned = false;       // 自检没过 → 本局永久关闭量化（避免闸门来回切）
 float    gLastMedRaw = 0.0f;            // 诊断用：最近的中位原始间隔
 uint32_t gDupPresent = 0;               // 被判定为"同一垂直消隐内的重复呈现"的次数（诊断）
 uint64_t gPhaseRefQpc = 0;              // 累积相位重建的参考时刻（0 = 未启用）
@@ -1282,21 +1283,25 @@ void UpdateTelemetryCommon(const NPConfig& cfg, uint64_t nowQpc, bool realPresen
         uint32_t look = (uint32_t)(fpsRef * 10.0);
         if (look < 200) look = 200;
         if (look > np::FrameStats::kCap) look = np::FrameStats::kCap;
-        // ★ 2026-10-11：Low 帧改回**百分位**（在"显示帧"序列上取）—— 窗口平均那套补丁退休。
+        // ★ Low 口径按"帧序列是否可信"分流（2026-10-11，用户实测后定）：
         //
-        //   为什么现在可以：③ 让帧时长变成"显示器上真实显示的那一帧"，帧内多次 Present
-        //   造成的假长短帧已经被相位重建吃掉，严格百分位不再被它骗。
-        //
-        //   为什么必须改（用户实测）：「关掉锁帧后 Low 帧等好几秒**突然跳到**新值」——
-        //   因为"把 1 秒窗口求平均、再取最差的窗口"是 **max 型统计**：只要回看里还剩一个
-        //   旧的慢窗口，数值就被它钉住，直到那一整块滑出回看（约 10 秒）才跳过去 —— 是台阶。
-        //   百分位是在滑动回看上取的：老帧一帧一帧被换出去 → **必然是渐变** ✓
-        //   （用户的原话就是"应该混合了跳变前和跳变后的部分，一定有一个渐变过程"）。
-        //   附带：600/1360 个样本下 1% 与 0.1% 取到的是**不同位置**的帧 → 两行不再相同。
-        t.fpsLow1 = gStats.lowPercentileFps(99.0f, look);
-        t.fpsLow01 = gStats.lowPercentileFps(99.9f, look);
+        //   * ③ 生效（呈现与垂直消隐**锁相**）→ 帧时长就是显示器上真实显示的那一帧
+        //     → 用**百分位**（渐变、1% 与 0.1% 不同）。
+        //   * ③ 不生效（例如《漫威蜘蛛侠》：呈现与消隐只是**同速**、并不锁相）→
+        //     帧序列里带着**亚帧级**的呈现抖动（10.7/16.3/16.6/23.0 交替、平均正好 16.65）。
+        //     此时严格百分位会把这种抖动当成掉帧（实测 Low≈42，而显示器明明是 60fps），
+        //     所以退回"窗口平均"口径 —— 它本来就是为吃掉这种抖动而存在的
+        //     （代价：数值会有台阶、且回看窗口太少导致 1% 与 0.1% 相同）。
+        if (gQuantizeOn) {
+            t.fpsLow1 = gStats.lowPercentileFps(99.0f, look);
+            t.fpsLow01 = gStats.lowPercentileFps(99.9f, look);
+        } else {
+            t.fpsLow1 = gStats.lowWindowed(1.0f, 1000.0f, look);
+            t.fpsLow01 = gStats.lowWindowed(0.1f, 1000.0f, look);
+            if (t.fpsLow1 <= 0.0f) t.fpsLow1 = gStats.lowPercentileFps(99.0f, look);
+            if (t.fpsLow01 <= 0.0f) t.fpsLow01 = gStats.lowPercentileFps(99.9f, look);
+        }
     }
-    // 样本太少（<20 帧）时百分位没有意义 → 保持 0（面板显示 —），不再用窗口平均兜底。
     t.p99Ms = gStats.percentileMs(99.0f);
     t.p999Ms = gStats.percentileMs(99.9f);
 
@@ -1535,7 +1540,8 @@ HRESULT PresentCommon(IDXGISwapChain* sc, UINT sync, UINT flags,
         gLastMedRaw = medRaw;
         bool paceOk = (gVblankMs > 0.0f && sync >= 1 && medRaw >= gVblankMs * 0.9f);
         gPaceEma += 0.02f * ((paceOk ? 1.0f : 0.0f) - gPaceEma);
-        if (gQuantizeOn) { if (gPaceEma < 0.60f) gQuantizeOn = false; }
+        if (gQuantizeBanned) gQuantizeOn = false;          // 自检没过 → 整局不再启用
+        else if (gQuantizeOn) { if (gPaceEma < 0.60f) gQuantizeOn = false; }
         else if (gPaceEma > 0.80f) gQuantizeOn = true;
         // ---- 以「显示帧」为准：**累积相位重建**（2026-10-11，③）
         //
@@ -1744,6 +1750,29 @@ HRESULT PresentCommon(IDXGISwapChain* sc, UINT sync, UINT flags,
         if (!diagT0) diagT0 = ms;
         if (ms - diagT0 >= 5000 && diagN > 0) {
             uint32_t real = diagN - diagTest;
+            // ★ 自检闸门（2026-10-11，《漫威蜘蛛侠》实测暴露）：
+            //   量化只在"呈现与垂直消隐**锁相**"时成立；如果只是**速率**一致（都 60/s）、
+            //   相位却停在 round() 的临界点上，重建就会**凭空造出**"重复"与"掉帧"
+            //   （实测：5 秒 300 次真实呈现 = 60/s，却被记成 221 帧 = 44/s，`dup=79`，
+            //    帧时长一半是 33.33ms —— 与真实一帧 16.67ms 不符）。
+            //   判据：**量化出的帧数必须与真实呈现数相符**（±5%）；不符就关掉、回退原始间隔。
+            {
+                static uint32_t sLastFt = 0;
+                uint32_t ft = gTel ? gTel->frameTotal : 0;
+                uint32_t frames = ft - sLastFt;
+                sLastFt = ft;
+                if (gQuantizeOn && real > 100 && frames > 0 &&
+                    (frames < real * 95 / 100 || frames > real * 105 / 100)) {
+                    // ⚠ **一次不通过就整局关掉**，不再尝试重新开启：
+                    //   否则闸门会在两套口径之间来回切，那本身就是一种周期性翻转
+                    //   （2026-10-11 在测试宿主上实测到 q=0/q=1 交替）。
+                    gQuantizeOn = false;
+                    gQuantizeBanned = true;
+                    Log("self-check: 量化帧数=%u 与真实呈现=%u 明显不符（呈现与消隐只是同速、"
+                        "并未锁相）→ **本局永久关闭量化**，回退原始间隔与窗口平均口径",
+                        frames, real);
+                }
+            }
             Log("present diag 5s: calls=%u real=%u test=%u sync0=%u sync1=%u other=%u "
                 "frameMs min=%.2f max=%.2f avg=%.2f | vblank=%.2fms med=%.2fms q=%d "
                 "aligned=%u/%u (%.0f%%) dup=%u",
