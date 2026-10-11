@@ -113,7 +113,7 @@
 |---|---|---|
 | 帧时间采集 | `src/hook/np_hook.cpp` | `PresentCommon` 里的 record 段 |
 | **帧内重复 Present 的合并** | `src/hook/np_hook.cpp` | 基准取自 `gRawStats.meanMs(240)`，避免正反馈 |
-| **Low 帧（Intel 权威口径）** | `src/common/np_stats.h` | `lowPercentileFps`（1 秒滑动窗口 + 对 FPS 取 P1） |
+| **Low 帧（窗口平均口径）** | `src/common/np_stats.h` | `lowWindowed`（1000ms 窗口平均、回看约 10s）；`lowPercentileFps`（1 秒窗口 + 对 FPS 取 P1）只做兜底 —— **以代码为准，别照抄文档** |
 | 环形缓冲与百分位 | `src/common/np_stats.h` | `FrameStats`、`push`、`recent`、`percentileMs` |
 | **CPU Busy / Wait 拆分** | `src/hook/np_hook.cpp` | Present 返回后**同一次减法**导出三个值 |
 | GPU 帧时间 | `src/sensors/np_sensors.cpp` | PDH `\GPU Engine(pid_*)\Running Time` |
@@ -281,8 +281,11 @@ python tests\struct_check.py                  # 结构体镜像一致性
    没有区别。主流工具（RTSS/Steam/Game Bar/Playnite）**清一色靠数据库**。
    本项目因此**移除了**靠特征猜的自动注入，只认**可信名单**。
 10. **改显示口径要三思。** Low 帧曾因擅自换成"68 秒窗口平均"而"卡顿后钉住
-    70 秒"。最终采用 **Intel PresentMon 权威口径**（1 秒滑动窗口 + 对 FPS 取 P1）
-    —— 有源码出处，不要凭感觉改。
+    70 秒"。**当前实际用的是「窗口平均」口径（1000ms 窗口 / 回看约 10 秒，
+    `np_hook.cpp::UpdateTelemetryCommon` 里的 `lowWindowed`）**；严格百分位
+    （对 FPS 取 P1 ≡ `1000/P99(帧时间)`）只在窗口数不足 4 个时兜底。
+    ⚠ 本文件曾把口径写成"最终采用严格百分位"，与代码不符 —— **改口径前先读代码**，
+    并同步 `COMMON.md` §3.4 与 README 的「已知问题」。
 
 11. **★★ 「先加诊断再改行为」—— 一行日志推翻了我推演三轮的解释（2026-10-11）**
 
