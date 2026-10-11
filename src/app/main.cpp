@@ -725,7 +725,17 @@ static void CleanupAndExit() {
     //    下次启动虽然能靠 ERROR_ALREADY_EXISTS 兜住，但会让系统里积垃圾。
     np::Etw().Stop();
     using namespace npa;
-    // 1) 广播退出：钩子 worker 每 500ms 轮询一次 quit 标志
+    // 1) ★★ 先停掉注入器的看护线程，**再**广播退出。
+    //
+    //   顺序反了会出一个死循环（2026-10-11 用户实测，re8）：
+    //     广播 quit -> 钩子看到 quit 立刻自卸载 -> 注入标记互斥量消失 ->
+    //     看护线程下一轮（800ms）认为"它没被注入" -> **又注入一次** ->
+    //     新钩子一启动又看到 quit -> 又自卸载 …… 如此往复。
+    //   后果是**往一个正在关停的游戏进程里反复 LoadLibrary**：一旦撞上 loader lock
+    //   就是永久挂死 —— 用户看到的正是"窗口没了、进程退不掉"。
+    //   看护线程停掉之后，就不会再有任何注入发生。
+    InjectorShutdown();
+
     gApp.cfg.quit = 1;
     AppPublish();
     Sleep(900);   // 等钩子完成自卸载（含 100ms 排空中窗）
@@ -733,8 +743,7 @@ static void CleanupAndExit() {
     // 2) 托盘图标
     if (gTrayAdded) { Shell_NotifyIconW(NIM_DELETE, &gNid); gTrayAdded = false; }
 
-    // 3) 各子系统
-    InjectorShutdown();
+    // 3) 各子系统（InjectorShutdown 已在最前面调用过；它是幂等的，不必重复调）
     OverlayShutdown();
     UiDestroy();
 

@@ -573,6 +573,12 @@ static const DWORD kAutoInjectDelayMs = 10000;
 void InjectorScanNow() {
     {
         AppLock lk;      // gApp.monitoring / gApp.games 都是跨线程共享的
+        // ★ 退出流程中**绝不再注入**。否则会形成死循环：
+        //     注入 -> 钩子看到 cfg.quit 立刻自卸载 -> 互斥量消失 ->
+        //     看护线程下一轮又认为"没注入" -> 再注入 ……（往正在关停的游戏进程里
+        //   反复 LoadLibrary，撞 loader lock 就挂死）。
+        //   根因修复见 main.cpp `CleanupAndExit` 里的说明（2026-10-11）。
+        if (gApp.cfg.quit) return;
         if (!gApp.monitoring || gApp.games.empty()) return;
     }
 
@@ -641,6 +647,9 @@ void InjectorScanNow() {
             }
             for (auto& g : gApp.games) {
                 if (g.pid == p.pid) {      // 只注入这一轮匹配上的那个进程
+                    // ★ 正在请求它卸载的 pid 不要注入：否则就是那个死循环的另一半
+                    //   （注入 -> 钩子看到 detachPid==自己 -> 立刻卸载 -> 下一轮又注入）。
+                    if (gApp.cfg.detachPid == p.pid) break;
                     // ★ 不要「一看到进程就注入」。
                     //   实测（2026-10-11，生化危机8 · DX12）：进程刚起来就注入 -> **游戏闪退**；
                     //   进到游戏里再手动注入 -> 不闪退。原因是早期注入正好撞上游戏自己
