@@ -110,7 +110,9 @@
 | `selftest` | 通过（exit 0） |
 | 回归套件 | **7/7 全绿**（exit 0） |
 | 看门狗不误报 | ✅ 跑了一次真实会话（`tests\_exitprobe.py`，宿主正常跑 5 秒后关窗），日志里**没有任何 `watchdog:` 行**；`DETACH: enter → worker wait -> exited` 链条完整 |
-| 看门狗确实会报（正例） | ❌ **未做** —— 需要一个"渲染线程停住但 worker 还活着"的靶子（例如只挂起渲染线程），已记进 `docs/APP.md` G14 |
+| 看门狗确实会报（正例） | ✅ **21:16 的真实复现里它报了**：`watchdog: 已有 5.2s 没有 Present 调用 —— 游戏侧停住了，不是卡在我们的 Present 路径里`，且**没有**任何"PresentCommon 进入后未返回"的行 → 我们的 Present 路径被排除。那次进程最终是**用户用任务管理器结束**的（所以日志里没有 `DETACH: enter`，`TerminateProcess` 不走 `DllMain`） |
+| 退出问题的下一步 | ❓ 只剩"**我们在场本身**（device/queue 引用、vtable 补丁、命令列表钩子）是否拖住游戏自己的关停"。需要一次 A/B：**不启动 NextPerf** 玩一次 re8 关窗，看进程多久消失；若是几秒，再按 `overlayMode=2` / `deepEngineHook=0` / `vtableProbe=0` 逐项二分 |
+| 面板闪烁 | 🔶 用户新报「游戏内面板闪烁」。日志事实：`drawn=300/skipped=0/heapSwaps=0`（每帧都画、没跳过、没换堆），上传缓冲是**每帧新建 + fence 延迟回收**（无复用竞态）。按 HOOK.md 判据这指向**成因B（画错缓冲）**，故新增两条判据：`swapchain desc`（BufferCount/SwapEffect）与 `overlay 5s … bbIdx=[…]` 直方图 —— flip 模型下应均匀分布，只落在 1 个下标即为成因B |
 
 ---
 
