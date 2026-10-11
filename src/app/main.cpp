@@ -118,24 +118,25 @@ void AppPollSensors() {
     // DxgKrnl Present 事件 —— 与锁帧 / Reflex / 多线程提交全都无关。
     np::Etw().SetTargetPid((uint32_t)pid);
 
-    // ★ 只把 **Low 帧**换成 ETW 的读数，其它一律不碰。
+    // ★ 2026-10-11 更新：**帧率/帧时间也换成 ETW**（原来只换 Low 帧）。
     //
-    // 为什么只改 Low：钩子量的是「真 Present 调用之间的间隔」，而这游戏每帧调
-    // 两次 Present（TEST + 真），真 Present 在帧内的相位每帧都在变 ——
-    // 实测单样本在 9.48~23.83ms 之间抖。**平均值对，但每个样本都是脏的**，
-    // 排序取「最慢 1%」时取到的正是那批假的 23.8ms 样本，于是流畅的 60fps
-    // 会显示 1%Low ≈ 38~42。ETW 的事件在真正 flip 处触发，没有这个抖动。
+    // 为什么改：钩子量的是「真 Present 调用之间的间隔」，而这游戏每帧调两次
+    // Present（TEST + 真）、真 Present 在帧内的相位每帧都在变 —— 实测日志：
+    //   **平均 16.68ms（=60fps，完全正确）但 p90=23ms、27% 的间隔 >20ms**，
+    // 也就是"均值对、每个样本都脏"。排序取最慢 1% 时取到的正是那批假的 23ms
+    // 样本 → 流畅的 60fps 显示 1%Low ≈ 38~42（用户报的"low帧很低不正常"）。
+    // ETW 的事件在真正 flip 处触发（`Present_Info`，实测 59.8 次/秒 = 一帧一次），
+    // 没有这个抖动：同一时刻 ETW 报 **16.64ms / 60.0fps**，而钩子报 22.73ms。
     //
-    // 帧率/帧时间/GPU 时间**不覆盖** —— 那些本来就已经对了，
-    // 多覆盖一次只会把对的数弄坏（上一版就是这么翻车的）。
+    // ⚠ 仍然带 pid 判断（见下）：没有目标进程时 ETW 的数据是全系统混出来的。
     {
         np::EtwMonitor::Result er{};
-        // ★ 必须带 pid 判断：没有目标进程时 ETW 的数据是「全系统所有进程的
-        //   present 事件」混出来的（桌面、浏览器、播放器都算），拿它去覆盖
-        //   Low 帧等于把别人的数字塞进面板。
         if (pid && np::Etw().active() && np::Etw().Snapshot(&er)) {
             if (er.low1Fps > 0.1f) gApp.telemetry.fpsLow1 = er.low1Fps;
             if (er.low01Fps > 0.1f) gApp.telemetry.fpsLow01 = er.low01Fps;
+            // 帧率 / 帧时间：显示侧、无亚帧抖动 → 一并覆盖（实测比钩子准）
+            if (er.frameMs > 0.02f && er.frameMs < 1000.0f) gApp.telemetry.frameMs = er.frameMs;
+            if (er.fps > 1.0f) gApp.telemetry.fps = er.fps;
         }
     }
 

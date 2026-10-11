@@ -243,27 +243,44 @@ void EtwMonitor::OnPresent(uint64_t qpc) {
 }
 
 void EtwMonitor::RecalcLow() {
-    // 用户要的口径：「记录一段时间内所有帧数据，排序，取最慢的 1% 求平均」。
-    // 之前 Low 不准不是因为算法，而是因为**喂进去的样本是脏的**（钩子量到的
-    // 是两次真 Present 调用的间隔，而这游戏每帧调两次 Present，相位一直在变，
-    // 单样本在 9.5~23.8ms 之间抖）。ETW 的事件在真正 flip 处触发，没有这个问题。
+    // ★ 口径 = **Intel PresentMon 的动态查询**（2026-10-11 复核其源码后定的）：
+    //   * 窗口：**滑动 1000ms**（`--window-size` 默认值），每个轮询重算
+    //     （PresentMonMiddleware/DynamicQuery.cpp: newest = now − offset; oldest = newest − size）
+    //   * 统计：在窗口内的样本上**直接取百分位**（**没有**"先求窗口平均"这一步）：
+    //       h = p×(N−1)，i = floor(h)，g = h − i，q = x[i] + g·(x[i+1] − x[i])
+    //     （Core/source/pmon/StatisticsTracker.cpp）
+    //   * 倒数指标排名反转（PresentMonMiddleware/DynamicStat.cpp:323）：
+    //       FPS 的 P1 ≡ 帧时间的 P99 → 1% Low = 1000 / P99(帧时间)
+    //   ⚠ 旧实现是"2048 个样本（≈34 秒）里取最慢 1% 求平均" —— 不是 PresentMon 的口径，
+    //     而且 34 秒回看会让一次卡顿钉住很久（实测 0.1%Low 掉到 20.5 后长时间不恢复）。
     if (ringN_ < 32) return;
-    // ★ 限流：Snapshot() 每 120ms 会被主线程调 3 次，每次都全排序 2048 个样本。
-    //   排序本身不贵，但它是在**持锁**状态下做的 —— 而持锁的另一边是 ETW 消费者
-    //   线程（OnPresent），一卡就会丢事件。5Hz 对这个滚动统计足够。
+    // 限流：Snapshot() 每 120ms 被调 3 次，而这里在**持锁**状态下排序 ——
+    // 持锁另一边是 ETW 消费者线程（OnPresent），一卡就丢事件。5Hz 够用。
     uint64_t now = GetTickCount64();
     if (lowCalcAt_ && now - lowCalcAt_ < 200) return;
     lowCalcAt_ = now;
-    std::vector<float> v(ring_, ring_ + ringN_);
+
+    // 窗口 = 最近 1 秒的样本数（≈ fps）。我们只存帧时间、不存时间戳，故按帧数近似。
+    int n = (int)(fps_ > 1.0f ? fps_ : 60.0f);
+    if (n < 20) n = 20;
+    if (n > ringN_) n = ringN_;
+    std::vector<float> v;
+    v.reserve((size_t)n);
+    for (int i = 0; i < n; ++i) {
+        int idx = (int)((ringW_ + kCap - (size_t)n + i) % kCap);   // 按写入顺序取最近 n 个
+        v.push_back(ring_[idx]);
+    }
     std::sort(v.begin(), v.end());          // 升序
-    auto avgSlowest = [&](double pct) {
-        int k = (int)(v.size() * pct / 100.0);
-        if (k < 1) k = 1;
-        double s = 0;
-        for (int i = 0; i < k; ++i) s += v[v.size() - 1 - i];   // 取最慢的 k 帧
-        return (float)(s / k);
+    auto pctl = [&](double p) -> float {    // 与 PresentMon 逐字一致的线性插值
+        if (v.empty()) return 0.0f;
+        if (v.size() == 1) return v[0];
+        double h = p * (double)(v.size() - 1);
+        size_t lo = (size_t)h;
+        size_t hi = (lo + 1 < v.size()) ? lo + 1 : lo;
+        double g = h - (double)lo;
+        return (float)(v[lo] * (1.0 - g) + v[hi] * g);
     };
-    float m1 = avgSlowest(1.0), m01 = avgSlowest(0.1);
+    float m1 = pctl(0.99), m01 = pctl(0.999);
     low1_ = m1 > 0.0001f ? 1000.0f / m1 : 0.0f;
     low01_ = m01 > 0.0001f ? 1000.0f / m01 : 0.0f;
 }
