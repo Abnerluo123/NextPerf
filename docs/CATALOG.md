@@ -212,6 +212,8 @@
 | `low_recover_check.py` | Low 帧恢复时间的量化（历史分析） |
 | `panel_width_check.py` / `row_metrics_check.py` | 面板布局 |
 | `shot_overlay.py` / `shot_ui.py` / `diag.py` / `vt_check.py` / `try_inject.py` | 截图与诊断工具 |
+| `_exitprobe.py` | **复现「钩子开着时关窗口，进程退不掉」**（发 WM_CLOSE 给测试宿主，再看进程是否退出 + 抓 DETACH 日志）。只结束自己启动的进程，**不会** taskkill 用户的 NextPerf |
+| `_bisect.py` / `_readmecrash.py` / `_adddebuglayer.py` | D3D12 闪退的二分定位 / README 用崩溃复现 / 装调试层（`_` 前缀 = 内部探针） |
 | `host_run.cpp` | **旧的**简易测试宿主（将被 `sim/` 取代） |
 | `sim/` | **新的模拟游戏**（DX11/DX12，见 `SIMULATOR.md`） |
 | `simvk/` | **新的 Vulkan 模拟游戏**（见 `SIMULATOR.md`） |

@@ -45,13 +45,13 @@
 
 | 文件 | SHA-256 | 与 v1.6.3 相比 |
 |---|---|---|
-| `NextPerf.exe` | `943DAF37051A9DD82EB06BA6C4254A68697682CD1DE06A9D120B1AB4C5E3F1E3` | **变了**（本轮改了 `src/app/main.cpp`） |
-| `NextPerfHook.dll` | `208C5A73C1E32CCD8DB43F6007A77595D0E02DF0316EA687BA5CC4586251A6DF` | 完全相同 |
-| `NextPerfHook32.dll` | `037869F3DCAE0E375B4A7E22934EF85C1AD94A018D64AF6F22DEE2B049C19F2C` | 完全相同 |
-| `NextPerfHook64.dll` | `208C5A73C1E32CCD8DB43F6007A77595D0E02DF0316EA687BA5CC4586251A6DF` | 完全相同 |
+| `NextPerf.exe` | `69B8C3B7505D5099B56AE01ADE5469897CFC95563BE4173613D3A44FFAA9DEE7` | **变了**（日志文案 + 判活修复 + 自动注入延迟） |
+| `NextPerfHook.dll` | `4CF0E808747F28F9023ED2100534AA156BB0E2DDB32B0783D965B2738C4B2459` | **变了**（新增 DETACH/worker 诊断日志 + 日志上限 512KB→4MB） |
+| `NextPerfHook32.dll` | `66BA423B54010F513DB293F9FC50FFC209BE192C0E0EB11DDDBD94F9B6766405` | 同上 |
+| `NextPerfHook64.dll` | `4CF0E808747F28F9023ED2100534AA156BB0E2DDB32B0783D965B2738C4B2459` | 同上 |
 
-> 三个钩子与 v1.6.3 **字节相同**（这一轮没动 `src/hook`），只有主程序变了 ——
-> 这也再次印证 v1.6.3 段落里的第 3 条：**哈希只能同机同路径比**。
+> 这一版 `src/app` 与 `src/hook` **都动过**，所以四个产物都和 v1.6.3 不同。
+> 哈希只能同机同路径比（见 v1.6.3 段落里的第 3 条事实）。
 
 ### 验证
 
@@ -60,7 +60,24 @@
 | `dist\NextPerf.exe --selftest` | 全部通过（exit 0） |
 | `python tests\run_all.py --skip-build` | 全部通过（7 项，exit 0） |
 | 新日志文案确实编进 exe | ✅ 在 `dist\NextPerf.exe` 里能搜到 `钩子 1000ms 窗口平均`、`CPUBusy + CPUWait(PresentMon 口径`、`engtype_Compute / engtype_OFA`；旧文案 `最近1200帧样本推算` 已搜不到 |
-| 真实游戏实测 | ❌ 未做（改动只涉及日志文案，但按规矩仍算未测） |
+| 真实游戏实测 | ❌ 未做（用户测的是**已发布的 v1.6.3**，不是这一版） |
+
+### 追加：真机反馈的两个 bug（2026-10-11 晚，用户实测 · 商店版《生化危机8》DX12）
+
+用户报了三件事，性质完全不同：
+
+| Bug | 现象 | 本轮做到了什么 |
+|---|---|---|
+| **状态栏每 2.5 秒跳变** | 关窗后 NextPerf 在「钩上 / 没钩上」之间反复翻 | ✅ **根因已定位并修复** —— 是主程序自己的逻辑 bug：判定"钩子已死"后把 `sLastFt` 清成 0，于是下一次读到的**冻结帧数**（888）与 0 不相等 → 被当成"帧数又长了" → 复活 → 2.5 秒后再判死。现在**只清计时器、保留冻结帧数**（用户日志里 20:52:07 判死 / 20:52:09 再判死 / 20:52:11 又 attached=1 正是这个周期） |
+| **关窗后游戏进程不退** | 窗口消失，后台进程留着 | ⚠️ **只加了诊断，未定性**。工作区里的测试宿主 **D3D11 与 D3D12 都复现不出来**（`python tests\_exitprobe.py`：关窗 0.5 秒内干净退出，`DETACH: enter` → `RestoreAllHooks` → `SELFCHECK unloadClean = OK` → `DETACH: worker wait -> exited` 链条完整）。新增 `DETACH: enter` / `DETACH: worker wait` / `worker: enter\|exit` 日志 + `tests/_exitprobe.py`，**下次复现即可判定是不是我们挡的** |
+| **自动注入让游戏闪退** | 自动盯 re8 → 启动即闪退；进游戏后手动注入不闪退 | ✅ **已缓解**：探测到进程后**等 10 秒**再自动注入（`kAutoInjectDelayMs`，手动注入不受影响）。⚠️ **根因未解** —— 早期注入撞上游戏自己的 D3D 初始化，而我们还要自建 D3D11 设备去探 vtable |
+
+顺带把**钩子日志上限从 512 KB 提到 4 MB**：这次查"进程不退"时，512 KB 回绕把整场 re8 会话
+冲成了**只剩 1 行**，害得只能靠推断。同时改掉 `docs/LOGGING.md` 里"最新在开头"那个过于
+简化的说法 —— 回绕之后文件**不是按时间排的**，必须按关键字搜，并且**一复现就先复制日志**。
+
+这一轮的验证：`selftest` 通过；回归套件 **7/7 全绿**；`tests\_exitprobe.py` 在 D3D11/D3D12
+宿主上**都未复现**（这本身就是结论的一部分：简单场景下卸载路径是好的）。
 
 ---
 
