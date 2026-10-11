@@ -145,7 +145,8 @@
 | T6 | **`run_all.py` 只断言"有值"** | 7 项用例都不验"准不准" | 见 V6 |
 | T7 | **`NPConfig::reserved` 只剩 4 个槽位** | 再无槽位可用时加字段**必须**改 `sizeof` → 两侧必须同时升级 | 建议改成递增布局版本号 |
 | T8 | **"恢复默认"不重置运行时开关**（G5） | `NPDefaultConfig` 不碰 `autoInject`/`pauseHook`/`learnedAutoHook`/`detachPid`（已在代码里核实） | 确认是"有意"还是漏了，并在注释写明 |
-| T9 | **文档行号漂移** | `HOOK.md` 头部写 2755 行、§1.3 写 2744；两份文档同一函数行号互不相同；`CATALOG.md` 的 `src/app` 行数也是旧估值 | 引用一律用**函数名**，不要用行号 |
+| T9 | **文档行号漂移** | `HOOK.md` 头部写 2755 行、§1.3 写 2744；两份文档同一函数行号互不相同；`CATALOG.md` 的 `src/app` 行数也是旧估值 | ✅ **已根治（2026-10-11）**：两份文档共 707 处行号引用全部清掉，改为只引用函数名/变量名（见 §9 D1、`CATALOG.md` §6 的维护约定） |
+| T10 | **`tests/verify_quit_noinject.py` 用错了配置文件名** | 它预置 `%APPDATA%\NextPerf\settings.json`，而程序读的是 **`config.json`**（`settings.cpp` 的 `SettingsPath()`）→ 看护线程永远拿不到维护目标，**用例的前置条件恒不成立**，主判据有可能空跑 | 🚧 待修：文件名改成 `config.json`，并**顺手备份/还原它**（主程序经「退出」路径结束时会 `AppSaveSettings()` 重写该文件）。已记进 `docs/CLEANUP.md` §7 的 C1/C2 |
 
 ---
 
