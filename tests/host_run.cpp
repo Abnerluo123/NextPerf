@@ -46,6 +46,7 @@ static int gProbePresent = 0;
 //   这正是《漫威蜘蛛侠》上 1% Low 显示 42~46 的原因（口径不对，不是算错）。
 // 回归用例：tests/verify_jitter_present.py
 static int gJitterPresent = 0;
+static int gUncapped = 0;
 static unsigned gFrameNo = 0;
 
 // 并发提交线程（实现在文件末尾，这里先声明）
@@ -104,7 +105,7 @@ static int Run11(HINSTANCE inst, int seconds) {
         }
         if (gProbePresent) sc->Present(0, DXGI_PRESENT_TEST);
         if (gJitterPresent && ((++gFrameNo) & 1)) Sleep(6);
-        sc->Present(1, 0);
+        sc->Present(gUncapped ? 0 : 1, 0);
         Sleep(gJitterPresent ? 0 : 16);      // 抖动模式跑 ~60fps（复现"显示 60 但间隔乱跳"）
     }
     return 0;
@@ -266,7 +267,7 @@ static int Run12(HINSTANCE inst, int seconds) {
         }
         if (gProbePresent) sc->Present(0, DXGI_PRESENT_TEST);
         if (gJitterPresent && ((++gFrameNo) & 1)) Sleep(6);
-        sc->Present(1, 0);
+        sc->Present(gUncapped ? 0 : 1, 0);
         Sleep(gJitterPresent ? 0 : 16);      // 抖动模式跑 ~60fps（复现"显示 60 但间隔乱跳"）
     }
 
@@ -335,6 +336,9 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmd, int) {
     //   回归用例：tests/verify_present_test.py（实现见 Run12 的 gProbePresent）
     if (strstr(cmd, "--probe-present")) gProbePresent = 1;
     if (strstr(cmd, "--jitter-present")) gJitterPresent = 1;
+    // --uncapped：Present(0,0)（不等垂直同步）—— 复现用户"关锁帧"那一局（sync0 → ③ 关闭，
+    // Low 走窗口平均口径）。见 tests/repro_low_frame.py --uncapped
+    if (strstr(cmd, "--uncapped")) gUncapped = 1;
     // --decoy-vulkan：**在正常跑 DX12 / D3D11 的同时**额外加载 vulkan-1.dll。
     //   模拟真实游戏《漫威蜘蛛侠》：纯 DX12，但进程里确实有 vulkan-1.dll
     //   （引擎/启动器/视频模块带进来的）。

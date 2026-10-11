@@ -108,6 +108,9 @@ def main():
     if "--no-jitter" in sys.argv:
         # 稳态负载：宿主不做呈现抖动 —— 用来量"固定周期的错误波峰"（用户报的 ~20ms 尖峰）
         host_args = [HOST_EXE, "--seconds", str(seconds + 15)]
+    elif "--uncapped" in sys.argv:
+        # 复现"关锁帧"那一局：Present(0,0) → sync0 → ③ 关闭 → Low 走窗口平均口径
+        host_args = [HOST_EXE, "--uncapped", "--seconds", str(seconds + 15)]
     else:
         host_args = [HOST_EXE, "--jitter-present", "--seconds", str(seconds + 15)]
     host = subprocess.Popen(host_args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

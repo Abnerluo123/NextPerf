@@ -1296,8 +1296,18 @@ void UpdateTelemetryCommon(const NPConfig& cfg, uint64_t nowQpc, bool realPresen
             t.fpsLow1 = gStats.lowPercentileFps(99.0f, look);
             t.fpsLow01 = gStats.lowPercentileFps(99.9f, look);
         } else {
-            t.fpsLow1 = gStats.lowWindowed(1.0f, 1000.0f, look);
-            t.fpsLow01 = gStats.lowWindowed(0.1f, 1000.0f, look);
+            // ★ 2026-10-11 用户实测（关锁帧那局）：`1%=58.9 → 95.9 → 96.3 → 97.4` 一步跳、
+            //   且 `1%` 与 `0.1%` 恒等。原因是窗口**太粗**：1000ms 窗口 + 10 秒回看
+            //   → 只有约 10 个窗口 → `ceil(10×1%)` 与 `ceil(10×0.1%)` 都等于 1（同一个窗口）。
+            //   改细：**窗口 250ms、回看 30 秒** → 约 120 个窗口
+            //   → `ceil(120×1%)=2`（取最差两个窗口的平均）vs `ceil(120×0.1%)=1`（最差一个）
+            //   → **两行不再是同一个数** ✓；取两个窗口的平均也让过渡少一点"一步到位"。
+            //   250ms 仍能吃掉亚帧抖动（60fps 下约 15 帧 ≈ 3.75 个抖动周期）。
+            uint32_t look30 = (uint32_t)(fpsRef * 30.0);
+            if (look30 < 600) look30 = 600;
+            if (look30 > np::FrameStats::kCap) look30 = np::FrameStats::kCap;
+            t.fpsLow1 = gStats.lowWindowed(1.0f, 250.0f, look30);
+            t.fpsLow01 = gStats.lowWindowed(0.1f, 250.0f, look30);
             if (t.fpsLow1 <= 0.0f) t.fpsLow1 = gStats.lowPercentileFps(99.0f, look);
             if (t.fpsLow01 <= 0.0f) t.fpsLow01 = gStats.lowPercentileFps(99.9f, look);
         }
