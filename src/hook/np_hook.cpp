@@ -1720,6 +1720,35 @@ HRESULT PresentCommon(IDXGISwapChain* sc, UINT sync, UINT flags,
                             }
                         }
                     }
+                    // ★★ D3D12 游戏内叠加：默认关闭（已知会让 NVIDIA 驱动在 Present 时崩）
+                    //
+                    // 证据（全部为工作区内实测，可复现）：
+                    //   * 靶子: python tests\sim_stress.py --api=dx12 -> 约 250 帧必崩，
+                    //     崩溃点 nvwgf2umx.dll+0x330124（与用户真游戏日志同一偏移）
+                    //   * 实验 A: 完全不调用 gOv12.Record -> 不崩
+                    //   * 实验 E: 只去掉 OMSetRenderTargets -> 不崩
+                    //   * 实验 G/H/I/J/M/N/F: 去掉 draw / 各条屏障 / 视口 / PSO / 根签名 /
+                    //     根描述符表 / CopyTextureRegion -> **仍然崩**
+                    //   * 已排除: 设备不一致、设备被移除、RTV 创建失败、rtvHeapSize_、
+                    //     槽位用尽、换堆、Retire 生存期、DX11 侧
+                    // => 崩溃需要「绑定我们的 RTV」与「上传那一半」同时存在，
+                    //    但每一半单独都不崩，根因尚未定位。
+                    //
+                    // 在查清之前，宁可没有游戏内叠加，也不要让用户的游戏崩。
+                    // DX11 的叠加不受影响（它是好的）；桌面叠加也不受影响。
+                    // 需要继续排查时设环境变量 NEXTPERF_D3D12_OVERLAY=1 重新打开。
+                    {
+                        static int sD12Overlay = -1;
+                        if (sD12Overlay < 0) {
+                            char b[8] = {0};
+                            DWORD n = GetEnvironmentVariableA("NEXTPERF_D3D12_OVERLAY", b, sizeof(b));
+                            sD12Overlay = (n > 0 && b[0] == '1') ? 1 : 0;
+                            if (!sD12Overlay)
+                                Log("D3D12 in-game overlay DISABLED: known driver crash "
+                                    "(nvwgf2umx.dll+0x330124). Set NEXTPERF_D3D12_OVERLAY=1 to re-enable.");
+                        }
+                        if (!sD12Overlay) stateOk = false;
+                    }
                     ID3D12GraphicsCommandList* l = stateOk ? BeginList() : nullptr;
                     if (l) {
                         drawnOk = gOv12.Record(gDev12, l, bb, D3D12_RESOURCE_STATE_PRESENT,
