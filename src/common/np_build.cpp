@@ -275,8 +275,24 @@ void BuildPanelData(PanelData& out, const NPConfig& c, const NPSensors& s, const
         //   若这里显示瞬时值，三行就永远加不上 —— 用户实测抓到过这个不一致。
         //   （用户澄清：他之前说「改回老口径」是误以为我拿 NVIDIA API 的数值替代了
         //    他自己的量，实际期望就是平滑值之和。）
-        float cpuShown = t.cpuBusyAvg + t.cpuWaitAvg;
-        if (cpuShown <= 0.0001f) cpuShown = t.cpuFrameMs;   // 平均值还没建立时的兜底
+        // ★ 这一行显示 **cpuBusy**，不是 Busy + Wait（用户定的口径，别改回去）。
+        //
+        // 为什么：这一行的用途是**判断 CPU 是不是瓶颈**。而 PresentMon 的
+        // msCPUTime = msCPUBusy + msCPUWait，其中的 Wait 是「本帧在 Present 内部
+        // 排队等垂直同步」的时间 —— 那**不是 CPU 在干活**。垂直同步锁帧时 wait
+        // 可能占掉一半，于是 Busy+Wait 会接近帧周期，让人误以为 CPU 很忙
+        // （用户原话：「我这个数据就是反应 cpu 压力，帮助用户判读有没有 cpu 导致的
+        //   卡顿用的，有排队的数据自然不准」）。
+        //
+        // 所以只取 Busy = 上一帧 Present **返回** -> 本帧 Present **开始**，
+        // 即 CPU 真正干活的那段。定义出处（PresentMon，权威）：
+        //   ComputeMsCpuBusy() = Delta(cpuStart, present.presentStartTime)
+        //     cpuStart = lastAppPresent.presentStartTime + lastAppPresent.timeInPresent
+        //
+        // Busy 与 Wait 两个半边仍然保留为可选行（默认关），想拆开看时打开即可。
+        float cpuShown = t.cpuBusyAvg;
+        if (cpuShown <= 0.0001f) cpuShown = t.cpuBusyMs;    // 平均值还没建立时的兜底
+        if (cpuShown <= 0.0001f) cpuShown = t.cpuFrameMs;   // 再兜一层（首次采样前）
         acc.rowRange(L"CPU 帧时间", active ? Msv(cpuShown) : L"—", PL_CPU, active,
                      h ? h->latCpu : nullptr, h, 1, -1e30f, 33.34f);
         if (showCharts && (c.counters & NP_C_CHART_LATENCY)) attach(acc.pending.back(), h->latCpu, 0);
