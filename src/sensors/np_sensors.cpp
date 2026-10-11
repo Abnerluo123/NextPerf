@@ -512,6 +512,11 @@ bool SensorHub::Init() {
         pdh_.AddWildcard(L"\\GPU Adapter Memory(*)\\Dedicated Usage");
         pdh_.AddWildcard(L"\\GPU Adapter Memory(*)\\Shared Usage");
         pdh_.AddWildcard(L"\\Processor Information(*)\\% Processor Performance");
+        // ★ 同一路计数器**必须也进 stars_ 表**，否则 MaxStarCounter /
+        //   SumStarCounter 查不到它（它们只遍历 stars_，见其实现）。
+        //   CPU 频率就是靠这里读 % Processor Performance 的 ——
+        //   只注册 Wildcard 的话 pct 恒为 0，会静默回落到 NT 路径并恒显示基准频率。
+        pdh_.AddStarCounter(L"\\Processor Information(*)\\% Processor Performance");
         pdh_.AddWildcard(L"\\Thermal Zone Information(*)\\Temperature");
         pdh_.Collect();  // 第一次采集给速率型计数器做基线
     }
@@ -747,8 +752,22 @@ void SensorHub::PollCpu(NPSensors& out) {
     //      下一步要解决的就是这一点：只取 _Total 实例的单个值。
     // 因此本轮**先退回 NT 路径**（显示 2700，虽不对但不荒谬），
     // 把这个坑记在这里，避免下一轮又从头试一遍。
-    double pctDummy = 0;
-    (void)pctDummy;
+    // ★ 用 MaxStarCounter 取【单一实例】的百分比（不会像 SumWhere 那样累加多实例）。
+    //   SumWhere 实测返回 289%（用户 typeperf 实测同一实例只有 108~187%）——
+    //   它把多个实例累加了，x2300 会得到 6659MHz 这种荒谬值。
+    //   MaxStarCounter 取「最忙的那个核」，也是任务管理器/各家工具的惯例。
+    out.cpuClock = 0.0f;
+    {
+        double pct = 0;
+        if (pdh_.MaxStarCounter(L"\\Processor Information(*)\\% Processor Performance", L"", L"", &pct) && pct > 1.0) {
+            const double kNominalMHz = 2300.0;   // TODO: 改为启动时从 PDH 读一次
+            double mhz2 = kNominalMHz * pct / 100.0;
+            if (mhz2 > 100.0 && mhz2 < 8000.0) {   // 夹紧：超过 8GHz 一律视为读错
+                out.cpuClock = (float)mhz2;
+                cpuFreqFromNt_ = false;
+            }
+        }
+    }
     // 兜底：NT 路径（本机恒返回基准频率，所以只在前一条拿不到时用）
     if (out.cpuClock < 100.0f && CpuFreqFromPowerInfo(&mhz)) {
         out.cpuClock = (float)mhz;
