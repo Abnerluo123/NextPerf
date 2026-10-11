@@ -178,6 +178,19 @@ bool Dx12Engine::CreateDeviceAndQueue(std::string* err) {
         DXGI_ADAPTER_DESC1 desc{};
         chosen->GetDesc1(&desc);
         if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) continue;  // 跳过 WARP，真跑硬件
+        // ★ 诊断：开 D3D12 Debug Layer（必须在创建设备**之前**）。
+        //   钩子侧会从设备上取 InfoQueue，把验证消息写进钩子日志 ——
+        //   这样"哪一次 D3D12 调用用错了"就能直接读出来，不必靠排除法猜。
+        {
+            ID3D12Debug* dbg = nullptr;
+            if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&dbg))) && dbg) {
+                dbg->EnableDebugLayer();
+                dbg->Release();
+                SimLog("D3D12 Debug Layer 已启用");
+            } else {
+                SimLog("D3D12 Debug Layer 不可用（未安装图形工具），继续");
+            }
+        }
         if (SUCCEEDED(D3D12CreateDevice(chosen.Get(), D3D_FEATURE_LEVEL_11_0,
                                         IID_PPV_ARGS(dev.Put())))) {
             char name[160] = {0};

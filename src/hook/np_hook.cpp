@@ -1690,6 +1690,36 @@ HRESULT PresentCommon(IDXGISwapChain* sc, UINT sync, UINT flags,
                     float ns = std::clamp((float)rd.Height / 1080.0f, 1.0f, 2.5f);
                     if (stateOk && fabsf(ns - s) > 0.05f) { npb::SetRasterScale(ns); RenderPanel(cfg); s = ns; }
                     float px = (float)rd.Width - gBw - x;
+                    // ★ 诊断：把 D3D12 验证层新产生的消息写进钩子日志。
+                    //   调用有没有用错，验证层说得最准 —— 不用再靠排除法猜。
+                    {
+                        static ID3D12InfoQueue* sIq = nullptr;
+                        static UINT64 sSeen = 0;
+                        static int sDumped = 0;
+                        if (!sIq) {
+                            if (FAILED(gDev12->QueryInterface(IID_PPV_ARGS(&sIq)))) sIq = nullptr;
+                        }
+                        if (sIq && sDumped < 40) {
+                            UINT64 n = sIq->GetNumStoredMessages();
+                            if (n > sSeen) {
+                                UINT64 from = sSeen;
+                                sSeen = n;
+                                for (UINT64 i = from; i < n && sDumped < 40; ++i, ++sDumped) {
+                                    SIZE_T len = 0;
+                                    if (FAILED(sIq->GetMessage(i, nullptr, &len)) || !len) continue;
+                                    char* buf = (char*)malloc(len);
+                                    if (!buf) break;
+                                    if (SUCCEEDED(sIq->GetMessage(i, (D3D12_MESSAGE*)buf, &len))) {
+                                        D3D12_MESSAGE* m = (D3D12_MESSAGE*)buf;
+                                        Log("D3D12 validation sev=%u id=%u: %s",
+                                            (unsigned)m->Severity, (unsigned)m->ID,
+                                            m->pDescription ? m->pDescription : "");
+                                    }
+                                    free(buf);
+                                }
+                            }
+                        }
+                    }
                     ID3D12GraphicsCommandList* l = stateOk ? BeginList() : nullptr;
                     if (l) {
                         drawnOk = gOv12.Record(gDev12, l, bb, D3D12_RESOURCE_STATE_PRESENT,
