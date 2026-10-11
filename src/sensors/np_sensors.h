@@ -149,6 +149,11 @@ private:
 
     // CPU 占用率差分
     uint64_t lastIdle_ = 0, lastKern_ = 0, lastUser_ = 0;
+    // 1 秒级平滑（2026-10-11）：瞬时的「两次轮询差分」窗口只有约 120ms，画到面板上乱跳。
+    // 现在按真实间隔做指数平滑：alpha = 1 − exp(−dt/τ)，τ = 500ms（约 1 秒内 86% 权重）。
+    uint64_t lastCpuMs_ = 0;
+    double   cpuUsageEma_ = 0.0;
+    bool     cpuEmaValid_ = false;
     bool     cpuBaseValid_ = false;
     // CPU 频率是否来自 CallNtPowerInformation（比 PDH 的「标称×百分比」准）。
     // 置 false 说明回退到了 PDH 路径，读数可能系统性偏低。

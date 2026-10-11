@@ -694,6 +694,7 @@ void SensorHub::PollCpu(NPSensors& out) {
             return (uint64_t(f.dwHighDateTime) << 32) | f.dwLowDateTime;
         };
         uint64_t i = toU64(idle), k = toU64(kern), u = toU64(user);
+        uint64_t nowMs = GetTickCount64();
         if (cpuBaseValid_) {
             uint64_t di = i - lastIdle_;
             uint64_t dk = k - lastKern_;
@@ -701,10 +702,32 @@ void SensorHub::PollCpu(NPSensors& out) {
             uint64_t total = dk + du;
             if (total > 0) {
                 double busy = double(total - di) / double(total) * 100.0;
-                out.cpuUsage = (float)std::clamp(busy, 0.0, 100.0);
+                busy = std::clamp(busy, 0.0, 100.0);
+                // ★ 1 秒级平滑（2026-10-11，用户反馈"蜘蛛侠能波动到 50%、看着乱跳"）。
+                //
+                //   原来画到面板上的是「两次轮询之间的瞬时差分」，而主循环节拍约 **120ms**
+                //   → 窗口太短，数字跳得厉害。任务管理器那种"稳"的感觉来自它约 **1 秒**的窗口。
+                //   这里用**按真实间隔算系数的指数平滑**（不是固定 alpha，节拍变了也不会失真）：
+                //       alpha = 1 − exp(−dt / τ)，τ = 0.5s
+                //   效果：约 1 秒内 86% 的权重落在最近这一秒；既不跳，也不会明显滞后。
+                //   口径不变 —— 仍然是**整机**占用（所有进程、所有逻辑处理器），
+                //   100% = 全部逻辑处理器跑满（本机 24 线程）。
+                static const double kTauMs = 500.0;
+                double dt = double(nowMs - lastCpuMs_);
+                if (!cpuEmaValid_) {
+                    cpuUsageEma_ = busy;
+                    cpuEmaValid_ = true;
+                } else if (dt > 0.0 && dt < 10000.0) {
+                    double alpha = 1.0 - std::exp(-dt / kTauMs);
+                    cpuUsageEma_ += alpha * (busy - cpuUsageEma_);
+                } else {
+                    cpuUsageEma_ = busy;      // 间隔异常（挂起/长时间不轮询）时直接重置
+                }
+                out.cpuUsage = (float)std::clamp(cpuUsageEma_, 0.0, 100.0);
             }
         }
         lastIdle_ = i; lastKern_ = k; lastUser_ = u;
+        lastCpuMs_ = nowMs;
         cpuBaseValid_ = true;
     }
     out.cpuCores = cpuCores_;
