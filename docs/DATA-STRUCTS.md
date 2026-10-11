@@ -318,7 +318,7 @@ for (size_t i = 0; i < sizeof(c->reserved) / sizeof(c->reserved[0]); ++i) {
 | `tickMs` | uint64 | 0 | 最近一次采集时间（`GetTickCount64`）。⚠ **跨进程只能判"是否变化"，不要拿主程序的钟去减它**（不同进程的 tick 基准可能差很远） | 同上 |
 | `valid` | uint32 | 0 → `Poll()` 置 **1** | `1` = 本块已填充。钩子 `Sens()` 要求 `magic` 正确**且** `valid != 0` 才采用共享内存里的值，否则回退到 `NPClearSensors()` 的空快照 | `SensorHub::Poll()` |
 | **CPU** | | | | |
-| `cpuUsage` | float | -1 | CPU 总占用率 %（`GetSystemTimes` 差分） | `PollCpu()` |
+| `cpuUsage` | float | -1 | **整机** CPU 总占用率 %（`GetSystemTimes` 差分；100% = 所有逻辑处理器跑满）。★ 2026-10-11 起按真实间隔做 **1 秒级指数平滑**（`alpha = 1 − exp(−dt/500ms)`）—— 瞬时窗口只有约 120ms，不平滑会乱跳 | `PollCpu()` |
 | `cpuTemp` | float | -273 | CPU 温度 ℃（HWiNFO 共享内存 / WMI ACPI 兜底） | `PollCpu()` / `PollHwinfoExtras()` |
 | `cpuPower` | float | -1 | CPU 包功耗 W（EMI / HWiNFO），0 = 不可用 | `PollHwinfoExtras()` 等 |
 | `cpuClock` | float | -1 | CPU 当前频率 MHz。**优先 `CallNtPowerInformation`**（每核实测取最高核心）；回退 PDH「标称 × 性能百分比」会**系统性偏低** | `PollCpu()`；内部标志 `cpuFreqFromNt_` 记录走的是哪条路 |

@@ -330,7 +330,7 @@ compute/OFA 占用、CPU 包功耗（EMI）。
 
 | 指标 | API | 行号 | 备注 |
 | --- | --- | --- | --- |
-| CPU 占用率 | `GetSystemTimes` 差分 | `np_sensors.cpp:682-699` | `total = dk + du`，`busy = (total - di)/total*100`，clamp 0~100；首轮无基线不输出 |
+| CPU 占用率 | `GetSystemTimes` 差分 | `SensorHub::PollCpu()` | **整机口径**（所有进程、所有逻辑处理器；100% = 全部跑满）：`total = dk + du`、`busy = (total - di)/total*100`，clamp 0~100。★ **按真实间隔做 1 秒级指数平滑**（`alpha = 1 − exp(−dt / 500ms)`，约 1 秒内 86% 权重）—— 瞬时窗口只有约 120ms（主循环节拍），不平滑会乱跳（2026-10-11 用户反馈后加）；首轮无基线不输出 |
 | 内存 | `GlobalMemoryStatusEx` | `:768-774` | `(TotalPhys - AvailPhys)` 算已用 |
 | 显卡型号/厂商/显存总量 | `CreateDXGIFactory1` + `EnumAdapters1(0)` + `GetDesc1` | `:517-535` | 跨厂商通用；`VendorId` 0x10DE→NVIDIA、0x1002→AMD、0x8086→Intel（`:780-782`） |
 | 标称频率 | 注册表 `HKLM\HARDWARE\DESCRIPTION\System\CentralProcessor\0\~MHz` | `:540-548` | 本机实测 = **3072**（见 3.1 的口径问题） |
@@ -720,7 +720,7 @@ PresentMon / RTSS 这类成熟软件的做法是订阅 `Microsoft-Windows-DxgKrn
 
 | 指标 | 优先级顺序（←先 / 后→） | 关键行号 |
 | --- | --- | --- |
-| CPU 占用率 | `GetSystemTimes` 差分（唯一来源） | `np_sensors.cpp:682-699` |
+| CPU 占用率 | `GetSystemTimes` 差分（唯一来源） | `SensorHub::PollCpu`（含 1 秒级指数平滑；整机口径） |
 | CPU 频率 | `CallNtPowerInformation` → PDH `% Processor Performance × cpuBaseMHz_` | `:706-714` |
 | CPU 温度 | HWiNFO（4 个关键字依次） → LibreHardwareMonitor(WMI) → ACPI 热区(WMI) | `:718-748` |
 | CPU 功耗 | **PDH `Energy Meter(*)Power` 实例含 `PKG`** → HWiNFO Package Power | `:756-764` |

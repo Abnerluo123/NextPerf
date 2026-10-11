@@ -28,7 +28,7 @@
 | `SensorHub::Describe()` | `np_sensors.cpp:605` | 把 `available_` 拼成 `"NVML+NVAPI+PDH"` 这样的短串 | `main.cpp:216`、`main.cpp:597`、`main.cpp:788` | ⚠ 反映的是"**探测到**"而不是"**本轮用到**"；NVAPI `EnumPhysicalGPUs` 失败时仍会报可用（P11） |
 | ❌ `SensorHub::sources()` | `np_sensors.h:126` | 返回 `srcInfo_`（每个源的 present/used/note） | **无调用方** | 结构化探测详情，目前只在 `ProbeSources` 里填 |
 | `SensorHub::ProbeSources()` | `np_sensors.cpp:581` | 把 6 个源的探测结果填进 `srcInfo_`，并累加 `available_` | `Init()`（`:568`） | 判断条件分别为 `nvml_.loaded`、`nvapi_.loaded`、`adl_.loaded`、`hwinfo_.loaded`、`pdh_.Count() > 0`、`comInited_` |
-| `SensorHub::PollCpu()` | `np_sensors.cpp:680` | CPU 占用率（`GetSystemTimes` 差分）、核数/线程数、频率（Nt → PDH 回退）、温度（HWiNFO → LHM → ACPI）、功耗（EMI → HWiNFO） | `Poll()`（`:1035`） | 频率回退口径有争议（见 SENSORS.md 3.1）；`cpuBaseValid_` 首轮不输出占用率 |
+| `SensorHub::PollCpu()` | `np_sensors.cpp` | CPU 占用率（`GetSystemTimes` 差分，**整机口径 + 1 秒级指数平滑**）、核数/线程数、频率（Nt → PDH 回退）、温度（HWiNFO → LHM → ACPI）、功耗（EMI → HWiNFO） | `Poll()` | 频率回退口径有争议（见 SENSORS.md 3.1）；`cpuBaseValid_` 首轮不输出占用率 |
 | `SensorHub::PollRam()` | `np_sensors.cpp:767` | 内存用量 + 从 DXGI 写显卡名/显存总量/厂商 | `Poll()`（`:1036`） | 它写的 `gpuName` 随后可能被 NVML/NVAPI 覆盖（优先级见 SENSORS.md 第 4 节） |
 | `SensorHub::PollGpuNvidia()` | `np_sensors.cpp:786` | NVML 全量指标 + NVAPI 域/温度/转速/**频率回退** | `Poll()`（`:1041`） | 每 32 轮询重挑"最忙的卡"（`:794`）；NVML 拿不到频率（`<=0`）才调 NVAPI（`:908`） |
 | `SensorHub::PollGpuAmd()` | `np_sensors.cpp:921` | ADL Overdrive5：占用率/温度/核心与显存频率 | `Poll()`（`:1042`，**仅当 NVIDIA 分支没走**） | 单位：`/100` → MHz、`/1000` → ℃ |
@@ -198,7 +198,7 @@
 | 字段 | 默认（`NPClearSensors`，`:441-470`） | 谁会写 | 位置 |
 | --- | --- | --- | --- |
 | `tickMs` / `valid` | 0 / 0 | `SensorHub::Poll` | `np_sensors.cpp:1031-1032` |
-| `cpuUsage` | `-1` | `PollCpu`（`GetSystemTimes` 差分） | `:694` |
+| `cpuUsage` | `-1` | `PollCpu`（`GetSystemTimes` 差分，含 1 秒级指数平滑） | 注释见 `PollCpu` |
 | `cpuTemp` | `-273` | `PollCpu`（HWiNFO → LHM → ACPI） | `:723`、`:735`、`:746` |
 | `cpuPower` | `-1` | `PollCpu`（EMI `PKG` → HWiNFO） | `:758`、`:763` |
 | `cpuClock` | `-1` | `PollCpu`（Nt → PDH 回退） | `:707`、`:712` |
