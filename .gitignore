@@ -28,3 +28,9 @@ tests/emi_probe.exe
 
 # 调试符号（构建产物）
 *.pdb
+
+# 模拟游戏构建产物（源码已入库，二进制请自行构建）
+tests/sim/sim.exe
+tests/simvk/simvk.exe
+tests/sim/_*.txt
+tests/sim/_*.ps1
