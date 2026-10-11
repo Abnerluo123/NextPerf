@@ -34,6 +34,11 @@ static HWND MakeWindow(HINSTANCE inst) {
 // 给测试留出「在游戏初始化图形之前注入」的窗口，用来验证工厂钩子那条路。
 static int gDelayMs = 0;
 
+// --probe-present：每次真 Present 之前先来一次 DXGI_PRESENT_TEST。
+// 模拟《漫威蜘蛛侠》那种「每帧两次 Present（探测 + 真的）」的游戏 ——
+// 这个模式曾把钩子的基准切到帧中间，使 Busy+Wait 只剩半个帧周期。
+static int gProbePresent = 0;
+
 // 并发提交线程（实现在文件末尾，这里先声明）
 static volatile LONG gSubmitRun = 0;
 static DWORD WINAPI SubmitThread(LPVOID param);
@@ -88,6 +93,7 @@ static int Run11(HINSTANCE inst, int seconds) {
             float c[4] = {0.10f, 0.14f, 0.30f, 1.0f};
             ctx->ClearRenderTargetView(rtv, c);
         }
+        if (gProbePresent) sc->Present(0, DXGI_PRESENT_TEST);
         sc->Present(1, 0);
         Sleep(16);
     }
@@ -248,6 +254,7 @@ static int Run12(HINSTANCE inst, int seconds) {
             WaitForSingleObject(ev, 1000);
             CloseHandle(ev);
         }
+        if (gProbePresent) sc->Present(0, DXGI_PRESENT_TEST);
         sc->Present(1, 0);
         Sleep(16);
     }
@@ -309,6 +316,13 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmd, int) {
         int v = atoi(p + 7);
         if (v > 0) gDelayMs = v * 1000;
     }
+    // --probe-present：**每次真 Present 之前先来一次 `DXGI_PRESENT_TEST`**。
+    //   模拟真实游戏《漫威蜘蛛侠》：它每帧调两次 Present（一次探测 + 一次真的），
+    //   日志里就是 `present diag: calls=600 real=300 test=300`。
+    //   ⚠ 这个模式曾经把钩子的「上一帧返回时刻」基准切到帧中间，导致
+    //   `Busy + Wait` 只剩半个帧周期（8.23ms vs 16.7ms）、面板 CPU 帧时间掉到 0.3ms。
+    //   回归用例：tests/verify_present_test.py（实现见 Run12 的 gProbePresent）
+    if (strstr(cmd, "--probe-present")) gProbePresent = 1;
     // --decoy-vulkan：**在正常跑 DX12 / D3D11 的同时**额外加载 vulkan-1.dll。
     //   模拟真实游戏《漫威蜘蛛侠》：纯 DX12，但进程里确实有 vulkan-1.dll
     //   （引擎/启动器/视频模块带进来的）。

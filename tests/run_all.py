@@ -31,6 +31,12 @@ STEPS = [
     # 在工作区内复现那个组合；**修复前的钩子跑它必 FAIL**（已验证）。
     ("DX12 + 进程里有 vulkan-1.dll · 仍须认出 DX12 并挂上",
      [sys.executable, os.path.join(HERE, "verify_dx12_decoyvk.py")]),
+    # 2026-10-11 用户实测《漫威蜘蛛侠》：CPU 帧时间掉到 0.3ms。
+    # 根因是「每帧先来一次 DXGI_PRESENT_TEST 的探测调用」把 Busy/Wait 的基准切到帧中间，
+    # `Busy + Wait` 只剩半个帧周期。这个用例用 `host_run.exe --probe-present` 复现该模式，
+    # 断言 `Busy + Wait ≈ 帧周期`（**修复前的钩子跑它必 FAIL**，实测比值 0.48）。
+    ("每帧带一次 PRESENT_TEST · Busy + Wait 仍须等于帧周期",
+     [sys.executable, os.path.join(HERE, "verify_present_test.py")]),
 ]
 
 
