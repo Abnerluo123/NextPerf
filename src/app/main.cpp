@@ -787,7 +787,16 @@ static int RunSelfTest() {
     }
     log("数据源: %s", gApp.hub.Describe().c_str());
     log("显卡: %s", gApp.sensors.gpuName[0] ? gApp.sensors.gpuName : "(未知)");
-    log("CPU 占用 %.1f%%  温度 %.1f C", gApp.sensors.cpuUsage, gApp.sensors.cpuTemp);
+    // 哨兵值（-273 表示传感器没读到）要显示成 --，不能把绝对值原样打出来。
+    // 面板那边早就是这么做的（见 np_build.cpp 的 Cv），这里漏了。
+    // 说明：CPU 温度读不到本身是环境问题（HWiNFO/LHM 未运行、ACPI 热区不可用），
+    // 不是本轮要修的 bug；这里只修显示。
+    {
+        char tb[32];
+        if (gApp.sensors.cpuTemp < -200.0f) snprintf(tb, sizeof(tb), "--");
+        else snprintf(tb, sizeof(tb), "%.1f C", (double)gApp.sensors.cpuTemp);
+        log("CPU 占用 %.1f%%  温度 %s", (double)gApp.sensors.cpuUsage, tb);
+    }
     // 频率与功耗单独一行：这两项最容易被写错（频率曾恒定显示基准值、
     // 功耗曾是瞬时抖动），放进自检便于随时核对，不必开面板看。
     log("CPU 频率 %.0f MHz  功耗 %.1f W", (double)gApp.sensors.cpuClock,
