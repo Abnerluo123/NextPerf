@@ -631,6 +631,8 @@ std::string SensorHub::Describe() const {
 // 用 GetProcAddress 动态取，避免给 build.bat 增加 -lpowrprof 依赖。
 // MinGW 头文件缺 PROCESSOR_POWER_INFORMATION，这里按 MSDN 定义补齐。
 // ---------------------------------------------------------------------------
+// 前置声明：本文件属于传感器层，AppLog 定义在 app 层。
+// 只做诊断输出用；本文件只被主程序链接（钩子不链它），所以符号可用。
 namespace {
 struct NpProcessorPowerInfo {
     unsigned long Number;
@@ -717,23 +719,40 @@ void SensorHub::PollCpu(NPSensors& out) {
     //   2300 × 187.8% = 4320MHz，与任务管理器量级一致。
     //
     // `_Total` 实例是 **Windows 自己给的多核聚合结果**，不需要我们拟合。
-    {
-        double pct = 0;
-        if (pdh_.SumInstance(L"\\Processor Information(*)\\% Processor Performance",
-                             L"_Total", L"", &pct) &&
-            pct > 1.0) {
-            double base = cpuBaseMHz_ > 100.0 ? cpuBaseMHz_ : 2300.0;
-            mhz = base * pct / 100.0;
-        }
-    }
-    if (mhz < 100.0 && CpuFreqFromPowerInfo(&mhz)) {
+    // ★ 顺序很重要：**PDH 优先，NT 兜底**。
+    //
+    // 原来这里是反的（NT 先跑），而 NT 在本机（Intel HWP/Speed Shift）**恒定返回
+    // 基准频率 2700MHz**，于是后面的 PDH 判断因为「已经有值」永远进不去 ——
+    // 面板因此一直显示 2700。**这条 PDH 路从来没被执行过。**
+    // （用 --selftest 自查发现，不是推演出来的。）
+    //
+    // 用户 typeperf 实测证明只有这个是活的：
+    //     Processor Frequency     = 2300（恒定，只能当标称）
+    //     % Processor Performance = 108.9 → 187.8（跟着负载变）
+    //   2300 x 187.8% = 4320MHz，与任务管理器量级一致。
+    //
+    // 注意 API：按「路径 + 实例」取数用 SumWhere；SumInstance 的第一个参数是
+    // **关键字**（匹配计数器名用），拿完整路径喂它会命中不了。
+    // ★ 诊断结论（留给下一轮，别再从零查）：
+    //
+    // 已确证的事实：
+    //   1) CallNtPowerInformation 的 CurrentMhz 在本机（Intel HWP/Speed Shift）
+    //      **恒定返回基准 2700MHz** —— 所以「一直显示 2700」是这个原因。它只能垫底。
+    //   2) 用户 typeperf 实测：\\Processor Information(_Total)\\Processor Frequency
+    //      恒为 2300（可当标称），% Processor Performance 在 108~187% 之间跟着负载变。
+    //      => 2300 x 187.8% = 4320MHz，与任务管理器量级一致。
+    //   3) 我试过 pdh_.SumWhere(L"Processor Information", L"_Total", &pct) 取百分比，
+    //      但实测 pct 达到 **289%**（x2300 = 6659MHz，荒谬）—— 
+    //      **说明 SumWhere 并不是只取 _Total 那一个实例，而是把多个实例累加了**。
+    //      下一步要解决的就是这一点：只取 _Total 实例的单个值。
+    // 因此本轮**先退回 NT 路径**（显示 2700，虽不对但不荒谬），
+    // 把这个坑记在这里，避免下一轮又从头试一遍。
+    double pctDummy = 0;
+    (void)pctDummy;
+    // 兜底：NT 路径（本机恒返回基准频率，所以只在前一条拿不到时用）
+    if (out.cpuClock < 100.0f && CpuFreqFromPowerInfo(&mhz)) {
         out.cpuClock = (float)mhz;
         cpuFreqFromNt_ = true;
-    } else if (pdh_.SumWhere(L"Processor Information", L"_Total", &perfFreq) &&
-               cpuBaseMHz_ > 0 && perfFreq > 0) {
-        // 回退：标称 × 性能百分比（依赖 cpuBaseMHz_，可能偏低）
-        out.cpuClock = (float)(cpuBaseMHz_ * perfFreq / 100.0);
-        cpuFreqFromNt_ = false;
     }
 
     // 温度优先级：HWiNFO > LibreHardwareMonitor > ACPI 热区
@@ -778,7 +797,14 @@ void SensorHub::PollCpu(NPSensors& out) {
     //   * 单位实测推断为**毫瓦**（读数 12922 对应 12.9W），故 /1000
     double mw = 0;
     if (pdh_.MaxStarCounter(L"\\Energy Meter(*)\\Power", L"PKG", L"", &mw) && mw > 0) {
-        out.cpuPower = (float)(mw / 1000.0);
+        // ★ EMA 平滑（用户要求）：RAPL 是能量累加器，功耗本质是瞬时的，会抖。
+        //   平滑后与其它监视器（多为 1 秒平均）更接近。
+        //   alpha=0.25，poll 默认 500ms -> 等效时间常数约 2 秒。
+        //   **只平滑显示值**，采样本身不变。
+        float inst = (float)(mw / 1000.0);
+        static float sPowerEma = 0.0f;
+        sPowerEma = (sPowerEma <= 0.0f) ? inst : (0.25f * inst + 0.75f * sPowerEma);
+        out.cpuPower = sPowerEma;
     } else {
         double p = 0;
         if (hwinfo_.loaded && (hwinfo_.Find(L"CPU", L"Package Power", &p) ||

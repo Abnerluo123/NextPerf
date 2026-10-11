@@ -788,6 +788,10 @@ static int RunSelfTest() {
     log("数据源: %s", gApp.hub.Describe().c_str());
     log("显卡: %s", gApp.sensors.gpuName[0] ? gApp.sensors.gpuName : "(未知)");
     log("CPU 占用 %.1f%%  温度 %.1f C", gApp.sensors.cpuUsage, gApp.sensors.cpuTemp);
+    // 频率与功耗单独一行：这两项最容易被写错（频率曾恒定显示基准值、
+    // 功耗曾是瞬时抖动），放进自检便于随时核对，不必开面板看。
+    log("CPU 频率 %.0f MHz  功耗 %.1f W", (double)gApp.sensors.cpuClock,
+        (double)gApp.sensors.cpuPower);
     log("GPU 占用 %.1f%%  温度 %.1f C  功耗 %.1f W", gApp.sensors.gpuUsage, gApp.sensors.gpuTemp,
         gApp.sensors.gpuPower);
     log("显存 %.2f / %.2f GB   内存 %.2f / %.2f GB", gApp.sensors.vramUsedGB,
