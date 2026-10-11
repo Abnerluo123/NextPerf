@@ -1696,7 +1696,12 @@ HRESULT PresentCommon(IDXGISwapChain* sc, UINT sync, UINT flags,
                         static ID3D12InfoQueue* sIq = nullptr;
                         static UINT64 sSeen = 0;
                         static int sDumped = 0;
-                        if (!sIq) {
+                        // ★ 只问一次。没装 D3D12 验证层时 QueryInterface 必然失败，
+                        //   少了这个标志就会**每帧**重试一次 —— 那是在游戏的 Present 栈里。
+                        //   本项目规矩：不要在游戏线程上做多余的活。
+                        static bool sTried = false;
+                        if (!sIq && !sTried) {
+                            sTried = true;
                             if (FAILED(gDev12->QueryInterface(IID_PPV_ARGS(&sIq)))) sIq = nullptr;
                         }
                         if (sIq && sDumped < 40) {
