@@ -115,7 +115,7 @@
 |---|---|---|
 | 帧时间采集 | `src/hook/np_hook.cpp` | `PresentCommon` 里的 record 段 |
 | ~~帧内重复 Present 的合并~~ | `src/hook/np_hook.cpp` | ❌ **已回退（不再吸收）**：吸收那一行被注释掉（`// gAbsorbThisPresent = true;`），只有 `gMergedCount` 仍在自增 —— 所以日志里的 `frame merge: … merged=N` 是「**满足阈值的次数**」，**不是真的合并了 N 帧**。判据仍取自 `gRawStats.meanMs(240)` |
-| **Low 帧（窗口平均口径）** | `src/common/np_stats.h` | `lowWindowed`（1000ms 窗口平均、回看约 10s）；`lowPercentileFps`（1 秒窗口 + 对 FPS 取 P1）只做兜底 —— **以代码为准，别照抄文档** |
+| **Low 帧（PresentMon 百分位口径）** | `src/hook/np_hook.cpp` + `src/etw/np_etw.cpp` | **滑动窗口内直接取百分位**（1% Low 窗口 1 秒、0.1% Low 窗口 3 秒；线性插值 `index=(n−1)p`、倒数指标排名反转）。管理员运行时窗口内的样本来自 **ETW 驱动侧显示事件**，并由主程序经 `NPConfig.reserved[]` 中继给钩子（见 `np_common.h` 的 `NPConfigSetEtwRelay`）。`lowWindowed`（窗口平均）**已退休**，只留在 `np_stats.h` 作历史对照 |
 | 环形缓冲与百分位 | `src/common/np_stats.h` | `FrameStats`、`push`、`recent`、`percentileMs` |
 | **CPU Busy / Wait 拆分** | `src/hook/np_hook.cpp` | Present 返回后**同一次减法**导出三个值 |
 | GPU 帧时间 | `src/sensors/np_sensors.cpp` | PDH `\GPU Engine(pid_*)\Running Time` |

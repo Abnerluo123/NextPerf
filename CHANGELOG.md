@@ -113,6 +113,68 @@ adv >= 1  → 记一帧，时长 = adv × vblank
 
 ---
 
+## v1.6.7（tag `v1.6.7`，2026-10-11 发布）—— ETW 显示侧帧计时接通 + Low 口径照 Intel PresentMon 重做
+
+> ✅ **用户实测确认**（《漫威蜘蛛侠》）：**锁帧 + 垂直同步下各数据都没问题**，而且
+> **"很好的体现体感流畅度"**。用户要求：**这一版冻结，不再改动**。
+
+### 本版主题：把"帧"的来源，从"挂钩 Present 的调用间隔"换成**驱动侧显示事件**
+
+挂钩 `IDXGISwapChain::Present` 量到的间隔**均值正确、单个样本是脏的**（实测：平均 16.68ms = 60fps
+完全正确，但 p90=23ms、27% 的间隔 >20ms，因为游戏每帧调两次 Present、真呈现的相位每帧在漂）。
+排序取"最慢 1%"时取到的正是那批假的长样本 → 流畅的 60fps 显示 1%Low ≈ 38~42。
+
+换成 **ETW 的 `Microsoft-Windows-DxgKrnl` 显示事件**后（实测 `Present_Info` 59.8 次/秒 = 一帧一次），
+同一时刻 ETW 报 16.64ms / 60.0fps，而钩子报 22.73ms —— 显示侧没有这个抖动。
+
+技术要点（全部照 Intel PresentMon 的定义/做法，见 `PresentMon/IntelPresentMon`）：
+
+| 项 | 做法 | 来源 |
+| --- | --- | --- |
+| 事件判定 | **按清单事件 ID**：`171`(PresentHistory_Start) 优先，退回 `184`(Present_Info) | `PresentData/ETW/Microsoft_Windows_DxgKrnl.h`（清单生成） |
+| 关键字 | `0x8000001`（Present\|Base）；**绝不启用 `Performance` 位** | 同上（它专门有这条警告） |
+| 事件量 | 会话级 **`EVENT_FILTER_TYPE_EVENT_ID`** 过滤 → 5 秒从 **1140 万条**降到 **2 万条** | MS Learn `EnableTraceEx2`（过滤器放 `ENABLE_TRACE_PARAMETERS.EnableFilterDesc`） |
+| 时间戳 | 用 **`QueryPerformanceFrequency`** 换算（原来写死假定 QPC=10MHz） | 同上 |
+| Low 帧 | **滑动窗口内直接取百分位**：`h = p×(N−1)` 线性插值、倒数指标排名反转（FPS 的 P1 ≡ 帧时间的 P99） | `Core/source/pmon/StatisticsTracker.cpp`、`PresentMonMiddleware/DynamicStat.cpp:323` |
+| 0.1% 窗口 | 1% 用 1 秒；0.1% 用 **3 秒**（1 秒只有 60 个样本，P99/P99.9 必然几乎相同；太长又会把一次卡顿钉住） | 同上（PresentMon 的窗口是可配的 `--window-size`） |
+
+### 本版修掉的 bug（都带证据）
+
+1. **游戏内面板与桌面面板两套数不一致**：桌面面板被 ETW 覆盖（59），游戏内面板画的是钩子自己的数（39）
+   → 用户看到 40。修法：主程序把显示侧的 `fps/帧时间/1%Low/0.1%Low` 放进 **`NPConfig.reserved[]`**
+   （**零 ABI 改动**，旧钩子 DLL 不会失配），钩子新鲜（<1.5 秒）就用它，超时自动回退。
+2. **GPU 帧时间的分母**混入了 ETW 的**跨局累计**帧数（第二次开局起必然偏小）。
+3. **ETW 双重计数风险**：原来 171/184 都算 → 某游戏每帧两个事件都发时帧率翻倍、帧时间减半。
+4. **ETW 时间戳换算**写死 10MHz（本机恰好是，换台机器就全错）。
+5. **`0.1% Low` 的 10 秒窗口**把"关垂直同步那一下"的卡顿钉住近 10 秒（读数长期停在 14.4）。
+6. ③"以显示帧为准"引入的两个自造缺陷：**每 5 秒在 Present 路径上做重活**（`EnumDisplaySettingsW`，
+   造成周期性 ~20ms 波峰）、**启用闸门每 5 秒翻转**（两套口径来回切，同样是周期性尖峰）。
+
+### 新增
+
+- **`docs/WHY-VSYNC.md`**：给玩家看的科普 —— 用本项目实测数据说明"锁帧 + 垂直同步"为什么决定流畅度
+  （平均 105fps 反而比 稳 60fps 更卡）。
+- 尖峰探测器（`spike:` 日志行）与 `tests/repro_low_frame.py`（呈现抖动/关锁帧的复现取数工具）。
+
+### 验证
+
+| 验证 | 结果 |
+| --- | --- |
+| `dist\NextPerf.exe --selftest` | 全部通过 |
+| `python tests\run_all.py --skip-build` | 全部通过（1~2 项因环境跳过） |
+| 真实游戏 | ✅ **用户实测确认**：锁帧 + 垂直同步下各项数据正常、体感流畅度反映准确 |
+
+### 资产校验（SHA-256）
+
+| 文件 | 字节 | SHA-256 |
+| --- | --- | --- |
+| `NextPerf.exe` | 791,552 | `AF74B8D039D077619C58908B3B89CB434E399DC351DE82A765D3199F17AB4314` |
+| `NextPerfHook.dll` | 719,872 | `2804D809BFB2F7DDB42DE08390326A86F98BD21C50F6EDD5895F915464337556` |
+| `NextPerfHook32.dll` | 778,240 | `58E739B101AA8559775BB15DBDD125E4CA911E3809475E1238B1D6ECE6484092` |
+| `NextPerfHook64.dll` | 719,872 | `2804D809BFB2F7DDB42DE08390326A86F98BD21C50F6EDD5895F915464337556` |
+
+---
+
 ## v1.6.6（tag `v1.6.6`，2026-10-11 发布）—— CPU 占用率 1 秒平滑（**大修前的冻结版**）
 
 > 📌 **这一版是用户指定的"安全点"**：用户要求在做 Low 帧底层大修之前先把当前状态发出去，

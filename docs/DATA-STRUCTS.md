@@ -462,7 +462,7 @@ for (size_t i = 0; i < sizeof(c->reserved) / sizeof(c->reserved[0]); ++i) {
 | `gpuFrames[4096]` | float[4096] | 每帧 GPU 帧时间 ms（= 当时的 `gpuFrameMs`） | 同上 | 无人读 | 写-无读（历史上是"GPU 曲线全为 0"投诉的现场） |
 | `fps` | float | 瞬时 FPS。**按 500ms 时间窗计数**得到（不是逐帧 `1000/frameMs`）：锁 60 时窗口内 30 帧/0.5s = 恰好 60.0，不会 60↔100 乱跳 | `UpdateTelemetryCommon()` | 面板「FPS」行、主程序 `NPHistoryPush` | 活跃 |
 | `fpsAvg` | float | 平均 FPS = 最近 600 帧的平均帧时间换算（`gStats.avgFps(600)`） | 同上 | 仪表/日志/`NPHistory`；**也用于把 1 秒窗口换算成帧数** | 活跃 |
-| `fpsLow1` | float | **1% Low（FPS）**。**最终口径 = `lowWindowed(1.0, 1000ms, look)`（窗口平均，回看约 10s）**；只有窗口数不足 4 个时才回退 `lowPercentileFps(99.0, lowWin)` 兜底（`np_hook.cpp` 1186-1191） | 同上 | 面板「1% Low」行；**主程序会用 ETW 读数覆盖**（见下） | 活跃 |
+| `fpsLow1` | float | **1% Low（FPS）**。**最终口径 = 滑动窗口内直接取百分位**（1% Low 窗口 1 秒、0.1% Low 窗口 3 秒；`lowPercentileFps(99.0/99.9, n)`，线性插值 `index=(n−1)p`）；只有窗口数不足 4 个时才回退 `lowPercentileFps(99.0, lowWin)` 兜底（`np_hook.cpp` 1186-1191） | 同上 | 面板「1% Low」行；**主程序会用 ETW 读数覆盖**（见下） | 活跃 |
 | `fpsLow01` | float | **0.1% Low（FPS）**。同 `fpsLow1`：`lowWindowed(0.1, 1000ms, look)` 为主，`lowPercentileFps(99.9, lowWin)` 兜底 | 同上 | 面板「0.1% Low」行 | 活跃 |
 | `frameMs` | float | **最近一帧的帧生成时间** ms。★ 2026-10-11 起 = **显示帧时长**（累积相位重建：`(N−N_prev) × 垂直消隐周期`），不再是 Present 调用间隔 —— 前者会在帧内漂移（Spider-Man 实测 10.7/16.3/16.6/23.0 交替），后者才是显示器上真实的帧时长。不满足"同步呈现 + 刷新率已知 + 对齐率≥75%"时回退原始间隔 | `PresentCommon` | `UpdateTelemetryCommon()`（喂 `gStats`、算 EMA、算 `rtLoad` 分母）、`np_build` 兜底显示 | 活跃 |
 | `frameMsAvg` | float | 平滑后的帧时间（`np::Ema(0.10f)`）。**面板显示用这个** | `UpdateTelemetryCommon()` | `np_build.cpp`「帧时间」行（`frameMsAvg > 0.0001 ? frameMsAvg : frameMs`） | 活跃 |
