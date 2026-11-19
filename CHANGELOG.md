@@ -14,9 +14,9 @@
 
 ---
 
-## 未发布（main）—— 第三轮 功能完善、RT/Tensor/Vulkan 支持、兼容加固与游戏库重构
+## v1.7.0（tag `v1.7.0`，commit `e0110e3`，2026-11-19 发布）—— Apple Metal HUD 高密度紧凑重构、900×580 统一深色控制台、单文件 U 盘便携打包与全链路加固
 
-> ⚠️ **未经用户完整测试**，未打 tag、未发布。**当前发布版仍以已打 tag 版本为准。**
+> ⚠️ **未经用户完整测试**（已在工作区通过 `--selftest`、`--uismoke`、单文件 U 盘隔离注入验证、`run_all.py`、DX11/DX12 真值对照与 12 轮交换链重建压测；按用户指令打包发布 GitHub Release `v1.7.0`）。
 
 ### 2026-11-19 缺陷修复、功能扩展与控制台 Direct2D 重构（未经用户完整测试）
 * **传感器与 vendor 采样修复**：修正 `NP_MAKE_NVAPI_VERSION`、`NvAPI_QueryInterface_t` 与 `NV_GPU_DYNAMIC_PSTATES_INFO_EX`（`ver=1`、`72` 字节布局），恢复 NVIDIA GPU/FB/VID/BUS 域占用采样并在无 NVML 时回退 NVAPI；`PollCpu` 防止无符号整数下溢；`pdh_.Collect()` 单次采集去重并增加 WMI（LHM/ACPI）查询缓存与失败退避；DXGI 优先选择显存最大的非软件适配器；HWiNFO 共享内存头补齐 `#pragma pack(1)`（44 字节）与重连，`UpdateSourceUsed` 补充 `NP_SRC_LHM`。
