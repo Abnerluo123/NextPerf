@@ -165,24 +165,24 @@ inline void NPTelemetryShmName(uint32_t pid, wchar_t* out, size_t n);
 | `warnColor` | uint32 | `0xFFFF6B5B` | 告警色 | `settings.cpp` 载入 | **无人读** | ✅ `warnColor` |
 | `scale` | float | `1.0f` | 整体缩放，UI 允许 0.75~2.0 | `ui.cpp` 滑杆「缩放」 | `np_panel.cpp` `Layout()` / `Measure()` / `Render()`；`overlay.cpp`、钩子算偏移 | ✅ `scale` |
 | `opacity` | float | `1.0f` | **旧字段，现固定 1.0，全项目无人读** | 仅 `NPDefaultConfig()` | 无人 | ❌（也不在 JSON 里，等于死字段） |
-| `bgOpacity` | float | `0.72f` | 背景不透明度（与文字独立） | `ui.cpp` 滑杆 | `np_panel.cpp` `Render()`：`bg.a * c.bgOpacity` | ✅ `bgOpacity` |
+| `bgOpacity` | float | `0.82f` | 背景不透明度（与文字独立） | `ui.cpp` 滑杆 | `np_panel.cpp` `Render()`：`bg.a * c.bgOpacity * theme.bgScale` | ✅ `bgOpacity` |
 | `textOpacity` | float | `1.0f` | 文字/内容不透明度 | `ui.cpp` 滑杆 | `np_panel.cpp` `Render()`：`alpha` 乘进每个画刷 | ✅ `textOpacity` |
-| `offsetX` | int32 | `16` | 相对**右上角**的水平偏移（逻辑像素；桌面叠加会再乘光栅倍率） | `ui.cpp` 滑杆（0~400） | `overlay.cpp` 定位；钩子内部定位 | ✅ `offsetX` |
-| `offsetY` | int32 | `16` | 相对显示器顶边的垂直偏移 | 同上 | 同上 | ✅ `offsetY` |
-| `fontHeight` | uint32 | `15` | **逻辑像素字号**；实际字号 = `fontHeight * scale` | `ui.cpp` 滑杆（10~24） | `np_panel.cpp` `EnsureFormats((float)c.fontHeight * c.scale)` | ✅ `fontHeight` |
-| `graphHeight` | uint32 | `64` | 图表区高度基准；实际 `chartH = max(11, graphHeight * 0.26) * scale` | `ui.cpp` 滑杆（30~140） | `np_panel.cpp` `Layout()` | ✅ `graphHeight` |
-| `overlayMode` | uint32 | `0` | `0`=自动（优先游戏内） `1`=强制游戏内 `2`=强制桌面叠加 | `ui.cpp` 循环控件 | **钩子**：`wantOverlay = ... && cfg.overlayMode != 2` **且** 主程序：`overlayMode == 2 \|\| (!attached && overlayMode != 1)` 决定是否显示桌面叠加 | ✅ `overlayMode` |
-| `fpsCap` | uint32 | `0` | 参考帧率上限（本意是图表 Y 轴），**当前无人读** | 仅 `settings.cpp` | 无人 | ✅ `fpsCap` |
-| `pollMs` | uint32 | `500` | 传感器轮询间隔 ms（UI 里可选 200/350/500/1000）。**当前无人读**：主程序是每 120ms 一个 tick、无条件调 `AppPollSensors()`（`AppState::lastPoll` 声明了也没人用） | 仅 `settings.cpp` | **无人读** | ✅ `pollMs` |
-| `updateHz` | uint32 | `20` | 叠加刷新率上限（UI 可选 60/30/20/10） | `ui.cpp` 循环控件 | **钩子**：`hz = cfg.updateHz ? cfg.updateHz : 20`（游戏内叠加的重绘间隔）。⚠ 主程序**不读**它（桌面叠加有自己的节流） | ✅ `updateHz` |
+| `offsetX` | int32 | `16` | 相对屏幕角落的水平偏移（逻辑像素；桌面叠加会再乘光栅倍率） | `ui.cpp` 滑杆（0~400） | `overlay.cpp` 定位；钩子内部定位 | ✅ `offsetX` |
+| `offsetY` | int32 | `16` | 相对显示器顶/底边的垂直偏移 | 同上 | 同上 | ✅ `offsetY` |
+| `fontHeight` | uint32 | `13` | **逻辑像素字号**；实际字号 = `fontHeight * scale` | `ui.cpp` 滑杆（10~26） | `np_panel.cpp` `EnsureFormats((float)c.fontHeight * c.scale)` | ✅ `fontHeight` |
+| `graphHeight` | uint32 | `46` | Metal 双通道示波器基准高度（34..120）；可选行内小图高 `max(11, graphHeight * 0.24) * scale` | `ui.cpp` 滑杆（34~120） | `np_panel.cpp` `Layout()` / `Render()` | ✅ `graphHeight` |
+| `fpsCap` | uint32 | `(1u<<4)\|(1u<<5)` | 零 ABI 破坏复用低位（通过 `NPConfigCorner`/`NPConfigTheme`/`NPConfigShowRange`/`NPConfigShowHeader`/`NPConfigHorizontal` 读写）：`bits[0:1]` 四角锚点、`bits[2:3]` Apple HUD 材质（`0=Metal 黑 / 1=液态暗灰 / 2=浅雾透明 / 3=极简纯字`）、`bit 4` 区间显示（1=开）、`bit 5` 2 行设备顶栏（1=开）、`bit 6` 横向极简条模式 | `ui.cpp` / `NPConfigSet*` | `np_panel.cpp` `np_build.cpp` `overlay.cpp` | ✅ `fpsCap` |
+| `pollMs` | uint32 | `500` | 传感器轮询间隔 ms（UI 支持 `100/250/500/1000` 切换），由 `main.cpp` 主循环按 `pollMs` 独立节流触发 `AppPollSensors()` | `ui.cpp` | `main.cpp` 主循环 | ✅ `pollMs` |
+| `updateHz` | uint32 | `20` | 叠加刷新率（`10/20/30/60`），同时驱动钩子侧与桌面层 `OverlayUpdate()` 节流频率 | `ui.cpp` | 钩子侧 + `main.cpp` `OverlayUpdate()` | ✅ `updateHz` |
+| `overlayMode` | uint32 | `0` | `0`=自动 `1`=强制游戏内 `2`=强制桌面叠加 `3`=全部隐藏（桌面快捷键或托盘一键关闭时在发布副本置 3） | `ui.cpp` / `main.cpp` `AppPublish` | 钩子侧与主程序 | ✅ `overlayMode` |
 | `deepEngineHook` | uint32 | `1` | 启用命令列表级钩子（Draw/Dispatch/RT 计数） | `ui.cpp` 循环控件 | 钩子安装命令列表钩子前判断 | ✅ `deepEngineHook` |
 | `vtableProbe` | uint32 | `1` | 注入后自己造一条 8×8 隐藏交换链拿 `Present` 的 vtable（游戏已经在跑时工厂钩子不会再被调用） | `ui.cpp` 循环控件 | 钩子探测线程 | ✅ `vtableProbe` |
 | `quit` | uint32 | `0` | `1` = 主程序正在退出，钩子收到后 `SelfUnloadNow()` | `main.cpp` 退出路径 | 钩子守卫线程 | ❌ **绝不持久化** |
 | `simulate` | uint32 | `0` | `1` = 模拟数据（开发预览） | `ui.cpp` 循环控件 | `np_build.cpp`（`active = hooked \|\| simulate`） | ✅ `simulate` |
-| `autoInject` | uint32 | **`NPDefaultConfig()` 不设置**（实际靠 `gApp` 全局零初始化 = 0） | 原意「检测到 3D 窗口时自动注入」。**功能已废弃**：`AppAutoInjectTick()` 现在是**故意留空的空函数**（曾把梯子/微信/自己误判成游戏） | 仅 `settings.cpp` | **无人读** | ✅ `autoInject`（但已无意义） |
-| `pauseHook` | uint32 | **不设置**（=0） | `1` = 主程序停止监视，钩子跳过叠加绘制与遥测更新（= 停止读游戏数据），只留最小心跳 | `main.cpp` `AppPublish()` **每 tick** 同步 `monitoring` 状态 | 钩子 `PresentCommon` | ❌ **绝不能持久化** |
-| `learnedAutoHook` | uint32 | **不设置**（=0） | 「学习来的条目」要不要自动注入。**手动添加的条目不受此开关影响，一直自动注入** | `ui.cpp` 循环控件「实验性自动注入」 | `injector.cpp` 扫描时 `if (g.learned && !cfg.learnedAutoHook) continue;` | ✅ `learnedAutoHook` |
-| `detachPid` | uint32 | **不设置**（=0） | 非 0 且 **等于钩子自己的 pid** → 钩子干净自卸载（还原 vtable 补丁 + 注销 VEH） | `injector.cpp` `RequestHookDetach()`；用完由注入器清零（约 2.5 秒后无条件清零） | 钩子守卫线程 | ❌ **绝不能持久化** |
+| `autoInject` | uint32 | `0`（由 `NPDefaultConfig()` 显式清零） | 原意「检测到 3D 窗口时自动注入」。**功能已废弃**：`AppAutoInjectTick()` 现在是**故意留空的空函数**（曾把梯子/微信/自己误判成游戏） | 仅 `settings.cpp` / `NPDefaultConfig()` | **无人读** | ✅ `autoInject`（但已无意义） |
+| `pauseHook` | uint32 | `0`（由 `NPDefaultConfig()` 清零；`A_DEFAULT` 随后同步为 `monitoring ? 0u : 1u`） | `1` = 主程序停止监视，钩子跳过叠加绘制与遥测更新（= 停止读游戏数据），只留最小心跳 | `main.cpp` `AppPublish()` **每 tick** 同步 `monitoring` 状态 | 钩子 `PresentCommon` | ❌ **绝不能持久化** |
+| `learnedAutoHook` | uint32 | `0`（由 `NPDefaultConfig()` 清零） | 「学习来的条目」要不要自动注入。**手动添加的条目不受此开关影响，一直自动注入** | `ui.cpp` 循环控件「实验性自动注入」/`NPDefaultConfig()` | `injector.cpp` 扫描时 `if (g.learned && !cfg.learnedAutoHook) continue;` | ✅ `learnedAutoHook` |
+| `detachPid` | uint32 | `0`（由 `NPDefaultConfig()` 清零） | 非 0 且 **等于钩子自己的 pid** → 钩子干净自卸载（还原 vtable 补丁 + 注销 VEH） | `injector.cpp` `RequestHookDetach()`；用完由注入器（`InjectorScanNow` 与 `InjectorTick`）在退出或 2.5 秒超时后清零 | 钩子守卫线程 | ❌ **绝不能持久化** |
 | `reserved[4]` | uint32×4 | 0 | 预留槽位。**加字段必须从这里挪**（保持 sizeof 不变） | `NPDefaultConfig()`（用 `sizeof(reserved)/sizeof(reserved[0])` 推导，见 §2.5） | 无人 | ❌ |
 
 ### 2.3 从 `reserved[]` 挪出来的四个字段（历史与规则）
@@ -266,10 +266,11 @@ for (size_t i = 0; i < sizeof(c->reserved) / sizeof(c->reserved[0]); ++i) {
 结构体的字段会被后来的迭代者搬来搬去（这个 `reserved` 就被搬过 5 次），
 写死的上限不会跟着变，而且这类越界**不一定崩**，只是悄悄把邻居清零。
 
-**另一个相关的小行为（仍在）**：`ui.cpp` 的「恢复默认设置」调 `NPDefaultConfig(&gApp.cfg)`，
-但该函数不碰 `autoInject` / `pauseHook` / `learnedAutoHook` / `detachPid`，
-所以**「恢复默认」不会把 `learnedAutoHook` 复位成 0**。这算 bug 还是 feature 未确认
-（用户没有明确要求），但要知道。
+**相关更新（已修）**：`NPDefaultConfig(&gApp.cfg)` 现已显式初始化
+`autoInject` / `pauseHook` / `learnedAutoHook` / `detachPid` 为 `0`，
+`ui.cpp` 的「恢复默认设置」（`A_DEFAULT`）会在调用后立即把 `pauseHook` 重同步为
+`gApp.monitoring ? 0u : 1u`；同时 `np_common.h` 已增加编译期 `static_assert` 锁定
+`NPConfig`(136) / `NPSensors`(448) / `NPTelemetry`(55736) 尺寸，读方亦同步校验 `size` / `version`。
 
 **注释里的预告**：修复后的注释提到槽位曾被
 `autoInject / lowStrict / pauseHook / learnedAutoHook / detachPid` 使用 ——
@@ -462,8 +463,8 @@ for (size_t i = 0; i < sizeof(c->reserved) / sizeof(c->reserved[0]); ++i) {
 | `gpuFrames[4096]` | float[4096] | 每帧 GPU 帧时间 ms（= 当时的 `gpuFrameMs`） | 同上 | 无人读 | 写-无读（历史上是"GPU 曲线全为 0"投诉的现场） |
 | `fps` | float | 瞬时 FPS。**按 500ms 时间窗计数**得到（不是逐帧 `1000/frameMs`）：锁 60 时窗口内 30 帧/0.5s = 恰好 60.0，不会 60↔100 乱跳 | `UpdateTelemetryCommon()` | 面板「FPS」行、主程序 `NPHistoryPush` | 活跃 |
 | `fpsAvg` | float | 平均 FPS = 最近 600 帧的平均帧时间换算（`gStats.avgFps(600)`） | 同上 | 仪表/日志/`NPHistory`；**也用于把 1 秒窗口换算成帧数** | 活跃 |
-| `fpsLow1` | float | **1% Low（FPS）**。**最终口径 = 滑动窗口内直接取百分位**（1% Low 窗口 1 秒、0.1% Low 窗口 3 秒；`lowPercentileFps(99.0/99.9, n)`，线性插值 `index=(n−1)p`）；只有窗口数不足 4 个时才回退 `lowPercentileFps(99.0, lowWin)` 兜底（`np_hook.cpp` 1186-1191） | 同上 | 面板「1% Low」行；**主程序会用 ETW 读数覆盖**（见下） | 活跃 |
-| `fpsLow01` | float | **0.1% Low（FPS）**。同 `fpsLow1`：`lowWindowed(0.1, 1000ms, look)` 为主，`lowPercentileFps(99.9, lowWin)` 兜底 | 同上 | 面板「0.1% Low」行 | 活跃 |
+| `fpsLow1` | float | **1% Low（FPS）**。**最终口径 = PresentMon 滑动窗口百分位**：`lowPercentileFps(99.0f, n1s)`（线性插值 + 倒数指标排名反转，`n1s` ≈ 1 秒帧数）；管理员启用 ETW 时优先由主程序经 `NPConfig.reserved[]` 中继驱动侧 1 秒窗口值 | 同上 | 面板「1% Low」行 | 活跃 |
+| `fpsLow01` | float | **0.1% Low（FPS）**。钩子侧 `lowPercentileFps(99.9f, n1s)`；启用 ETW 时由 `EtwMonitor::RecalcLow()` 用 3 秒窗口计算 `99.9` 百分位并中继 | 同上 | 面板「0.1% Low」行 | 活跃 |
 | `frameMs` | float | **最近一帧的帧生成时间** ms。★ 2026-10-11 起 = **显示帧时长**（累积相位重建：`(N−N_prev) × 垂直消隐周期`），不再是 Present 调用间隔 —— 前者会在帧内漂移（Spider-Man 实测 10.7/16.3/16.6/23.0 交替），后者才是显示器上真实的帧时长。不满足"同步呈现 + 刷新率已知 + 对齐率≥75%"时回退原始间隔 | `PresentCommon` | `UpdateTelemetryCommon()`（喂 `gStats`、算 EMA、算 `rtLoad` 分母）、`np_build` 兜底显示 | 活跃 |
 | `frameMsAvg` | float | 平滑后的帧时间（`np::Ema(0.10f)`）。**面板显示用这个** | `UpdateTelemetryCommon()` | `np_build.cpp`「帧时间」行（`frameMsAvg > 0.0001 ? frameMsAvg : frameMs`） | 活跃 |
 | `cpuFrameMs` | float | CPU 帧时间 = **`CPUBusy + CPUWait`**（PresentMon 口径）= 帧周期。⚠ 必须扣掉卡在 `Present` 里的等待，否则锁 60 时恒等于 16.66ms —— 那是帧周期，不是 CPU 的活 | `PresentCommon` 尾部（`busyMs + waitMs`）；首帧兜底 `= frameMs` | 主程序 `NPHistoryPush`（桌面曲线的 `latCpu`）；`np_build` 在 `cpuBusyAvg` 还没建立时兜底 | 活跃。⚠ **这是遥测字段**；**面板「CPU 帧时间」显示的不是它**，而是 `cpuBusyAvg`（用户定的口径，见下） |
@@ -668,16 +669,15 @@ struct GameEntry {
 
 | 量 | 公式 | 备注 |
 | --- | --- | --- |
-| 内边距 `pad` | `4.0f * scale + 3.0f` | 那 3px 是用户指定的"四周留黑" |
-| 行高 `lh` | `max(fontHeight * 1.14f * scale, lineHeight_)` | **不能小于字体自身行距**（DWrite 实测），否则 `DRAW_TEXT_OPTIONS_CLIP` 会裁掉字形上下 |
+| 内边距 `pad` | `5.0f * scale` | 紧凑留边，贴近 Apple Metal HUD |
+| 行高 `lh` | `max(fontHeight * 1.12f * scale, lineHeight_)` | **不能小于字体自身行距**（DWrite 实测），否则 `DRAW_TEXT_OPTIONS_CLIP` 会裁掉字形上下 |
 | 标题行高 `headH` | `= lh` | 标题字号已改为与正文同号，只靠**加粗**区分 |
-| 图表高 `chartH` | `max(11.0f, graphHeight * 0.26f) * scale` | 金属 HUD 的曲线区比文字区矮得多 |
-| 行间距 `rowGap` | `1.0f * scale` | |
+| 图表高 `chartH` / `dualPlotH` | `chartH = max(11.0f, graphHeight * 0.24f) * scale`，`dualPlotH = max(30.0f, (float)graphHeight) * scale` | 双通道示波器默认 `46px` |
+| 行间距 `rowGap` | `0.8f * scale` | |
 | 图表间距 `chartGap` | `2.0f * scale` | |
-| 列间距 `colGap` | `2.0f * scale` | |
-| 面板最小宽 | `max(170.0f * scale, contentW + pad * 2)`，再经 `latchedW_` 锁定 | |
-| 数值列宽 | **固定 14 个等宽字符格** | 数据层 `FitCols(..., 14)` 保证不会被截断 |
-| 标签列宽 | 量化到**整字符格**（`ceil(px / charW) * charW`） | 标签集合固定 → 量化后完全稳定 |
+| 列间距 `colGap` | `4.0f * scale` | |
+| 面板最小宽 | `max(156.0f * scale, max(headW, max(coreW, extW)) + pad * 2)`，再经 `latchedW_` 锁定 | 取消旧 `248px` 宽度下限；核心列宽 (`coreLabelW`/`coreValW`/`coreRngW`) 与扩展列宽 (`extW`) 在 `PanelRenderer::Grid` 中解耦 |
+| 核心/扩展对齐 | 核心数值列右对齐于 `coreLabelW + 6*scale` 后，`[min max]`/`[VRAM]` 贴齐 `rightX`；下方扩展行右对齐 `rightX` | 避免扩展长中文标签把 `FPS:`/`Pre:`/`GPU:` 核心数值右推过远 |
 | 分组间距 `gapBefore` | `np_build.cpp` 四个分组依次传 **`0.0f`（帧率与延迟）/ `9.0f`（CPU）/ `3.0f`（GPU）/ `9.0f`（系统）** | ⚠ 这几个值**没有乘 `scale`**，与 `Layout()` 里其他间距的处理不一致（见 `COMMON.md` 教训清单）；首行不计 `gapBefore` |
 | 圆角半径 | `11.0f * scale` | 底板是**带轻微圆角**的矩形（与源码注释"方角"不一致，以代码为准） |
 
@@ -695,23 +695,20 @@ unit == 1（百分比）→ 再夹到 [0, 100]，且保证 yMax - yMin >= 1
 **没有 Y 轴刻度**（金属 HUD 的做法：区间数值给在方括号里）。采样点**铺满整个宽度**，
 不按固定时间轴（否则数据不足时线只挤在右边缘，看起来像坏了）。
 
-### 8.3 行配色（`np_panel.cpp` `LevelRGB()`）—— 与 `NPConfig` 颜色的关系
+### 8.3 行配色（`np_panel.cpp` `LevelRGB()` Apple System Colors）—— 与 `NPConfig` 的关系
 
 | `PanelLevel` | 值 | RGB | 用途 |
 | --- | --- | --- | --- |
-| `PL_NORMAL` | 0 | `0.93,0.93,0.93` | 普通行（近白） |
-| `PL_ACCENT` | 1 | `1.00,0.78,0.35` | 琥珀（RT/Tensor/AI 模块） |
-| `PL_WARN` | 2 | `1.00,0.42,0.42` | 红（热点/结温 > 95℃、显存/内存 > 92%） |
-| `PL_DIM` | 3 | `0.62,0.62,0.62` | 灰（次要信息） |
-| `PL_FPS` | 4 | `0.95,0.95,0.95` | 白（FPS） |
-| `PL_CPU` | 5 | `0.39,0.65,1.00` | 蓝（CPU 侧全部指标） |
-| `PL_GPU` | 6 | `0.49,0.85,0.49` | 绿（GPU 侧全部指标） |
-| `PL_MEM` | 7 | `0.95,0.95,0.95` | 白（帧时间等"总量"指标） |
+| `PL_NORMAL` | 0 | `0.92,0.92,0.94` | 扩展行标准近白（`#EBEBF0`） |
+| `PL_ACCENT` | 1 | `1.00,0.62,0.04` | Apple Orange `#FF9F0A`（高温预警 / AI 模块） |
+| `PL_WARN` | 2 | `1.00,0.27,0.23` | Apple Red `#FF453A`（超阈值极值 / 合成模式 / 告警） |
+| `PL_DIM` | 3 | `0.60,0.60,0.62` | Apple Secondary `#98989D`（次要信息） |
+| `PL_FPS` | 4 | `0.96,0.96,0.97` | Apple Label `#F5F5F7`（FPS 核心行） |
+| `PL_CPU` | 5 | `0.16,0.59,1.00` | Apple Blue `#2997FF`（`Pre:` 核心行及示波器主通道 / 桌面 CPU 线） |
+| `PL_GPU` | 6 | `0.19,0.82,0.35` | Apple Green `#30D158`（`GPU:`、`[VRAM]` 及示波器副通道） |
+| `PL_MEM` | 7 | `0.96,0.96,0.97` | Apple Label `#F5F5F7`（`Mem:` 内存列） |
 
-**这些颜色是硬编码的** —— 所以 `cfg.textColor` / `accentColor` / `warnColor`
-**写了也没用**（渲染器不读）。`cfg.bgColor` 是唯一真正生效的颜色。
-标签色固定 `0.95,0.95,0.95` × `textOpacity`；`hint`（如「低延迟」）固定亮黄
-`1.00,0.85,0.15`。**要恢复可配置颜色，改这里 + 让 `mk()` 接收 `cfg` 的颜色。**
+主题背景由 `ThemeFor()` 决定（0=Metal 黑 / 1=液态暗灰 / 2=浅雾透明 / 3=极简纯字阴影文字）。`cfg.textColor` / `accentColor` / `warnColor` 不再生效。
 
 ---
 
@@ -747,6 +744,13 @@ unit == 1（百分比）→ 再夹到 [0, 100]，且保证 yMax - yMin >= 1
    并想清楚它**该不该**持久化（见 §2.4）。
 
 ---
+
+### 7.x 新增计数器位与预设（保持 53 位精度安全范围）
+
+* `NP_C_BOTTLENECK` (`1ull << 35`)：通过 `np::NPComputeBottleneck()` 实时评估 GPU/CPU/帧率上限瓶颈或平衡状态并着色渲染。
+* `NP_C_CLOCK_TIME` (`1ull << 36`)：显示本地系统实时时钟 `HH:MM:SS`。
+* `NP_PRESET_MINIMAL` (`8` 项 Metal 核心) / `NP_PRESET_STANDARD` (`NP_ALL_COUNTERS`, `24` 项) / `NP_PRESET_TUNING` (`32` 项) / `NP_PRESET_FULL` (全部 `37` 项)。
+* Apple Metal Performance HUD 排版：2 行设备顶栏（`gpuHeaderLeft`+`gpuHeaderRight`、`modeHeaderPrefix`+`modeHeaderTag`+`modeHeaderRight`）、核心 4 行（`FPS:` / `Pre:` / `GPU:` / `Mem:` 带右侧 `[min max]` 与 `[VRAM]` 对齐列）、全宽 10 格双通道示波器图（`dualChart`：游戏内 `Pre` 蓝 + `GPU` 绿；桌面 `CPU%` 蓝 + `GPU%` 绿）以及图下方分段子标题（`splitSubHeader`）与精简扩展表；可选行内小图仅在勾选 `NP_C_CHART_*` 时绘制，桌面/游戏外延统一按 `ThemeFor` 4 套 Apple 材质与 `LayoutHorizontalChips` 横向条输出。
 
 ## 10. 未确认 / 需要进一步核实的事项
 

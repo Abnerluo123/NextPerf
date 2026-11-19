@@ -124,18 +124,33 @@ static int ClassifyEvent(PEVENT_RECORD ev, uint8_t* opOut, wchar_t* nameOut, siz
 }
 
 std::string EtwMonitor::diagText() const {
+    auto* self = const_cast<EtwMonitor*>(this);
+    uint32_t recv = 0, pidMatch = 0, otherPid = 0, id171 = 0, id172 = 0, id184 = 0;
+    DiagEv seen[12]{};
+    int seenN = 0;
+    EnterCriticalSection(&self->lock_);
+    recv = diagRecv_;
+    pidMatch = diagPidMatch_;
+    otherPid = diagOtherPid_;
+    id171 = diagId171_;
+    id172 = diagId172_;
+    id184 = diagId184_;
+    seenN = diagSeenN_ < 12 ? diagSeenN_ : 12;
+    for (int i = 0; i < seenN; ++i) seen[i] = diagSeen_[i];
+    LeaveCriticalSection(&self->lock_);
+
     char buf[700];
     int off = snprintf(buf, sizeof(buf),
                        "收到事件 %u（头部 pid 命中 %u / 不命中 %u）| 目标进程 Present 家族计数: "
                        "171(PresentHistory_Start)=%u 172(Info)=%u 184(Present_Info)=%u | ID 直方图: ",
-                       diagRecv_, diagPidMatch_, diagOtherPid_, diagId171_, diagId172_, diagId184_);
-    for (int i = 0; i < diagSeenN_ && off > 0 && off < (int)sizeof(buf) - 90; ++i) {
+                       recv, pidMatch, otherPid, id171, id172, id184);
+    for (int i = 0; i < seenN && off > 0 && off < (int)sizeof(buf) - 90; ++i) {
         char nm[128] = {0};
-        if (diagSeen_[i].nm[0])
-            WideCharToMultiByte(CP_UTF8, 0, diagSeen_[i].nm, -1, nm, sizeof(nm) - 1, nullptr, nullptr);
+        if (seen[i].nm[0])
+            WideCharToMultiByte(CP_UTF8, 0, seen[i].nm, -1, nm, sizeof(nm) - 1, nullptr, nullptr);
         off += snprintf(buf + off, sizeof(buf) - (size_t)off, "%sid=%u op=%u pid=%u x%u%s%s",
-                        i ? " | " : "", (unsigned)diagSeen_[i].id, (unsigned)diagSeen_[i].op,
-                        (unsigned)diagSeen_[i].pid, diagSeen_[i].n,
+                        i ? " | " : "", (unsigned)seen[i].id, (unsigned)seen[i].op,
+                        (unsigned)seen[i].pid, seen[i].n,
                         nm[0] ? " [" : "", nm[0] ? nm : "");
         if (nm[0] && off < (int)sizeof(buf) - 2) off += snprintf(buf + off, sizeof(buf) - (size_t)off, "]");
     }
@@ -145,64 +160,122 @@ std::string EtwMonitor::diagText() const {
 void __stdcall EtwMonitor::OnEvent(PEVENT_RECORD ev) {
     EtwMonitor& m = Etw();
     if (!m.active_ || !ev) return;
+
+    const auto& d = ev->EventHeader.EventDescriptor;
+    const uint32_t evPid = ev->EventHeader.ProcessId;
+    uint32_t targetPid = 0;
+    int slot = -1;
+    bool needDiagName = false;
+
     // ---- 诊断：在**任何过滤之前**先统计 + 记 ID 直方图（带事件名）（2026-10-11）
     {
+        EnterCriticalSection(&m.lock_);
+        targetPid = m.targetPid_;
         ++m.diagRecv_;
-        if (m.targetPid_ && ev->EventHeader.ProcessId == m.targetPid_) ++m.diagPidMatch_;
-        else ++m.diagOtherPid_;
-        const auto& dd = ev->EventHeader.EventDescriptor;
-        if (m.targetPid_ && ev->EventHeader.ProcessId == m.targetPid_) {
-            if (dd.Id == 171) ++m.diagId171_;
-            else if (dd.Id == 172) ++m.diagId172_;
-            else if (dd.Id == 184) ++m.diagId184_;
+        if (targetPid && evPid == targetPid) {
+            ++m.diagPidMatch_;
+            if (d.Id == 171) ++m.diagId171_;
+            else if (d.Id == 172) ++m.diagId172_;
+            else if (d.Id == 184) ++m.diagId184_;
+        } else {
+            ++m.diagOtherPid_;
         }
-        int slot = -1;
         for (int i = 0; i < m.diagSeenN_; ++i) {
-            if (m.diagSeen_[i].id == dd.Id && m.diagSeen_[i].op == dd.Opcode) { slot = i; break; }
+            if (m.diagSeen_[i].id == d.Id && m.diagSeen_[i].op == d.Opcode) { slot = i; break; }
         }
         if (slot < 0 && m.diagSeenN_ < 12) {
             slot = m.diagSeenN_++;
-            m.diagSeen_[slot] = {dd.Id, dd.Opcode, ev->EventHeader.ProcessId, 0, {}};
-            // 取一次事件名（TDH）。注意 ClassifyEvent 会把 task/opcode 名写进 nm。
-            uint8_t opTmp = 0;
-            ClassifyEvent(ev, &opTmp, m.diagSeen_[slot].nm, 40);
+            m.diagSeen_[slot] = {d.Id, d.Opcode, evPid, 0, {}};
+            needDiagName = true;
         }
         if (slot >= 0) ++m.diagSeen_[slot].n;
+        LeaveCriticalSection(&m.lock_);
     }
+    if (needDiagName) {
+        // 取一次事件名（TDH）放在锁外执行，避免阻塞消费与快照线程
+        uint8_t opTmp = 0;
+        wchar_t nmTmp[40]{};
+        ClassifyEvent(ev, &opTmp, nmTmp, 40);
+        if (nmTmp[0]) {
+            EnterCriticalSection(&m.lock_);
+            if (slot >= 0 && slot < m.diagSeenN_ &&
+                m.diagSeen_[slot].id == d.Id && m.diagSeen_[slot].op == d.Opcode) {
+                wcsncpy(m.diagSeen_[slot].nm, nmTmp, 39);
+                m.diagSeen_[slot].nm[39] = 0;
+            }
+            LeaveCriticalSection(&m.lock_);
+        }
+    }
+
     // ★ 没有目标进程时**一条都不算**。targetPid_ == 0 以前表示「全都算」，
     //   而主程序在还没注入任何游戏时正是这个状态 —— 于是全系统（桌面、浏览器、
     //   播放器）的 present 事件都被算进来，Low 帧被污染成别的程序的数字。
-    if (!m.targetPid_ || ev->EventHeader.ProcessId != m.targetPid_) return;
+    if (!targetPid || evPid != targetPid) return;
 
-    // ★ 审计修正 1（2026-10-11）：**事件优先级**。不能 171/184 都算 ——
-    //   若某游戏每帧两个事件都发，就会每帧计两次（帧率翻倍 / 帧时间减半 / Low 全错）。
-    //   171(PresentHistory_Start) 是"应用把一帧交给 DWM"，语义最准；只有该进程
-    //   从不产生 171 时才退回 184(Present_Info)。
-    //   （Spider-Man 实测：171=0、184=299/5s，正是走 184 的情形。）
-    if (ev->EventHeader.EventDescriptor.Id == 171) m.saw171_ = true;
-    else if (ev->EventHeader.EventDescriptor.Id == 184 && m.saw171_) return;
+    int verdict = -2;
+    {
+        EnterCriticalSection(&m.lock_);
+        if (!m.targetPid_ || evPid != m.targetPid_) {
+            LeaveCriticalSection(&m.lock_);
+            return;
+        }
+        // ★ 审计修正 1（2026-10-11）：**事件优先级**。不能 171/184 都算 ——
+        //   若某游戏每帧两个事件都发，就会每帧计两次（帧率翻倍 / 帧时间减半 / Low 全错）。
+        //   171(PresentHistory_Start) 是"应用把一帧交给 DWM"，语义最准；只有该进程
+        //   从不产生 171 时才退回 184(Present_Info)。
+        //   （Spider-Man 实测：171=0、184=299/5s，正是走 184 的情形。）
+        if (d.Id == 171) {
+            if (!m.saw171_) {
+                m.saw171_ = true;
+                if (m.presentN_ > 0) {
+                    // 此前已记入过 184 样本，切换优先级时重建基线防止两套时间戳混减
+                    m.lastQpc_ = 0;
+                    m.winStart_ = 0;
+                    m.winN_ = 0;
+                    m.ringN_ = m.ringW_ = 0;
+                    m.frameMs_ = m.fps_ = m.low1_ = m.low01_ = 0;
+                    m.presentN_ = 0;
+                    m.lowCalcAt_ = 0;
+                }
+            }
+        } else if (d.Id == 184 && m.saw171_) {
+            LeaveCriticalSection(&m.lock_);
+            return;
+        }
+        for (int i = 0; i < m.cacheN_; ++i) {
+            if (m.cachedKey_[i].id == d.Id && m.cachedKey_[i].ver == d.Version &&
+                m.cachedKey_[i].op == d.Opcode) {
+                verdict = m.cachedVal_[i];
+                break;
+            }
+        }
+        LeaveCriticalSection(&m.lock_);
+    }
 
     uint8_t op = 0;
     wchar_t evName[96] = {0};
-    const auto& d = ev->EventHeader.EventDescriptor;
-    int verdict = -2;
-    for (int i = 0; i < m.cacheN_; ++i) {
-        if (m.cachedKey_[i].id == d.Id && m.cachedKey_[i].ver == d.Version &&
-            m.cachedKey_[i].op == d.Opcode) {
-            verdict = m.cachedVal_[i];
-            break;
-        }
-    }
     if (verdict == -2) {
         verdict = ClassifyEvent(ev, &op, evName, 96);
-        if (verdict >= 0 && m.cacheN_ < 8) {
+        EnterCriticalSection(&m.lock_);
+        bool dupKey = false;
+        for (int i = 0; i < m.cacheN_; ++i) {
+            if (m.cachedKey_[i].id == d.Id && m.cachedKey_[i].ver == d.Version &&
+                m.cachedKey_[i].op == d.Opcode) { dupKey = true; break; }
+        }
+        if (!dupKey && verdict >= 0 && m.cacheN_ < 8) {
             m.cachedKey_[m.cacheN_] = {d.Id, d.Version, d.Opcode};
             m.cachedVal_[m.cacheN_] = (int8_t)verdict;
             ++m.cacheN_;
         }
+        LeaveCriticalSection(&m.lock_);
     }
     if (verdict != 1) return;
 
+    EnterCriticalSection(&m.lock_);
+    if (!m.targetPid_ || evPid != m.targetPid_) {
+        LeaveCriticalSection(&m.lock_);
+        return;
+    }
     // 诊断：把这个事件的名字记下来（去重，最多 6 个）。
     // 实测每帧匹配两次（120fps vs 真相 60fps），必须知道第二个是谁。
     // （命中缓存的那次不会重新取名，所以这里用 evName[0] 判空。）
@@ -216,10 +289,10 @@ void __stdcall EtwMonitor::OnEvent(PEVENT_RECORD ev) {
             ++m.evNameN_;
         }
     }
-
     // EVENT_HEADER.TimeStamp 已经是 100ns 单位的 QPC 对齐时间戳，
     // 和 QueryPerformanceCounter 同源，可以直接比较差值。
     m.OnPresent(static_cast<uint64_t>(ev->EventHeader.TimeStamp.QuadPart));
+    LeaveCriticalSection(&m.lock_);
 }
 
 ULONG __stdcall EtwMonitor::OnBuffer(PEVENT_TRACE_LOGFILEW) { return Etw().stop_ ? FALSE : TRUE; }
@@ -327,23 +400,29 @@ bool EtwMonitor::Start() {
     const size_t nameLen = (wcslen(kSessionName) + 1) * sizeof(wchar_t);
     const size_t propsLen = sizeof(EVENT_TRACE_PROPERTIES) + nameLen;
     std::vector<uint8_t> buf(propsLen, 0);
-    auto* props = reinterpret_cast<EVENT_TRACE_PROPERTIES*>(buf.data());
-    props->Wnode.BufferSize = (ULONG)propsLen;
-    props->Wnode.Flags = WNODE_FLAG_TRACED_GUID;
-    props->Wnode.ClientContext = 1;          // 1 = QPC 时间戳（我们要的就是它）
-    props->LogFileMode = EVENT_TRACE_REAL_TIME_MODE;
-    props->LoggerNameOffset = sizeof(EVENT_TRACE_PROPERTIES);
-    props->BufferSize = 64;
-    props->MinimumBuffers = 4;
-    props->MaximumBuffers = 24;
-    props->FlushTimer = 1;                   // 秒级刷新，别让事件在缓冲里躺着
-    memcpy(buf.data() + props->LoggerNameOffset, kSessionName, nameLen);
+    auto fillProps = [&]() {
+        std::fill(buf.begin(), buf.end(), 0);
+        auto* p = reinterpret_cast<EVENT_TRACE_PROPERTIES*>(buf.data());
+        p->Wnode.BufferSize = (ULONG)propsLen;
+        p->Wnode.Flags = WNODE_FLAG_TRACED_GUID;
+        p->Wnode.ClientContext = 1;          // 1 = QPC 时间戳（我们要的就是它）
+        p->LogFileMode = EVENT_TRACE_REAL_TIME_MODE;
+        p->LoggerNameOffset = sizeof(EVENT_TRACE_PROPERTIES);
+        p->BufferSize = 64;
+        p->MinimumBuffers = 4;
+        p->MaximumBuffers = 24;
+        p->FlushTimer = 1;                   // 秒级刷新，别让事件在缓冲里躺着
+        memcpy(buf.data() + p->LoggerNameOffset, kSessionName, nameLen);
+        return p;
+    };
 
     TRACEHANDLE sh = 0;
-    // 同名会话可能残留在上一次异常退出。先停掉再建。
+    EVENT_TRACE_PROPERTIES* props = fillProps();
+    // 同名会话可能残留在上一次异常退出。先停掉再重填 props 重建。
     ULONG st = StartTraceW(&sh, kSessionName, props);
     if (st == ERROR_ALREADY_EXISTS) {
         ControlTraceW(0, kSessionName, props, EVENT_TRACE_CONTROL_STOP);
+        props = fillProps();
         st = StartTraceW(&sh, kSessionName, props);
     }
     if (st != ERROR_SUCCESS) {
@@ -373,23 +452,26 @@ bool EtwMonitor::Start() {
     //                      ULONG Timeout, PENABLE_TRACE_PARAMETERS EnableParameters)
     //     过滤器描述符是放在 ENABLE_TRACE_PARAMETERS.EnableFilterDesc 里，
     //     不是第 8 个参数直接传（那是老版本 EnableTraceEx 的形式）。
-    NP_EVENT_FILTER_EVENT_ID filter{};
-    filter.FilterIn = TRUE;          // TRUE = 只保留列出的这些 ID
-    filter.Count = 3;
-    filter.Events[0] = 171;          // PresentHistory_Start（每帧一次的应用提交）
-    filter.Events[1] = 172;          // PresentHistory_Info
-    filter.Events[2] = 184;          // Present_Info
+    alignas(NP_EVENT_FILTER_EVENT_ID) uint8_t filterBuf[sizeof(NP_EVENT_FILTER_EVENT_ID) + 2 * sizeof(USHORT)]{};
+    auto* filter = reinterpret_cast<NP_EVENT_FILTER_EVENT_ID*>(filterBuf);
+    filter->FilterIn = TRUE;          // TRUE = 只保留列出的这些 ID
+    filter->Count = 3;
+    filter->Events[0] = 171;          // PresentHistory_Start（每帧一次的应用提交）
+    filter->Events[1] = 172;          // PresentHistory_Info
+    filter->Events[2] = 184;          // Present_Info
     EVENT_FILTER_DESCRIPTOR fd{};
-    fd.Ptr = (ULONGLONG)&filter;
-    fd.Size = (ULONG)(sizeof(NP_EVENT_FILTER_EVENT_ID) + (filter.Count - 1) * sizeof(USHORT));
+    fd.Ptr = (ULONGLONG)filter;
+    fd.Size = (ULONG)sizeof(filterBuf);
     fd.Type = EVENT_FILTER_TYPE_EVENT_ID;
     ENABLE_TRACE_PARAMETERS params{};
     params.Version = 2;              // ENABLE_TRACE_PARAMETERS_VERSION_2（v2 起才有 FilterDescCount）
     params.EnableFilterDesc = &fd;
     params.FilterDescCount = 1;
+    bool filterOk = true;
     ULONG en = EnableTraceEx2(sh, &kDxgKrnl, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
                               TRACE_LEVEL_INFORMATION, kKwPresent, 0, 0, &params);
     if (en != ERROR_SUCCESS) {
+        filterOk = false;
         // 过滤失败就退回不过滤（宁可多收，也别收不到）。失败原因记在 status 里，
         // 由主程序每 5 秒那行 [ETW] 打出来。
         char msg[192];
@@ -420,7 +502,7 @@ bool EtwMonitor::Start() {
         Stop();
         return false;
     }
-    SetStatus("运行中（DxgKrnl Present 事件）");
+    if (filterOk) SetStatus("运行中（DxgKrnl Present 事件）");
     return true;
 }
 
@@ -438,18 +520,35 @@ void EtwMonitor::ConsumeLoop() {
         active_ = false;
         return;
     }
-    consumer_ = h;
+    EnterCriticalSection(&lock_);
+    bool stopping = stop_;
+    if (!stopping) consumer_ = h;
+    LeaveCriticalSection(&lock_);
+    if (stopping) {
+        CloseTrace(h);
+        return;
+    }
     ProcessTrace(&h, 1, nullptr, nullptr);   // 阻塞直到 CloseTrace
-    CloseTrace(h);
+    EnterCriticalSection(&lock_);
+    TRACEHANDLE hClose = (TRACEHANDLE)consumer_;
     consumer_ = 0;
+    LeaveCriticalSection(&lock_);
+    if (hClose) CloseTrace(hClose);
 }
 
 void EtwMonitor::Stop() {
     if (!active_ && !session_) return;
     stop_ = true;
     active_ = false;
-    // 关掉消费者会让 ProcessTrace 返回
-    if (consumer_) CloseTrace((TRACEHANDLE)consumer_);
+    // 关掉消费者会让 ProcessTrace 返回；加锁原子摘除句柄防止双重 CloseTrace
+    TRACEHANDLE hClose = 0;
+    EnterCriticalSection(&lock_);
+    if (consumer_) {
+        hClose = (TRACEHANDLE)consumer_;
+        consumer_ = 0;
+    }
+    LeaveCriticalSection(&lock_);
+    if (hClose) CloseTrace(hClose);
     if (thread_) {
         WaitForSingleObject((HANDLE)thread_, 2000);
         CloseHandle((HANDLE)thread_);
@@ -467,16 +566,26 @@ void EtwMonitor::Stop() {
 }
 
 void EtwMonitor::SetTargetPid(uint32_t pid) {
-    if (pid == targetPid_) return;
     EnterCriticalSection(&lock_);
+    if (pid == targetPid_) {
+        LeaveCriticalSection(&lock_);
+        return;
+    }
     targetPid_ = pid;
     // 换目标就重建基线，否则会把两个进程的间隔算成一帧
+    saw171_ = false;
+    evNameN_ = 0;
+    diagSeenN_ = 0;
+    diagId171_ = 0;
+    diagId172_ = 0;
+    diagId184_ = 0;
     lastQpc_ = 0;
     winStart_ = 0;
     winN_ = 0;
     ringN_ = ringW_ = 0;
     frameMs_ = fps_ = low1_ = low01_ = 0;
     presentN_ = 0;
+    lowCalcAt_ = 0;
     LeaveCriticalSection(&lock_);
 }
 

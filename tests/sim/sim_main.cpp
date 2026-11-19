@@ -245,6 +245,72 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int) {
     std::string exit_reason = "unknown";
     bool stats_capped = false;
 
+    // 最近 120 帧滑动窗口：每 500ms 把真实运行指标写进窗口标题，作为 2D/3D 地面真值对照。
+    struct GtWindow {
+        enum { N = 120 };
+        double ft[N]{};
+        double cpuBusy[N]{};
+        double wait[N]{};
+        double gpu[N]{};
+        uint8_t gpuOk[N]{};
+        int pos = 0;
+        int cnt = 0;
+        ULONGLONG lastTitleTicks = 0;
+
+        void Push(const SimFrameReport& r) {
+            if (r.frame_delta_ms <= 0.0) return;
+            ft[pos] = r.frame_delta_ms;
+            double busy = r.cpu_frame_ms > r.present_ms ? (r.cpu_frame_ms - r.present_ms) : 0.0;
+            cpuBusy[pos] = busy;
+            wait[pos] = r.present_ms;
+            gpu[pos] = r.gpu_frame_ms;
+            gpuOk[pos] = r.gpu_time_valid ? 1 : 0;
+            pos = (pos + 1) % N;
+            if (cnt < N) ++cnt;
+        }
+
+        void MaybeUpdateTitle(HWND hwnd, const SimEngine* engine, ULONGLONG nowTicks) {
+            if (!hwnd || cnt <= 0 || nowTicks - lastTitleTicks < 500) return;
+            lastTitleTicks = nowTicks;
+            double sumFt = 0.0, sumCpu = 0.0, sumWait = 0.0, sumGpu = 0.0;
+            int gpuN = 0;
+            double max1 = 0.0, max2 = 0.0;
+            for (int i = 0; i < cnt; ++i) {
+                sumFt += ft[i];
+                sumCpu += cpuBusy[i];
+                sumWait += wait[i];
+                if (gpuOk[i]) {
+                    sumGpu += gpu[i];
+                    ++gpuN;
+                }
+                if (ft[i] >= max1) {
+                    max2 = max1;
+                    max1 = ft[i];
+                } else if (ft[i] > max2) {
+                    max2 = ft[i];
+                }
+            }
+            double avgFt = sumFt / (double)cnt;
+            double fps = sumFt > 0.0 ? (double)cnt * 1000.0 / sumFt : 0.0;
+            double low1Ms = (cnt >= 101 && max2 > 0.0) ? 0.5 * (max1 + max2) : max1;
+            double low1Fps = low1Ms > 0.0 ? 1000.0 / low1Ms : 0.0;
+            double avgCpu = sumCpu / (double)cnt;
+            double avgWait = sumWait / (double)cnt;
+            wchar_t gpuStr[32];
+            if (gpuN > 0) {
+                swprintf(gpuStr, 32, L"%.2fms", sumGpu / (double)gpuN);
+            } else {
+                wcscpy_s(gpuStr, L"N/A");
+            }
+            const wchar_t* apiW = strcmp(engine->BackendName(), "dx12") == 0 ? L"DX12" : L"DX11";
+            wchar_t title[256];
+            swprintf(title, 256,
+                     L"NextPerfBench [真值对照] API=%ls | FPS=%.1f | 帧时间=%.2fms | 1%%Low=%.1f | CPU=%.2fms | Wait=%.2fms | GPU=%ls",
+                     apiW, fps, avgFt, low1Fps, avgCpu, avgWait, gpuStr);
+            SetWindowTextW(hwnd, title);
+        }
+    } gtWin;
+
     SimLog("启动：api=%s pid=%lu 退出条件=%s 锁帧=%d vsync=%s 初始 %dx%d %s%s",
            engine->BackendName(), (unsigned long)GetCurrentProcessId(),
            cfg.seconds > 0 ? (std::to_string(cfg.seconds) + " 秒").c_str()
@@ -361,6 +427,10 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int) {
 
         // 记进「最近帧率」环形缓冲：status 命令会用到（只统计有间隔的帧）。
         if (r.frame_delta_ms > 0.0) SimRecentPushFrame(r.frame_delta_ms);
+        if (!cfg.hidden) {
+            gtWin.Push(r);
+            gtWin.MaybeUpdateTitle(hwnd, engine, GetTickCount64());
+        }
 
         // 5) 输出
         if (cfg.json && (total_frames % cfg.json_every == 0)) {

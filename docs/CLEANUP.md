@@ -79,7 +79,7 @@
 
 | 项 | 说明 |
 | --- | --- |
-| `%APPDATA%\NextPerf\settings.json` | `tests/verify_quit_noinject.py` 会写这个文件再删掉。⚠️ **文件名是错的**（程序读的是 `config.json`）—— 见 §7 的缺陷记录 |
+| `%APPDATA%\NextPerf\config.json` | `tests/verify_quit_noinject.py` 会先备份原文件、写入测试配置，退出后再还原（C1/C2 已修） |
 | `host_run.exe` / `sim.exe` / `simvk.exe` / `NextPerf.exe` 子进程 | 测试自己启动、自己结束；不动用户已开的进程 |
 | 测试宿主的窗口 `NpHost` / `NextPerfMainCls` | 进程结束即消失 |
 
@@ -100,6 +100,6 @@
 
 | # | 项 | 状态 |
 | --- | --- | --- |
-| C1 | **`tests/verify_quit_noinject.py` 预置了错误的文件名**：它写 `settings.json`，而程序读的是 `%APPDATA%\NextPerf\config.json` → 看护线程**永远拿不到维护目标**，用例的前置条件恒不成立（在真机上会一直打印"读不到学习记录"后继续跑，主判据可能空跑） | 🚧 **待修**（改文件名 + 顺手备份 `config.json`，因为主程序退出时会重写它） |
-| C2 | 该用例目前**没有备份 `config.json`**：主程序经「退出」路径结束时会 `AppSaveSettings()` 重写它。2026-10-11 核对过**这次没被污染**，但测试该自己保证 | 🚧 同 C1 一起修 |
+| C1 | **`tests/verify_quit_noinject.py` 预置了错误的文件名**：原写 `settings.json`，而程序读的是 `%APPDATA%\NextPerf\config.json` → 看护线程拿不到维护目标 | ✅ **已修**：已改为 `%APPDATA%\NextPerf\config.json` 并通过实测 |
+| C2 | 该用例在写入 `%APPDATA%\NextPerf\config.json` 前的备份与退出后还原 | ✅ **已修**：用例已实现备份与恢复，避免污染本机配置 |
 | C3 | 沙箱每次命令给一个独立 TEMP 并在结束后回收 → 测试**不能依赖单一日志路径** | ⚠️ 已在 `docs/TODO.md` D13 记录；新用例已按 mtime 在多候选里挑 |

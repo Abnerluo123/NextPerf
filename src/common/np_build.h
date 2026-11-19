@@ -9,5 +9,6 @@ namespace np {
 
 void BuildPanelData(PanelData& out, const NPConfig& c, const NPSensors& s, const NPTelemetry& t,
                     const NPHistory* h);
+void NPComputeBottleneck(const NPSensors& s, const NPTelemetry& t, std::wstring* label, int* level);
 
 }  // namespace np

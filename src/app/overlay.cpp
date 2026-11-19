@@ -82,16 +82,45 @@ void OverlaySetVisible(bool v) {
     ShowWindow(gHwnd, v ? SW_SHOWNOACTIVATE : SW_HIDE);
 }
 
+static UINT MonitorDpi(HWND fg, HMONITOR hm) {
+    typedef HRESULT(WINAPI *FnGetDpiForMonitor)(HMONITOR, int, UINT*, UINT*);
+    static FnGetDpiForMonitor pGetDpiForMonitor = []() {
+        HMODULE m = LoadLibraryW(L"Shcore.dll");
+        return m ? reinterpret_cast<FnGetDpiForMonitor>(GetProcAddress(m, "GetDpiForMonitor"))
+                 : nullptr;
+    }();
+    if (pGetDpiForMonitor && hm) {
+        UINT dx = 0, dy = 0;
+        if (SUCCEEDED(pGetDpiForMonitor(hm, 0 /* MDT_EFFECTIVE_DPI */, &dx, &dy)) && dx >= 96)
+            return dx;
+    }
+    typedef UINT(WINAPI *FnGetDpiForWindow)(HWND);
+    static FnGetDpiForWindow pGetDpiForWindow = []() {
+        HMODULE m = GetModuleHandleW(L"user32.dll");
+        return m ? reinterpret_cast<FnGetDpiForWindow>(GetProcAddress(m, "GetDpiForWindow"))
+                 : nullptr;
+    }();
+    if (pGetDpiForWindow && fg) {
+        UINT d = pGetDpiForWindow(fg);
+        if (d >= 96) return d;
+    }
+    UINT dpi = 96;
+    HDC scr = GetDC(fg ? fg : nullptr);
+    if (scr) {
+        dpi = (UINT)GetDeviceCaps(scr, LOGPIXELSX);
+        ReleaseDC(fg, scr);
+    }
+    return dpi >= 96 ? dpi : 96;
+}
+
 void OverlayUpdate() {
     if (!gHwnd || !gVisible) return;
     if (!npb::Factory() && !npb::GfxInit()) return;
 
     // 叠加面板跟前台窗口所在显示器走：按该显示器 DPI 用物理像素光栅化，保证清晰
     HWND fg = GetForegroundWindow();
-    UINT dpi = 96;
-    HDC scr = GetDC(fg ? fg : nullptr);
-    if (scr) { dpi = (UINT)GetDeviceCaps(scr, LOGPIXELSX); ReleaseDC(fg, scr); }
-    if (dpi < 96) dpi = 96;
+    HMONITOR hm = MonitorFromWindow(fg, MONITOR_DEFAULTTOPRIMARY);
+    UINT dpi = MonitorDpi(fg, hm);
     npb::SetRasterScale(dpi / 96.0f);
 
     NPConfig cfg = gApp.cfg;
@@ -104,8 +133,7 @@ void OverlayUpdate() {
     DrawCtx dc{&gPanel, &gPd, cfg};
     if (!gBmp.Render(w, h, DrawCb, &dc)) return;
 
-    // 定位到「前台窗口所在显示器」的右上角；坐标与尺寸都用物理像素
-    HMONITOR hm = MonitorFromWindow(fg, MONITOR_DEFAULTTOPRIMARY);
+    // 定位到「前台窗口所在显示器」的指定角落；坐标与尺寸都用物理像素
     MONITORINFO mi{};
     mi.cbSize = sizeof(mi);
     if (!GetMonitorInfoW(hm, &mi)) {
@@ -116,8 +144,11 @@ void OverlayUpdate() {
     }
     int bw = gBmp.width(), bh = gBmp.height();
     float s = npb::RasterScale();
-    int x = mi.rcMonitor.right - bw - (int)(cfg.offsetX * s);
-    int y = mi.rcMonitor.top + (int)(cfg.offsetY * s);
+    int ox = (int)(cfg.offsetX * s);
+    int oy = (int)(cfg.offsetY * s);
+    uint32_t corner = NPConfigCorner(cfg);
+    int x = (corner == 1 || corner == 3) ? (mi.rcMonitor.left + ox) : (mi.rcMonitor.right - bw - ox);
+    int y = (corner == 2 || corner == 3) ? (mi.rcMonitor.bottom - bh - oy) : (mi.rcMonitor.top + oy);
 
     POINT pt{x, y};
     SIZE sz{bw, bh};

@@ -55,7 +55,7 @@ for cand in (os.path.join(TEMP, "NextPerf.log"),
     if cand not in NP_LOG_CANDIDATES:
         NP_LOG_CANDIDATES.append(cand)
 APPDATA = os.environ.get("APPDATA", os.path.expanduser("~"))
-SETTINGS = os.path.join(APPDATA, "NextPerf", "settings.json")
+SETTINGS = os.path.join(APPDATA, "NextPerf", "config.json")
 
 
 def app_log_text():

@@ -4,6 +4,7 @@
 #include <dxgi1_6.h>
 #include <d3d11.h>
 #include <d3d12.h>
+#include <tlhelp32.h>
 
 #include <atomic>
 #include <algorithm>
@@ -36,9 +37,11 @@ enum SwapChain {
     GetBuffer = 9,
     GetFullscreenState = 11,
     GetDesc = 12,
+    ResizeBuffers = 13,
     GetHwnd = 20,                      // IDXGISwapChain1
     Present1 = 22,                     // IDXGISwapChain1
     GetCurrentBackBufferIndex = 36,    // IDXGISwapChain3
+    ResizeBuffers1 = 39,               // IDXGISwapChain3
 };
 enum Factory {
     CreateSwapChain = 10,
@@ -80,12 +83,15 @@ enum CommandList {
 #define TS_BATCH_BASE   0
 #define TS_BATCH_PAIRS  16     // 槽 0..31，最多夹 16 批
 #define TS_RT_BASE      32
-#define TS_RT_PAIRS     8      // 槽 32..47
-#define TS_AI_START     48
-#define TS_AI_END       49
+#define TS_RT_PAIRS     8      // 槽 32..47（光线追踪 / BVH 构建）
+#define TS_AI_BASE      48
+#define TS_AI_PAIRS     8      // 槽 48..63（后处理 / AI compute dispatch）
 
 typedef HRESULT(__stdcall* FnPresent)(IDXGISwapChain*, UINT, UINT);
 typedef HRESULT(__stdcall* FnPresent1)(IDXGISwapChain1*, UINT, UINT, const DXGI_PRESENT_PARAMETERS*);
+typedef HRESULT(__stdcall* FnResizeBuffers)(IDXGISwapChain*, UINT, UINT, UINT, DXGI_FORMAT, UINT);
+typedef HRESULT(__stdcall* FnResizeBuffers1)(IDXGISwapChain3*, UINT, UINT, UINT, DXGI_FORMAT, UINT,
+                                             const UINT*, IUnknown* const*);
 typedef void(__stdcall* FnECL)(ID3D12CommandQueue*, UINT, ID3D12CommandList* const*);
 typedef void(__stdcall* FnDispatchRays)(ID3D12GraphicsCommandList4*, const D3D12_DISPATCH_RAYS_DESC*);
 typedef void(__stdcall* FnBuildAS)(ID3D12GraphicsCommandList4*,
@@ -109,6 +115,10 @@ extern "C" {
 HRESULT __stdcall NpPresent(IDXGISwapChain* sc, UINT sync, UINT flags);
 HRESULT __stdcall NpPresent1(IDXGISwapChain1* sc, UINT sync, UINT flags,
                              const DXGI_PRESENT_PARAMETERS* pp);
+HRESULT __stdcall NpResizeBuffers(IDXGISwapChain* sc, UINT count, UINT w, UINT h, DXGI_FORMAT fmt,
+                                  UINT flags);
+HRESULT __stdcall NpResizeBuffers1(IDXGISwapChain3* sc, UINT count, UINT w, UINT h, DXGI_FORMAT fmt,
+                                   UINT flags, const UINT* nodeMask, IUnknown* const* queues);
 void __stdcall NpECL(ID3D12CommandQueue* q, UINT n, ID3D12CommandList* const* lists);
 void __stdcall NpDispatchRays(ID3D12GraphicsCommandList4* cl, const D3D12_DISPATCH_RAYS_DESC* d);
 void __stdcall NpBuildAS(ID3D12GraphicsCommandList4* cl,
@@ -300,9 +310,11 @@ ID3D12CommandQueue*  gQueue12 = nullptr;
 // 工厂钩子不会再被调用」时唯一能把 Present 挂上去的办法。
 // blt / flip / composition 可能是不同的类（vtable 不同），所以存成一张小表。
 struct SwapVtEntry {
-    void**     vt = nullptr;
-    FnPresent  origPresent = nullptr;
-    FnPresent1 origPresent1 = nullptr;
+    void**           vt = nullptr;
+    FnPresent        origPresent = nullptr;
+    FnPresent1       origPresent1 = nullptr;
+    FnResizeBuffers  origResize = nullptr;
+    FnResizeBuffers1 origResize1 = nullptr;
 };
 #define NP_MAX_SWAPVT 4
 SwapVtEntry gSwapVts[NP_MAX_SWAPVT];
@@ -474,8 +486,12 @@ static void ProbeDisplayEventSources(IDXGISwapChain* sc) {
 //  游戏若启用 Reflex，会自己打 sim/submit/present 的标记，我们直接读它，
 //  这才是权威的 CPU 帧时间拆分（我们原来的公式只能算 Present 之间的残差）。
 np::ReflexReader gReflex;
-void*            gReflexDev = nullptr;   // D3D 设备（AddRef 后长期持有，不释放）
+void*            gReflexDev = nullptr;   // D3D 设备（AddRef 后持有，自卸载时释放）
 bool             gReflexTried = false;
+ID3D12InfoQueue* gInfoQueue12 = nullptr;
+UINT64           gInfoQueueSeen = 0;
+int              gInfoQueueDumped = 0;
+bool             gInfoQueueTried = false;
 uint64_t gCpuStartQpc = 0;
 // 上一帧卡在原始 Present 调用里的时长（主要是等垂直同步）
 float    gLastInPresentMs = 0.0f;
@@ -489,9 +505,8 @@ np::FrameStats gStats;
 // 会被**游戏的多个提交线程**同时调用，而 Present 线程同时在读并清零它们：
 // 普通变量的「读-改-写」既会丢计数，也是 C++ 层面的数据竞争（未定义行为）。
 // 换成原子变量（relaxed 就够，只是计数，不需要排序语义）。
-std::atomic<uint32_t> gDraws{0}, gDispatches{0}, gRtDispatches{0}, gAsBuilds{0};
+std::atomic<uint32_t> gDraws{0}, gDispatches{0}, gRtDispatches{0}, gAiDispatches{0}, gAsBuilds{0};
 uint32_t gVpW = 0, gVpH = 0;   // 只由写 vtable 钩子的提交线程写、Present 线程读，属 32 位标量竞态，影响可忽略
-bool     gAiSpanOpen = false;
 
 // D3D12 时间戳
 ID3D12QueryHeap* gHeap = nullptr;
@@ -499,23 +514,19 @@ ID3D12Resource*  gReadback[4]{};
 ID3D12Fence*     gFence = nullptr;
 UINT64           gFenceVal = 0;
 uint64_t         gTsFreq = 0;
-// 分配器环形缓冲。
-// 一帧里的用量：每批 GPU 时间戳要 2 次（起止各一次），再加 Present 里的 resolve
-// 和叠加录制。批次多的时候十几个很正常，所以给足 —— 只给 3 或 8 会让 GPU 稍微
-// 落后就全部「busy」，然后 BeginList 一路返回 nullptr，叠加**永久停画**。
 #define NP_ALLOC_RING 32
-ID3D12CommandAllocator*  gAlloc[NP_ALLOC_RING]{};
+ID3D12CommandAllocator*    gAlloc[NP_ALLOC_RING]{};
 ID3D12GraphicsCommandList* gList = nullptr;
-UINT64           gAllocFence[NP_ALLOC_RING]{};
-int              gAllocCur = 0;
-uint32_t         gBeginListFails = 0;   // 连续拿不到分配器的次数
+UINT64                     gAllocFence[NP_ALLOC_RING]{};
+int                        gAllocCur = 0;
+uint32_t                   gBeginListFails = 0;
 
 struct Pending {
-    bool    busy = false;
-    UINT64  fenceVal = 0;
+    bool     busy = false;
+    UINT64   fenceVal = 0;
     uint32_t rtCount = 0;
+    uint32_t aiCount = 0;
     uint32_t batchCount = 0;
-    bool    aiUsed = false;
 };
 Pending gPending[4];
 
@@ -761,13 +772,13 @@ bool OpenIpc() {
 NPConfig Cfg() {
     NPConfig c{};
     NPDefaultConfig(&c);
-    if (gCfg && gCfg->magic == NP_MAGIC) c = *gCfg;
+    if (gCfg && gCfg->magic == NP_MAGIC && gCfg->size == sizeof(NPConfig)) c = *gCfg;
     return c;
 }
 NPSensors Sens() {
     NPSensors s{};
     NPClearSensors(&s);
-    if (gSens && gSens->magic == NP_MAGIC && gSens->valid) s = *gSens;
+    if (gSens && gSens->magic == NP_MAGIC && gSens->version == sizeof(NPSensors) && gSens->valid) s = *gSens;
     return s;
 }
 
@@ -934,36 +945,47 @@ void HarvestTimestamps() {
             UINT64 b = ts[TS_RT_BASE + k * 2 + 1];
             if (b > a) rtMs += (double)(b - a) * 1000.0 / (double)gTsFreq;
         }
-        if (p.aiUsed && ts[TS_AI_END] > ts[TS_AI_START])
-            aiMs = (double)(ts[TS_AI_END] - ts[TS_AI_START]) * 1000.0 / (double)gTsFreq;
+        for (uint32_t k = 0; k < p.aiCount && k < TS_AI_PAIRS; ++k) {
+            UINT64 a = ts[TS_AI_BASE + k * 2];
+            UINT64 b = ts[TS_AI_BASE + k * 2 + 1];
+            if (b > a) aiMs += (double)(b - a) * 1000.0 / (double)gTsFreq;
+        }
         gReadback[i]->Unmap(0, nullptr);
 
         if (gpuMs > 0 && gpuMs < 1000.0) gTel->gpuFrameMs = (float)gpuMs;
         gTel->rtGpuMs = (float)rtMs;
         gTel->aiGpuMs = (float)aiMs;
         gTel->rtDispatches = p.rtCount;
-        // RT / Tensor 的百分比统一在 UpdateTelemetryCommon 里按**帧周期**算
-        // （见那里的说明：用 gpuFrameMs 当分母会严重低估）
         gTel->rtMeasured = p.rtCount ? 1 : 0;
-        gTel->tensorMeasured = (p.aiUsed && aiMs > 0.0) ? 1 : 0;
+        gTel->tensorMeasured = (p.aiCount > 0 && aiMs > 0.0) ? 1 : 0;
     }
 }
 
-void SubmitPendingResolve(ID3D12CommandQueue* q, uint32_t rtCount, bool aiUsed,
+void SubmitPendingResolve(ID3D12CommandQueue* q, uint32_t rtCount, uint32_t aiCount,
                           uint32_t batchCount) {
+    uint32_t rtN = std::min<uint32_t>(rtCount, TS_RT_PAIRS);
+    uint32_t aiN = std::min<uint32_t>(aiCount, TS_AI_PAIRS);
+    if (rtN == 0 && aiN == 0) return;
+
     int idx = -1;
     for (int i = 0; i < 4; ++i)
         if (!gPending[i].busy) { idx = i; break; }
     if (idx < 0) return;
     ID3D12GraphicsCommandList* l = BeginList();
     if (!l) return;
-    l->ResolveQueryData(gHeap, D3D12_QUERY_TYPE_TIMESTAMP, 0, TS_SLOTS, gReadback[idx], 0);
+    // 仅回读实际写入过的查询槽位，避免 D3D12 验证层对未写入槽位的 ResolveQueryData 报错
+    if (rtN > 0)
+        l->ResolveQueryData(gHeap, D3D12_QUERY_TYPE_TIMESTAMP, TS_RT_BASE, rtN * 2,
+                            gReadback[idx], (UINT64)TS_RT_BASE * 8);
+    if (aiN > 0)
+        l->ResolveQueryData(gHeap, D3D12_QUERY_TYPE_TIMESTAMP, TS_AI_BASE, aiN * 2,
+                            gReadback[idx], (UINT64)TS_AI_BASE * 8);
     EndList(q);
     gPending[idx].busy = true;
     gPending[idx].fenceVal = gFenceVal;
-    gPending[idx].rtCount = rtCount;
+    gPending[idx].rtCount = rtN;
+    gPending[idx].aiCount = aiN;
     gPending[idx].batchCount = batchCount;
-    gPending[idx].aiUsed = aiUsed;
 }
 
 // ---------------------------------------------------------------------------
@@ -1132,6 +1154,33 @@ void UpdateTelemetryCommon(const NPConfig& cfg, uint64_t nowQpc, bool realPresen
         t.tensorLoad = t.aiGpuMs / t.frameMs * 100.0f;
     }
     t.fpsAvg = gStats.avgFps(600);
+    {
+        double fpsRef = t.fpsAvg > 1.0f ? (double)t.fpsAvg : 60.0;
+        uint32_t n1s = std::clamp((uint32_t)(fpsRef * 1.0), 20u, np::FrameStats::kCap);
+        uint32_t n3s = std::clamp((uint32_t)(fpsRef * 3.0), 60u, np::FrameStats::kCap);
+        t.fpsLow1 = gStats.lowPercentileFps(99.0f, n1s);
+        t.fpsLow01 = gStats.lowPercentileFps(99.9f, n3s);
+        if (t.fpsAvg > 0.0f && t.fpsLow1 > t.fpsAvg) t.fpsLow1 = t.fpsAvg;
+        if (t.fpsLow01 > t.fpsLow1) t.fpsLow01 = t.fpsLow1;
+    }
+    // ★ ETW 中继（2026-10-11）：主程序把**显示侧**的 (1%Low, 0.1%Low, 帧时间) 放进
+    //   NPConfig.reserved[]，新鲜就覆盖钩子自己的值 —— 否则**游戏内面板**画的还是
+    //   钩子那套"挂钩 Present"的脏样本。
+    {
+        float l1 = 0, l01 = 0, fms = 0;
+        NPConfig rc = Cfg();
+        if (NPConfigGetEtwRelay(&rc, (uint32_t)GetTickCount(), &l1, &l01, &fms)) {
+            if (l1 > 0.1f) {
+                t.fpsLow1 = l1;
+                t.fpsLow01 = (l01 > 0.1f) ? l01 : l1;
+            }
+            if (fms > 0.02f && fms < 1000.0f) {
+                t.frameMs = fms;
+                t.frameMsAvg = fms;
+                t.fps = 1000.0f / fms;
+            }
+        }
+    }
     // ★ Low 帧口径：**百分位**（与 NVIDIA 驱动面板 / FrameView 一致）
     //   实测驱动面板 1% = 59、本程序 = 30，差异就来自口径：
     //     按帧数(P99)  : 掉垂直同步的帧若不足 1%，P99 落在正常帧上 -> 60
@@ -1278,52 +1327,6 @@ void UpdateTelemetryCommon(const NPConfig& cfg, uint64_t nowQpc, bool realPresen
     //
     // 回看长度按帧率换算成约 10 秒：不能太长，否则一次卡顿会「钉住」很久
     //（用户为此吃过亏：68 秒回看会让数值钉住近 70 秒）。
-    {
-        double fpsRef = t.fpsAvg > 1.0f ? (double)t.fpsAvg : 60.0;
-        // ★ Low 口径 = **照抄 Intel PresentMon 的动态查询实现**（2026-10-11 复核它的源码后定的；
-        //   之前我们自己发明的"1000ms 窗口平均 + 取最差窗口"、以及 250ms/30s 都不是它的做法）。
-        //
-        //   * 窗口：**滑动 1000ms**（`--window-size` 默认值，SampleClient/CliOptions.h:49），
-        //     **每个轮询（每帧）都重算** —— PresentMonMiddleware/DynamicQuery.cpp:
-        //         newest = now − windowOffset;   oldest = newest − windowSize;
-        //   * 统计：在**窗口内的样本**上**直接取百分位** —— 没有"先把窗口求平均"这一步：
-        //       Core/source/pmon/StatisticsTracker.cpp 与
-        //       PresentMonMiddleware/DynamicStat.cpp::InputSortedSamples：
-        //         h = p × (N − 1);  i = floor(h);  g = h − i;  q = x[i] + g·(x[i+1] − x[i])
-        //     （我们的 percentileMs() 与它逐字一致：index = p/100 × (take−1) + 线性插值）
-        //   * 倒数指标排名反转（DynamicStat.cpp:323 `AdjustPercentileForReciprocation_`）：
-        //         FPS 的 P1 ≡ 帧时间的 P99 → 1% Low = 1000 / P99(帧时间)
-        //   * `1%` / `0.1%` = 同一个 1 秒窗口内的 p = 0.99 / 0.999
-        //     （PresentMon 有 PM_STAT_PERCENTILE_99；0.999 按同一定义补）
-        //
-        //   窗口按**帧数**近似 —— 最近 1 秒收到的帧数 ≈ fpsAvg（我们只存帧时间、不存时间戳）。
-        //   于是每帧都在动、回看只有 1 秒：不会像"取最差窗口"那样钉住好几秒再跳。
-        uint32_t n1s = (uint32_t)(fpsRef * 1.0);
-        if (n1s < 20) n1s = 20;
-        if (n1s > np::FrameStats::kCap) n1s = np::FrameStats::kCap;
-        t.fpsLow1 = gStats.lowPercentileFps(99.0f, n1s);
-        t.fpsLow01 = gStats.lowPercentileFps(99.9f, n1s);
-    }
-    // ★ ETW 中继（2026-10-11）：主程序把**显示侧**的 (1%Low, 0.1%Low, 帧时间) 放进
-    //   NPConfig.reserved[]，新鲜就覆盖钩子自己的值 —— 否则**游戏内面板**画的还是
-    //   钩子那套"挂钩 Present"的脏样本（实测同一时刻：钩子 Low=39、ETW Low=59，
-    //   用户看到的就是 39）。fps 由帧时间反推，保证与帧时间自洽。
-    //   超过 1.5 秒没更新（ETW 关了 / 非管理员 / 游戏刚切）→ 自动回退钩子自己的数。
-    {
-        float l1 = 0, l01 = 0, fms = 0;
-        NPConfig rc = Cfg();
-        if (NPConfigGetEtwRelay(&rc, (uint32_t)GetTickCount(), &l1, &l01, &fms)) {
-            if (l1 > 0.1f) {
-                t.fpsLow1 = l1;
-                t.fpsLow01 = (l01 > 0.1f) ? l01 : l1;
-            }
-            if (fms > 0.02f && fms < 1000.0f) {
-                t.frameMs = fms;
-                t.frameMsAvg = fms;
-                t.fps = 1000.0f / fms;
-            }
-        }
-    }
     t.p99Ms = gStats.percentileMs(99.0f);
     t.p999Ms = gStats.percentileMs(99.9f);
 
@@ -1374,6 +1377,8 @@ void EnsureRt() {
         npb::Factory() ? 1 : 0);
 }
 
+thread_local IUnknown* gPresentTempBb = nullptr;
+
 HRESULT PresentCommon(IDXGISwapChain* sc, UINT sync, UINT flags,
                       const DXGI_PRESENT_PARAMETERS* pp, bool isP1) {
     // 原始函数按「这条交换链属于哪张 vtable」来取：blt / flip 可能是不同的类，
@@ -1410,7 +1415,18 @@ HRESULT PresentCommon(IDXGISwapChain* sc, UINT sync, UINT flags,
     if (setjmp(gJmp) != 0) {
         gJmpArmed = false;
         gInPresent = false;
+        gDbgInPresent = 0;
+        gNpCountingOverlayDraws = false;
         gPresentEnterMs.store(0);
+        if (gPresentTempBb) {
+            gPresentTempBb->Release();
+            gPresentTempBb = nullptr;
+        }
+        if (gD12Locked) {
+            gD12Broken.store(true, std::memory_order_release);
+            gD12Locked = false;
+            gD12Lock.unlock();
+        }
         return CallOriginal();
     }
     gJmpArmed = true;
@@ -1419,6 +1435,7 @@ HRESULT PresentCommon(IDXGISwapChain* sc, UINT sync, UINT flags,
     uint64_t now = NowQpc();
     uint32_t seq = ++gSeq;
     NPConfig cfg = Cfg();
+    const bool paused = (cfg.pauseHook != 0);
 
     // ---- 首次接入：识别设备
     // 注：GetDevice / GetImmediateContext 本身就会 AddRef，设备与上下文是安全的。
@@ -1427,7 +1444,7 @@ HRESULT PresentCommon(IDXGISwapChain* sc, UINT sync, UINT flags,
         if (SUCCEEDED(sc->GetDevice(IID_PPV_ARGS(&gDev11))) && gDev11) {
             gApi = NP_API_D3D11;
             gDev11->GetImmediateContext(&gCtx11);
-            gOv11.Init(gDev11);
+            if (gOv11.Init(gDev11) && gTel) gTel->hookFlags |= NP_HOOK_OVERLAY;
             InitTs11(gDev11);
         } else if (SUCCEEDED(sc->GetDevice(IID_PPV_ARGS(&gDev12))) && gDev12) {
             gApi = NP_API_D3D12;
@@ -1624,7 +1641,7 @@ HRESULT PresentCommon(IDXGISwapChain* sc, UINT sync, UINT flags,
         // 超过 1 秒的间隔不是「一帧」，是切出去/加载/挂起留下的空档。
         // 把它塞进统计会把 1% Low / 0.1% Low 直接拖到个位数 ——
         // 用户看到「稳定 60fps 却显示 1% Low = 10」就是这么来的。
-        if (!gAbsorbThisPresent && fm > 0.02f && fm < 1000.0f) {
+        if (!paused && !gAbsorbThisPresent && fm > 0.02f && fm < 1000.0f) {
             gTel->frameMs = fm;
             gStats.push(fm);
             gTel->frameTotal++;
@@ -1689,7 +1706,7 @@ HRESULT PresentCommon(IDXGISwapChain* sc, UINT sync, UINT flags,
     // 我们的启发式 sim/submit 只是"猜"（用钩子时刻近似），而 Reflex 的标记是
     // **游戏自己报的**：模拟起止、渲染提交起止，都是权威值。
     // 接口 ID 0x1a587f9c 来自 Intel PresentMon 的 nvapi_interface_table.h。
-    if (realPresent && sc) {
+    if (!paused && realPresent && sc) {
         if (!gReflexDev && !gReflexTried) {
             gReflexTried = true;
             void* dev = nullptr;
@@ -1812,23 +1829,14 @@ HRESULT PresentCommon(IDXGISwapChain* sc, UINT sync, UINT flags,
     }
 
     // 图表历史：每 8 帧采一个点，256 点 ≈ 144FPS 下 14 秒 / 60FPS 下 34 秒
-    if ((gTel->frameTotal & 7u) == 0) {
+    if (!paused && (gTel->frameTotal & 7u) == 0) {
         const NPSensors& ss = Sens();
         gHist.sampleMs = (uint32_t)std::max(8.0, 8000.0 / std::max(1.0f, gTel->fpsAvg));
-        // ★ GPU 曲线必须用 **PDH 的值**（ss.gpuBusyMs），不能用 gTel->gpuFrameMs。
-        //
-        //   原因：gpuFrameMs 来自钩子的「逐批 GPU 时间戳夹取」，而那套东西已经
-        //   整个拆掉了 —— 它给每一次 ExecuteCommandLists 前后各插一条时间戳，
-        //   真实游戏一帧提交十几到几十批，一帧要 32+ 个分配器，直接导致
-        //   `allocator starved` 和叠加永久停画。
-        //   拆掉之后 gpuFrameMs 就再也没人写，**恒为 0** —— 于是面板上的
-        //   数值是对的（走 s.gpuBusyMs），但曲线是**一条零线**（用户实测反馈）。
-        //   这里改成优先用 PDH 的每帧 GPU 时间，钩子那个字段只作兜底。
         float gpuSeries = (ss.gpuBusyMs >= 0.0f) ? ss.gpuBusyMs : gTel->gpuFrameMs;
         NPHistoryPush(&gHist, gTel->fps, gTel->fpsAvg, gTel->fpsLow1, gTel->fpsLow01,
-                      gTel->cpuBusyAvg, gTel->cpuWaitAvg,
-                      ss.cpuUsage, ss.gpuUsage, gTel->frameMsAvg, gTel->cpuFrameMsAvg,
-                      gpuSeries);
+                      ss.cpuUsage, ss.gpuUsage,
+                      gTel->frameMsAvg, gTel->cpuFrameMsAvg, gpuSeries,
+                      gTel->cpuBusyAvg, gTel->cpuWaitAvg);
     }
 
     // 设备移除检测：GPU 侧非法操作会导致 device removed，游戏随即自杀式退出。
@@ -1847,25 +1855,28 @@ HRESULT PresentCommon(IDXGISwapChain* sc, UINT sync, UINT flags,
     // D3D12 侧一旦出过不可恢复的错就彻底停手（gD12Broken），
     // 宁可全程没有 RT/Tensor 数据和叠加，也不能把游戏搞崩。
     bool d12ok = !gD12Broken.load(std::memory_order_acquire);
-    if (gApi == NP_API_D3D12 && gQueue12 && gHeap && d12ok) {
-        HarvestTimestamps();
-        SubmitPendingResolve(gQueue12, gRtDispatches.load(std::memory_order_relaxed), gAiSpanOpen,
-                             gBatchCount.load(std::memory_order_relaxed));
+    if (!paused) {
+        if (gApi == NP_API_D3D12 && gQueue12 && gHeap && d12ok) {
+            HarvestTimestamps();
+            SubmitPendingResolve(gQueue12, gRtDispatches.load(std::memory_order_relaxed),
+                                 gAiDispatches.load(std::memory_order_relaxed),
+                                 gBatchCount.load(std::memory_order_relaxed));
+            gRtDispatches.store(0, std::memory_order_relaxed);
+            gAiDispatches.store(0, std::memory_order_relaxed);
+        } else if (gApi == NP_API_D3D11) {
+            Ts11Tick(seq);
+        }
+    } else {
         gRtDispatches.store(0, std::memory_order_relaxed);
-        gAiSpanOpen = false;
-    } else if (gApi == NP_API_D3D11) {
-        Ts11Tick(seq);
+        gAiDispatches.store(0, std::memory_order_relaxed);
+        gDraws.store(0, std::memory_order_relaxed);
+        gDispatches.store(0, std::memory_order_relaxed);
+        gAsBuilds.store(0, std::memory_order_relaxed);
     }
-
-    // ★ 主程序停止监视时会置 pauseHook -> 不再绘制、也不再更新遥测。
-    //   原来停止监视只关掉桌面 HUD，游戏内面板照旧在画、数据照旧在读。
-    const bool paused = (cfg.pauseHook != 0);
 
     // ★ 暂停时**不再更新遥测** = 停止读取游戏数据。
     //   ⚠ 只跳过更新，**绝不能提前 return** —— PresentCommon 尾部还有一整套收尾
-    //     （gInPresent / gFrameStarted / gLastPresentQpc / gLastInPresentMs …），
-    //     从中间返回会让 gInPresent 永远为 true，之后每帧都走「已在 Present 中」
-    //     直通原函数，叠加与时间戳**永久失效**（这个坑踩过一次，下面也有注释）。
+    //     （gInPresent / gFrameStarted / gLastPresentQpc / gLastInPresentMs …）。
     if (!paused) UpdateTelemetryCommon(cfg, now, realPresent);
 
     // ---- 叠加
@@ -1873,11 +1884,8 @@ HRESULT PresentCommon(IDXGISwapChain* sc, UINT sync, UINT flags,
     // NVIDIA 驱动的崩溃点（见 np_draw.cpp 里 settle_ 置位处的说明）。
     gOv12.tickSettle();
     bool settling = gOv12.settlePending();
-    // ★ 主程序停止监视时会置 pauseHook -> **不再绘制游戏内叠加**。
-    //   原来停止监视只关掉桌面 HUD，游戏内 HUD 照旧在画：
-    //   用户点了「退出监视」，画面里却还挂着一个面板在更新，很怪。
-    bool wantOverlay = !paused && (cfg.overlayMode != 2) && (gDev11 || gDev12) &&
-                       !(gDev12 && !d12ok) && !settling;
+    bool wantOverlay = !paused && (cfg.overlayMode != 2) && (cfg.overlayMode != 3) &&
+                       (gDev11 || gDev12) && !(gDev12 && !d12ok) && !settling;
     bool panelOk = false, drawnOk = false;
     // 诊断（2026-10-11 用户报「面板闪烁」）：我们到底画进了哪几张后台缓冲？
     //   `overlay 5s` 显示 drawn=300 / skipped=0（每帧都画），人眼却看到闪烁 ——
@@ -1903,14 +1911,19 @@ HRESULT PresentCommon(IDXGISwapChain* sc, UINT sync, UINT flags,
             panelOk = (gBw > 0 && gBh > 0);
         }
         if (gBw > 0 && gBh > 0) {
+            // 四角叠加位置（cfg.fpsCap & 3u: 0=右上 1=左上 2=右下 3=左下）
+            auto cornerPos = [&](float surfW, float surfH, float ox, float oy,
+                                 float* outX, float* outY) {
+                uint32_t corner = cfg.fpsCap & 3u;
+                float px = (corner == 1 || corner == 3) ? ox : (surfW - gBw - ox);
+                float py = (corner == 2 || corner == 3) ? (surfH - gBh - oy) : oy;
+                *outX = std::max(0.0f, px);
+                *outY = std::max(0.0f, py);
+            };
             // 光栅倍率以 1080p 为基准随分辨率放大，面板在各分辨率下占屏比例一致
             float s = npb::RasterScale();
             float x = cfg.offsetX * s, y = cfg.offsetY * s;
             if (gApi == NP_API_D3D11 && gDev11 && gCtx11) {
-                // flip 模型（FLIP_DISCARD / FLIP_SEQUENTIAL）下 GetBuffer(0) 不一定是
-                // 当前正在显示的那张后台缓冲，必须问 GetCurrentBackBufferIndex()，
-                // 否则面板只会画进某一张、交替闪烁甚至完全看不见。
-                // 只有老式 blt 模型（DISCARD）才固定是 0。
                 UINT bbIndex = 0;
                 IDXGISwapChain3* sc3 = nullptr;
                 if (SUCCEEDED(sc->QueryInterface(IID_PPV_ARGS(&sc3))) && sc3) {
@@ -1920,6 +1933,7 @@ HRESULT PresentCommon(IDXGISwapChain* sc, UINT sync, UINT flags,
                 if (bbIndex < 16) ++sBbIdxHist[bbIndex];
                 ID3D11Texture2D* bb = nullptr;
                 if (SUCCEEDED(sc->GetBuffer(bbIndex, IID_PPV_ARGS(&bb))) && bb) {
+                    gPresentTempBb = bb;
                     ID3D11Device* bdev = nullptr;
                     bb->GetDevice(&bdev);
                     bool sameDev = bdev == gDev11;
@@ -1928,12 +1942,21 @@ HRESULT PresentCommon(IDXGISwapChain* sc, UINT sync, UINT flags,
                     D3D11_TEXTURE2D_DESC bd{};
                     bb->GetDesc(&bd);
                     float ns = std::clamp((float)bd.Height / 1080.0f, 1.0f, 2.5f);
-                    if (stateOk && fabsf(ns - s) > 0.05f) { npb::SetRasterScale(ns); RenderPanel(cfg); s = ns; }
-                    float px = (float)bd.Width - gBw - x;
+                    if (stateOk && fabsf(ns - s) > 0.05f) {
+                        npb::SetRasterScale(ns);
+                        RenderPanel(cfg);
+                        s = ns;
+                        x = cfg.offsetX * s;
+                        y = cfg.offsetY * s;
+                    }
+                    float px = 0.0f, py = 0.0f;
+                    cornerPos((float)bd.Width, (float)bd.Height, x, y, &px, &py);
                     if (stateOk)
                         drawnOk = gOv11.Draw(gDev11, gCtx11, bb, gBmp.pixels(), gBw, gBh,
-                                             gBmp.stride(), px, y);
+                                             gBmp.stride(), px, py);
+                    if (drawnOk && gTel) gTel->hookFlags |= NP_HOOK_OVERLAY;
                     bb->Release();
+                    gPresentTempBb = nullptr;
                 }
             } else if (gApi == NP_API_D3D12 && gDev12 && gQueue12) {
                 IDXGISwapChain3* sc3 = nullptr;
@@ -1943,8 +1966,6 @@ HRESULT PresentCommon(IDXGISwapChain* sc, UINT sync, UINT flags,
                     sc3->Release();
                 }
                 if (idx < 16) ++sBbIdxHist[idx];
-                // 交换链参数只在第一次打一条：BufferCount / SwapEffect / 格式直接决定
-                // "每帧该画进哪张缓冲"，判 bbIdx 直方图正不正常要用它做参照。
                 static bool sScDescLogged = false;
                 if (!sScDescLogged) {
                     DXGI_SWAP_CHAIN_DESC d{};
@@ -1957,39 +1978,42 @@ HRESULT PresentCommon(IDXGISwapChain* sc, UINT sync, UINT flags,
                 }
                 ID3D12Resource* bb = nullptr;
                 if (SUCCEEDED(sc->GetBuffer(idx, IID_PPV_ARGS(&bb))) && bb) {
+                    gPresentTempBb = bb;
                     ID3D12Device* bdev = nullptr;
                     bool sameDev = SUCCEEDED(bb->GetDevice(IID_PPV_ARGS(&bdev))) && bdev == gDev12;
                     if (bdev) bdev->Release();
                     if (!sameDev) { stateOk = false; }
                     D3D12_RESOURCE_DESC rd = bb->GetDesc();
+                    if (stateOk && !gOv12.OnBackBuffer(gDev12, bb, idx, (int)rd.Width,
+                                                       (int)rd.Height, rd.Format)) {
+                        stateOk = false;
+                    }
                     float ns = std::clamp((float)rd.Height / 1080.0f, 1.0f, 2.5f);
-                    if (stateOk && fabsf(ns - s) > 0.05f) { npb::SetRasterScale(ns); RenderPanel(cfg); s = ns; }
-                    float px = (float)rd.Width - gBw - x;
-                    // ★ 诊断：把 D3D12 验证层新产生的消息写进钩子日志。
-                    //   调用有没有用错，验证层说得最准 —— 不用再靠排除法猜。
+                    if (stateOk && fabsf(ns - s) > 0.05f) {
+                        npb::SetRasterScale(ns);
+                        RenderPanel(cfg);
+                        s = ns;
+                        x = cfg.offsetX * s;
+                        y = cfg.offsetY * s;
+                    }
+                    float px = 0.0f, py = 0.0f;
+                    cornerPos((float)rd.Width, (float)rd.Height, x, y, &px, &py);
                     {
-                        static ID3D12InfoQueue* sIq = nullptr;
-                        static UINT64 sSeen = 0;
-                        static int sDumped = 0;
-                        // ★ 只问一次。没装 D3D12 验证层时 QueryInterface 必然失败，
-                        //   少了这个标志就会**每帧**重试一次 —— 那是在游戏的 Present 栈里。
-                        //   本项目规矩：不要在游戏线程上做多余的活。
-                        static bool sTried = false;
-                        if (!sIq && !sTried) {
-                            sTried = true;
-                            if (FAILED(gDev12->QueryInterface(IID_PPV_ARGS(&sIq)))) sIq = nullptr;
+                        if (!gInfoQueue12 && !gInfoQueueTried) {
+                            gInfoQueueTried = true;
+                            if (FAILED(gDev12->QueryInterface(IID_PPV_ARGS(&gInfoQueue12)))) gInfoQueue12 = nullptr;
                         }
-                        if (sIq && sDumped < 40) {
-                            UINT64 n = sIq->GetNumStoredMessages();
-                            if (n > sSeen) {
-                                UINT64 from = sSeen;
-                                sSeen = n;
-                                for (UINT64 i = from; i < n && sDumped < 40; ++i, ++sDumped) {
+                        if (gInfoQueue12 && gInfoQueueDumped < 40) {
+                            UINT64 n = gInfoQueue12->GetNumStoredMessages();
+                            if (n > gInfoQueueSeen) {
+                                UINT64 from = gInfoQueueSeen;
+                                gInfoQueueSeen = n;
+                                for (UINT64 i = from; i < n && gInfoQueueDumped < 40; ++i, ++gInfoQueueDumped) {
                                     SIZE_T len = 0;
-                                    if (FAILED(sIq->GetMessage(i, nullptr, &len)) || !len) continue;
+                                    if (FAILED(gInfoQueue12->GetMessage(i, nullptr, &len)) || !len) continue;
                                     char* buf = (char*)malloc(len);
                                     if (!buf) break;
-                                    if (SUCCEEDED(sIq->GetMessage(i, (D3D12_MESSAGE*)buf, &len))) {
+                                    if (SUCCEEDED(gInfoQueue12->GetMessage(i, (D3D12_MESSAGE*)buf, &len))) {
                                         D3D12_MESSAGE* m = (D3D12_MESSAGE*)buf;
                                         Log("D3D12 validation sev=%u id=%u: %s",
                                             (unsigned)m->Severity, (unsigned)m->ID,
@@ -2003,11 +2027,12 @@ HRESULT PresentCommon(IDXGISwapChain* sc, UINT sync, UINT flags,
                     ID3D12GraphicsCommandList* l = stateOk ? BeginList() : nullptr;
                     if (l) {
                         drawnOk = gOv12.Record(gDev12, l, bb, D3D12_RESOURCE_STATE_PRESENT,
-                                               gBmp.pixels(), gBw, gBh, gBmp.stride(), px, y,
+                                               gBmp.pixels(), gBw, gBh, gBmp.stride(), px, py,
                                                (float)rd.Width, (float)rd.Height);
                         EndList(gQueue12);
                     }
                     bb->Release();
+                    gPresentTempBb = nullptr;
                 }
             }
         }
@@ -2193,6 +2218,31 @@ std::string PtrOwner(void* p) {
     return std::string(buf);
 }
 
+// 指针是否落在**我们自己**的 DLL 里。
+// 用途：读取到的「原函数」若在这里，说明上一次卸载没能还原，
+// 拿它当原函数用会调用自己（无限递归 -> 栈溢出）。用 PE 头算模块范围，不依赖 psapi。
+static bool PointsIntoOurDll(const void* p) {
+    if (!p || !gSelf) return false;
+    uintptr_t base = reinterpret_cast<uintptr_t>(gSelf);
+    auto dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
+    auto nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
+    uintptr_t a = reinterpret_cast<uintptr_t>(p);
+    return a >= base && a < base + nt->OptionalHeader.SizeOfImage;
+}
+
+bool PatchSafe(void** vt, int idx, void* hook, void** orig, const char* tag) {
+    if (!vt || idx < 0) return false;
+    void* cur = vt[idx];
+    if (PointsIntoOurDll(cur)) {
+        Log("%s: slot %d already points into our DLL (%p), skip to prevent recursion", tag, idx,
+            cur);
+        return false;
+    }
+    return Patch(vt, idx, hook, orig);
+}
+
 // 给一条交换链补 Present / Present1 补丁。返回是否（已经）挂上。
 bool PatchSwapChainVtable(IDXGISwapChain* sc) {
     if (!sc) return false;
@@ -2217,15 +2267,39 @@ bool PatchSwapChainVtable(IDXGISwapChain* sc) {
 
     SwapVtEntry& e = gSwapVts[gSwapVtCount];
     void* orig = nullptr;
-    if (!Patch(vt, Vt::SwapChain::Present, (void*)&NpPresent, &orig) || !orig) return false;
+    if (!PatchSafe(vt, Vt::SwapChain::Present, (void*)&NpPresent, &orig, "SwapChain::Present") ||
+        !orig)
+        return false;
     e.vt = vt;
     e.origPresent = (FnPresent)orig;
 
     // Present1 不一定存在（基类表可能就到不了这一格），失败也无所谓
     if (PlausibleCodePtr(pPresent1, pPresent, pGetBuf)) {
         void* o1 = nullptr;
-        if (Patch(vt, Vt::SwapChain::Present1, (void*)&NpPresent1, &o1) && o1)
+        if (PatchSafe(vt, Vt::SwapChain::Present1, (void*)&NpPresent1, &o1,
+                      "SwapChain::Present1") &&
+            o1)
             e.origPresent1 = (FnPresent1)o1;
+    }
+    void* pResize = vt[Vt::SwapChain::ResizeBuffers];
+    if (PlausibleCodePtr(pResize, pPresent, pGetBuf)) {
+        void* orsz = nullptr;
+        if (PatchSafe(vt, Vt::SwapChain::ResizeBuffers, (void*)&NpResizeBuffers, &orsz,
+                      "SwapChain::ResizeBuffers") &&
+            orsz)
+            e.origResize = (FnResizeBuffers)orsz;
+    }
+    IDXGISwapChain3* sc3 = nullptr;
+    if (SUCCEEDED(sc->QueryInterface(IID_PPV_ARGS(&sc3))) && sc3) {
+        void* pResize1 = vt[Vt::SwapChain::ResizeBuffers1];
+        if (PlausibleCodePtr(pResize1, pPresent, pResize)) {
+            void* orsz1 = nullptr;
+            if (PatchSafe(vt, Vt::SwapChain::ResizeBuffers1, (void*)&NpResizeBuffers1, &orsz1,
+                          "SwapChain::ResizeBuffers1") &&
+                orsz1)
+                e.origResize1 = (FnResizeBuffers1)orsz1;
+        }
+        sc3->Release();
     }
     ++gSwapVtCount;
     Log("swapchain vtable patched: vt=%p present=%s present1=%p (now %d)", (void*)vt,
@@ -2316,8 +2390,9 @@ bool ProbeSwapChainVtable() {
         wc.hInstance = hostExe;          // 宿主 exe，不会卸载
         wc.lpszClassName = L"NextPerfProbeWnd";
         RegisterClassExW(&wc);           // 已注册过也没关系
-        HWND hwnd = CreateWindowExW(0, L"NextPerfProbeWnd", L"", WS_POPUP, 0, 0, 8, 8, nullptr,
-                                    nullptr, hostExe, nullptr);
+        HWND hwnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, L"NextPerfProbeWnd", L"",
+                                    WS_POPUP | WS_DISABLED, -32000, -32000, 8, 8, nullptr, nullptr,
+                                    hostExe, nullptr);
 
         IDXGIFactory1* f1 = nullptr;
         IDXGIFactory2* f2 = nullptr;
@@ -2362,21 +2437,6 @@ bool ProbeSwapChainVtable() {
     return PresentHooked();
 }
 
-// 指针是否落在**我们自己**的 DLL 里。
-// 用途：InstallDxgi 读到的「原函数」若在这里，说明上一次卸载没能还原，
-// 那读到的是上一份 DLL 的钩子 —— 当成原函数用就会调用自己（无限递归 -> 栈溢出）。
-// 用 PE 头算模块范围，不依赖 psapi。
-static bool PointsIntoOurDll(const void* p) {
-    if (!p || !gSelf) return false;
-    uintptr_t base = reinterpret_cast<uintptr_t>(gSelf);
-    auto dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
-    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
-    auto nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
-    if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
-    uintptr_t a = reinterpret_cast<uintptr_t>(p);
-    return a >= base && a < base + nt->OptionalHeader.SizeOfImage;
-}
-
 bool InstallDxgi() {
     IDXGIFactory1* factory1 = nullptr;
     if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory1))) || !factory1) {
@@ -2391,28 +2451,26 @@ bool InstallDxgi() {
     }
     gFactoryVt = *reinterpret_cast<void***>(factory);
     void* orig = nullptr;
-    Patch(gFactoryVt, Vt::Factory::CreateSwapChain, (void*)&NpCreateSwapChain, &orig);
-    if (orig) gOrigCreateSC = (FnCreateSwapChain)orig;
+    if (PatchSafe(gFactoryVt, Vt::Factory::CreateSwapChain, (void*)&NpCreateSwapChain, &orig,
+                  "Factory::CreateSwapChain") &&
+        orig)
+        gOrigCreateSC = (FnCreateSwapChain)orig;
     factory->Release();
 
     IDXGIFactory2* factory2 = nullptr;
     if (SUCCEEDED(factory1->QueryInterface(IID_PPV_ARGS(&factory2))) && factory2) {
         gFactory2Vt = *reinterpret_cast<void***>(factory2);
         orig = nullptr;
-        Patch(gFactory2Vt, Vt::Factory2::CreateSwapChainForHwnd, (void*)&NpCreateSwapChainHwnd,
-              &orig);
-        if (orig && PointsIntoOurDll((void*)orig)) {
-            // 上一次卸载没还干净，这个"原函数"其实是上一份 DLL 的钩子。
-            // 拿它当原函数用 -> 调用自己 -> 无限递归 -> 栈溢出。所以宁可**不装**。
-            Log("InstallDxgi: CreateSwapChainForHwnd slot still points into our own DLL "
-                "(previous unload did NOT restore). Skipping this hook to avoid self-recursion.");
-            orig = nullptr;
-        }
-        if (orig) gOrigCreateSCHwnd = (FnCreateSwapChainHwnd)orig;
+        if (PatchSafe(gFactory2Vt, Vt::Factory2::CreateSwapChainForHwnd,
+                      (void*)&NpCreateSwapChainHwnd, &orig, "Factory2::CreateSwapChainForHwnd") &&
+            orig)
+            gOrigCreateSCHwnd = (FnCreateSwapChainHwnd)orig;
         orig = nullptr;
-        Patch(gFactory2Vt, Vt::Factory2::CreateSwapChainForComposition,
-              (void*)&NpCreateSwapChainComp, &orig);
-        if (orig) gOrigCreateSCComp = (FnCreateSwapChainComp)orig;
+        if (PatchSafe(gFactory2Vt, Vt::Factory2::CreateSwapChainForComposition,
+                      (void*)&NpCreateSwapChainComp, &orig,
+                      "Factory2::CreateSwapChainForComposition") &&
+            orig)
+            gOrigCreateSCComp = (FnCreateSwapChainComp)orig;
         factory2->Release();
     }
     factory1->Release();
@@ -2467,7 +2525,8 @@ bool EnsureD3D12Hooks(ID3D12Device* dev) {
     }
     gQueueVt = *reinterpret_cast<void***>(q);
     void* orig = nullptr;
-    if (Patch(gQueueVt, Vt::CommandQueue::ExecuteCommandLists, (void*)&NpECL, &orig))
+    if (PatchSafe(gQueueVt, Vt::CommandQueue::ExecuteCommandLists, (void*)&NpECL, &orig,
+                  "CommandQueue::ExecuteCommandLists"))
         gOrigECL = (FnECL)orig;
     if (q->GetTimestampFrequency(&gTsFreq) != S_OK || gTsFreq == 0) gTsFreq = 1000000;
     bool tsOk = InitTs12(dev, q);
@@ -2523,25 +2582,31 @@ bool EnsureD3D12Hooks(ID3D12Device* dev) {
                         PtrOwner(vt[Vt::CommandList::Dispatch]).c_str());
                     gClVt = vt;
                     void* o = nullptr;
-                    if (Patch(vt, Vt::CommandList::DispatchRays, (void*)&NpDispatchRays, &o))
+                    if (PatchSafe(vt, Vt::CommandList::DispatchRays, (void*)&NpDispatchRays, &o,
+                                  "CommandList::DispatchRays"))
                         gOrigDR = (FnDispatchRays)o;
                     o = nullptr;
-                    if (Patch(vt, Vt::CommandList::BuildRaytracingAccelerationStructure,
-                              (void*)&NpBuildAS, &o))
+                    if (PatchSafe(vt, Vt::CommandList::BuildRaytracingAccelerationStructure,
+                                  (void*)&NpBuildAS, &o, "CommandList::BuildAS"))
                         gOrigBAS = (FnBuildAS)o;
                     o = nullptr;
-                    if (Patch(vt, Vt::CommandList::Dispatch, (void*)&NpDispatch, &o))
+                    if (PatchSafe(vt, Vt::CommandList::Dispatch, (void*)&NpDispatch, &o,
+                                  "CommandList::Dispatch"))
                         gOrigDispatch = (FnDispatch)o;
                     o = nullptr;
-                    if (Patch(vt, Vt::CommandList::DrawInstanced, (void*)&NpDrawInst, &o))
+                    if (PatchSafe(vt, Vt::CommandList::DrawInstanced, (void*)&NpDrawInst, &o,
+                                  "CommandList::DrawInstanced"))
                         gOrigDrawInst = (FnDrawInst)o;
                     o = nullptr;
-                    if (Patch(vt, Vt::CommandList::DrawIndexedInstanced, (void*)&NpDrawIdx, &o))
+                    if (PatchSafe(vt, Vt::CommandList::DrawIndexedInstanced, (void*)&NpDrawIdx, &o,
+                                  "CommandList::DrawIndexedInstanced"))
                         gOrigDrawIdx = (FnDrawIdx)o;
                     // 视口能反映游戏真正在渲染多大（DLSS/FSR 超分时 < 输出分辨率），
                     // 用来填「渲染 / 输出分辨率与缩放比」。
                     o = nullptr;
-                    if (Patch(vt, Vt::CommandList::RSSetViewports, (void*)&NpSetViewports, &o) && o)
+                    if (PatchSafe(vt, Vt::CommandList::RSSetViewports, (void*)&NpSetViewports, &o,
+                                  "CommandList::RSSetViewports") &&
+                        o)
                         gOrigVP = (FnSetViewports)o;
                     gClHooked = gOrigDR != nullptr || gOrigDispatch != nullptr;
                     Log("EnsureD3D12Hooks: command-list hooks installed (rays=%d bas=%d disp=%d "
@@ -2570,6 +2635,60 @@ HRESULT __stdcall NpPresent(IDXGISwapChain* sc, UINT sync, UINT flags) {
 HRESULT __stdcall NpPresent1(IDXGISwapChain1* sc, UINT sync, UINT flags,
                              const DXGI_PRESENT_PARAMETERS* pp) {
     return PresentCommon(sc, sync, flags, pp, true);
+}
+
+static void BeforeSwapchainResize() {
+    if (gUnloading) return;
+    gVpW = 0;
+    gVpH = 0;
+    gLastPanelMs = 0;
+    gOv11.OnResizeBuffers();
+    bool lockedHere = false;
+    if (!gD12Locked) {
+        gD12Lock.lock();
+        lockedHere = true;
+    }
+    if (ID3D12Fence* f = gOv12.fence()) {
+        UINT64* pv = gOv12.fenceValuePtr();
+        if (pv && *pv > 0 && f->GetCompletedValue() < *pv) {
+            HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+            if (ev) {
+                if (SUCCEEDED(f->SetEventOnCompletion(*pv, ev)))
+                    WaitForSingleObject(ev, 200);
+                CloseHandle(ev);
+            }
+        }
+    }
+    gOv12.OnResizeBuffers();
+    if (lockedHere) gD12Lock.unlock();
+}
+
+HRESULT __stdcall NpResizeBuffers(IDXGISwapChain* sc, UINT count, UINT w, UINT h, DXGI_FORMAT fmt,
+                                  UINT flags) {
+    void** vt = sc ? *reinterpret_cast<void***>(sc) : nullptr;
+    SwapVtEntry* e = SwapVtFor(vt);
+    FnResizeBuffers orig = e ? e->origResize : nullptr;
+    BeforeSwapchainResize();
+    HRESULT hr = orig ? orig(sc, count, w, h, fmt, flags) : E_FAIL;
+    if (SUCCEEDED(hr) && !gUnloading && gTel && w && h) {
+        gTel->windowW = w;
+        gTel->windowH = h;
+    }
+    return hr;
+}
+
+HRESULT __stdcall NpResizeBuffers1(IDXGISwapChain3* sc, UINT count, UINT w, UINT h, DXGI_FORMAT fmt,
+                                   UINT flags, const UINT* nodeMask, IUnknown* const* queues) {
+    void** vt = sc ? *reinterpret_cast<void***>(sc) : nullptr;
+    SwapVtEntry* e = SwapVtFor(vt);
+    FnResizeBuffers1 orig = e ? e->origResize1 : nullptr;
+    BeforeSwapchainResize();
+    HRESULT hr = orig ? orig(sc, count, w, h, fmt, flags, nodeMask, queues) : E_FAIL;
+    if (SUCCEEDED(hr) && !gUnloading && gTel && w && h) {
+        gTel->windowW = w;
+        gTel->windowH = h;
+    }
+    return hr;
 }
 
 // 工厂钩子：游戏创建交换链后补 Present 补丁（异常一律放行，绝不影响创建）
@@ -2692,31 +2811,21 @@ inline bool CanTimestamp(ID3D12GraphicsCommandList* cl) {
 }
 
 void __stdcall NpDispatchRays(ID3D12GraphicsCommandList4* cl, const D3D12_DISPATCH_RAYS_DESC* d) {
-    // ★ 这里原来有一个「光追被提交两次」的严重 bug：
-    //   `if (CanTimestamp(...) && SehReady() && setjmp(gJmp) == 0) { ... EndQuery();
-    //      gOrigDR(cl, d); EndQuery(); ... return; }`
-    //   —— setjmp 返回非 0（即两次 EndQuery 之间出异常被 VEH longjmp 回来）时，
-    //   条件整体为假，控制流掉到下面的兜底 `gOrigDR(cl, d)`，于是**同一次
-    //   DispatchRays 被提交了两遍**，而且第一遍的 EndQuery 只插了一半
-    //   （时间戳对不齐）。光追被算两遍 = 画面错乱、GPU 侧非法查询 =
-    //   设备 removed、游戏退出。
-    //   现在改成：只要探针期间出过异常，就认定我们的时间戳插桩已经不可信，
-    //   永久关掉 D3D12 侧的插桩（gD12Broken，与 BeginList 的失败策略一致：
-    //   宁可丢数据也绝不动游戏的命令流），并且**只**原样转发一次。
+    if (gUnloading) {
+        if (gOrigDR) gOrigDR(cl, d);
+        return;
+    }
+    volatile bool calledOrig = false;
     bool faulted = false;
     if (SehReady()) {
         if (setjmp(gJmp) == 0) {
             gJmpArmed = true;
-            // ⚠ 槽位分配必须用 fetch_add 的**返回值**，不能「先 load 判断、再
-            //   fetch_add」。原来那样写，两个提交线程可以读到同一个 n，
-            //   于是同时往同一个时间戳槽里写 —— RT 占用算出垃圾值，计数也会丢。
-            //   改成先原子占号再用占到的号；号超出范围就不插桩（harvest 那边
-            //   本来就用 `k < TS_RT_PAIRS` 夹住，不会读到没写的槽）。
             if (CanTimestamp(cl)) {
                 uint32_t n = gRtDispatches.fetch_add(1, std::memory_order_relaxed);
                 if (n < TS_RT_PAIRS) {
                     uint32_t slot = TS_RT_BASE + n * 2;
                     cl->EndQuery(gHeap, D3D12_QUERY_TYPE_TIMESTAMP, slot);
+                    calledOrig = true;
                     if (gOrigDR) gOrigDR(cl, d);
                     cl->EndQuery(gHeap, D3D12_QUERY_TYPE_TIMESTAMP, slot + 1);
                     gJmpArmed = false;
@@ -2725,86 +2834,108 @@ void __stdcall NpDispatchRays(ID3D12GraphicsCommandList4* cl, const D3D12_DISPAT
             }
             // 不在插桩范围（或列表类型不允许）→ 落到下面统一原样转发
             gJmpArmed = false;
-            gJmpArmed = false;
         } else {
             faulted = true;
         }
     }
     if (faulted) {
-        // 命令列表里已经留下了半对时间戳，之后 ResolveQueryData 读它同样危险。
         gD12Broken.store(true, std::memory_order_release);
         Log("NpDispatchRays: SEH during timestamp insert -> disable D3D12 instrumentation");
         gRtDispatches.store(TS_RT_PAIRS, std::memory_order_relaxed);   // 不再插桩
+        if (!calledOrig && gOrigDR) gOrigDR(cl, d);
+        return;
     }
     if (gOrigDR) gOrigDR(cl, d);
 }
 
 void __stdcall NpBuildAS(ID3D12GraphicsCommandList4* cl,
-                         const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC* d, UINT n,
+                         const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC* d, UINT num,
                          const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC* p) {
+    if (gUnloading) {
+        if (gOrigBAS) gOrigBAS(cl, d, num, p);
+        return;
+    }
     gAsBuilds.fetch_add(1, std::memory_order_relaxed);
-    if (gOrigBAS) gOrigBAS(cl, d, n, p);
-}
-
-void __stdcall NpDispatch(ID3D12GraphicsCommandList* cl, UINT x, UINT y, UINT z) {
-    // AI 超分 / 帧生成通常发生在「所有 draw 之后」的 compute 阶段，
-    // 用一对时间戳把这段区间夹住，作为 Tensor / AI 单元的负载来源。
-    //
-    // ★ 与 NpDispatchRays 同类的坑：原来这里的 `ts` 是 setjmp 的返回值，
-    //   一旦探针中出异常，`ts` 变 false，后面的原函数调用会**再执行一遍**
-    //   本就已经转发过的 Dispatch（下面的 gOrigDispatch 在 try 段之后就调过一次）。
-    //   现在把「探针是否出异常」单独记下来，并且只转发一次。
+    volatile bool calledOrig = false;
     bool faulted = false;
     if (SehReady()) {
         if (setjmp(gJmp) == 0) {
             gJmpArmed = true;
-            if (CanTimestamp(cl) && gDraws.load(std::memory_order_relaxed) > 0 && !gAiSpanOpen) {
-                cl->EndQuery(gHeap, D3D12_QUERY_TYPE_TIMESTAMP, TS_AI_START);
-                gAiSpanOpen = true;
+            if (CanTimestamp(cl)) {
+                uint32_t n = gRtDispatches.fetch_add(1, std::memory_order_relaxed);
+                if (n < TS_RT_PAIRS) {
+                    uint32_t slot = TS_RT_BASE + n * 2;
+                    cl->EndQuery(gHeap, D3D12_QUERY_TYPE_TIMESTAMP, slot);
+                    calledOrig = true;
+                    if (gOrigBAS) gOrigBAS(cl, d, num, p);
+                    cl->EndQuery(gHeap, D3D12_QUERY_TYPE_TIMESTAMP, slot + 1);
+                    gJmpArmed = false;
+                    return;
+                }
             }
             gJmpArmed = false;
         } else {
             faulted = true;
         }
     }
-    gDispatches.fetch_add(1, std::memory_order_relaxed);
-    if (gOrigDispatch) gOrigDispatch(cl, x, y, z);
-
     if (faulted) {
-        // 探针里出过异常，命令列表上可能已经留了半对时间戳。这里绝不能再去补写
-        // 另一半（同一张坏列表上继续插桩只会更糟），也绝不能把这次 Dispatch 再
-        // 转发一遍。直接按「插桩不可信」处理：永久停手，并把 AI 区间状态复位，
-        // 否则 HarvestTimestamps 会把没写过的 TS_AI_END 当成有效结束点，
-        // 报出一个荒唐的 Tensor 占用。
-        gAiSpanOpen = false;
         gD12Broken.store(true, std::memory_order_release);
-        Log("NpDispatch: SEH during AI timestamp -> disable D3D12 instrumentation");
+        Log("NpBuildAS: SEH during timestamp insert -> disable D3D12 instrumentation");
+        gRtDispatches.store(TS_RT_PAIRS, std::memory_order_relaxed);
+        if (!calledOrig && gOrigBAS) gOrigBAS(cl, d, num, p);
         return;
     }
+    if (gOrigBAS) gOrigBAS(cl, d, num, p);
+}
 
-    // AI 区间结束时间戳
-    if (gAiSpanOpen && cl) {
-        if (SehReady() && setjmp(gJmp) == 0) {
+void __stdcall NpDispatch(ID3D12GraphicsCommandList* cl, UINT x, UINT y, UINT z) {
+    // AI 超分 / 后处理通常在首次 draw 之后调度 compute。
+    // 用 TS_AI_BASE..TS_AI_BASE+TS_AI_PAIRS*2 成对夹住每次 Dispatch 并累加耗时。
+    if (gUnloading) {
+        if (gOrigDispatch) gOrigDispatch(cl, x, y, z);
+        return;
+    }
+    gDispatches.fetch_add(1, std::memory_order_relaxed);
+    volatile bool calledOrig = false;
+    bool faulted = false;
+    if (SehReady()) {
+        if (setjmp(gJmp) == 0) {
             gJmpArmed = true;
-            cl->EndQuery(gHeap, D3D12_QUERY_TYPE_TIMESTAMP, TS_AI_END);
-            gAiSpanOpen = false;
+            if (CanTimestamp(cl) && gDraws.load(std::memory_order_relaxed) > 0) {
+                uint32_t n = gAiDispatches.fetch_add(1, std::memory_order_relaxed);
+                if (n < TS_AI_PAIRS) {
+                    uint32_t slot = TS_AI_BASE + n * 2;
+                    cl->EndQuery(gHeap, D3D12_QUERY_TYPE_TIMESTAMP, slot);
+                    calledOrig = true;
+                    if (gOrigDispatch) gOrigDispatch(cl, x, y, z);
+                    cl->EndQuery(gHeap, D3D12_QUERY_TYPE_TIMESTAMP, slot + 1);
+                    gJmpArmed = false;
+                    return;
+                }
+            }
             gJmpArmed = false;
         } else {
-            gAiSpanOpen = false;   // 状态对齐，别让下一帧继续用这个坏区间
-            gD12Broken.store(true, std::memory_order_release);
-            Log("NpDispatch: SEH during AI timestamp -> disable D3D12 instrumentation");
+            faulted = true;
         }
     }
+    if (faulted) {
+        gD12Broken.store(true, std::memory_order_release);
+        Log("NpDispatch: SEH during AI timestamp -> disable D3D12 instrumentation");
+        gAiDispatches.store(TS_AI_PAIRS, std::memory_order_relaxed);
+        if (!calledOrig && gOrigDispatch) gOrigDispatch(cl, x, y, z);
+        return;
+    }
+    if (gOrigDispatch) gOrigDispatch(cl, x, y, z);
 }
 
 void __stdcall NpDrawInst(ID3D12GraphicsCommandList* cl, UINT a, UINT b, UINT c, UINT d) {
-    if (gNpCountingOverlayDraws) { if (gOrigDrawInst) gOrigDrawInst(cl, a, b, c, d); return; }
+    if (gUnloading || gNpCountingOverlayDraws) { if (gOrigDrawInst) gOrigDrawInst(cl, a, b, c, d); return; }
     gDraws.fetch_add(1, std::memory_order_relaxed);
     if (gOrigDrawInst) gOrigDrawInst(cl, a, b, c, d);
 }
 
 void __stdcall NpDrawIdx(ID3D12GraphicsCommandList* cl, UINT a, UINT b, UINT c, INT d, UINT e) {
-    if (gNpCountingOverlayDraws) { if (gOrigDrawIdx) gOrigDrawIdx(cl, a, b, c, d, e); return; }
+    if (gUnloading || gNpCountingOverlayDraws) { if (gOrigDrawIdx) gOrigDrawIdx(cl, a, b, c, d, e); return; }
     gDraws.fetch_add(1, std::memory_order_relaxed);
     if (gOrigDrawIdx) gOrigDrawIdx(cl, a, b, c, d, e);
 }
@@ -2813,7 +2944,7 @@ void __stdcall NpSetViewports(ID3D12GraphicsCommandList* cl, UINT n, const D3D12
     // 「渲染分辨率」只在视口**长宽比和输出一致**时才认。
     // 原来取「见过的最大的视口」，结果被 shadow atlas / 后处理用的方目标骗到：
     // 用户 16:10 的屏幕上显示成 3072×3072 → 3840×2400（80%），完全是错的。
-    if (v && n && v[0].Width > 1 && v[0].Height > 1) {
+    if (!gUnloading && v && n && v[0].Width > 1 && v[0].Height > 1) {
         uint32_t w = (uint32_t)(v[0].Width + 0.5f);
         uint32_t h = (uint32_t)(v[0].Height + 0.5f);
         if (gTel && gTel->windowW && gTel->windowH) {
@@ -2839,6 +2970,298 @@ static HANDLE gInjectedMutex = nullptr;
 // 主程序已退出：摘掉全部钩子、释放资源、从宿主进程卸载本 DLL。
 // 顺序不能乱——先让跳板直通（gUnloading），再还原 vtable，
 // 短暂等待在途调用排空后才允许 FreeLibrary。
+// ---------------------------------------------------------------------------
+// Vulkan 轻量呈现钩子（通过 IAT 拦截 vkQueuePresentKHR / vkCreateSwapchainKHR / ProcAddr）
+// 只采帧时间、FPS、1%Low、0.1%Low、CPU Busy/Wait 与交换链分辨率，不改写渲染流程，
+// 桌面层（NextPerfOverlayCls）自动接管画面显示。
+// ---------------------------------------------------------------------------
+namespace {
+typedef int32_t(__stdcall* FnVkQueuePresentKHR)(void* queue, const void* presentInfo);
+typedef int32_t(__stdcall* FnVkCreateSwapchainKHR)(void* device, const void* createInfo,
+                                                    const void* alloc, void* swapchain);
+typedef void*(__stdcall* FnVkGetDeviceProcAddr)(void* device, const char* name);
+typedef void*(__stdcall* FnVkGetInstanceProcAddr)(void* instance, const char* name);
+
+struct NpVkSwapchainCreateInfoKHR {
+    uint32_t sType;
+    const void* pNext;
+    uint32_t flags;
+    uint64_t surface;
+    uint32_t minImageCount;
+    int32_t imageFormat;
+    int32_t imageColorSpace;
+    uint32_t width;
+    uint32_t height;
+};
+
+struct IatPatchEntry {
+    void** slot = nullptr;
+    void* orig = nullptr;
+};
+IatPatchEntry gVkIat[64]{};
+int gVkIatCount = 0;
+bool gVkHooked = false;
+std::atomic<bool> gVkPresentSeen{false};
+std::atomic<bool> gVkProcAddrHandedOut{false};
+FnVkQueuePresentKHR     gOrigVkQueuePresent = nullptr;
+FnVkCreateSwapchainKHR  gOrigVkCreateSwapchain = nullptr;
+FnVkGetDeviceProcAddr   gOrigVkGetDevProc = nullptr;
+FnVkGetInstanceProcAddr gOrigVkGetInstProc = nullptr;
+
+int32_t __stdcall NpVkCreateSwapchainKHR(void* device, const void* createInfo, const void* alloc,
+                                         void* swapchain) {
+    if (!gUnloading && createInfo && gTel) {
+        auto* ci = reinterpret_cast<const NpVkSwapchainCreateInfoKHR*>(createInfo);
+        if (ci->width > 1 && ci->height > 1 && ci->width < 32768 && ci->height < 32768) {
+            gTel->windowW = ci->width;
+            gTel->windowH = ci->height;
+            if (!gTel->renderW) {
+                gTel->renderW = ci->width;
+                gTel->renderH = ci->height;
+            }
+        }
+    }
+    return gOrigVkCreateSwapchain ? gOrigVkCreateSwapchain(device, createInfo, alloc, swapchain)
+                                  : -13;
+}
+
+int32_t __stdcall NpVkQueuePresentKHR(void* queue, const void* presentInfo) {
+    if (gUnloading || !gTel)
+        return gOrigVkQueuePresent ? gOrigVkQueuePresent(queue, presentInfo) : 0;
+
+    uint64_t now = NowQpc();
+    gApi = NP_API_VULKAN;
+    gVkPresentSeen.store(true, std::memory_order_relaxed);
+    gTel->attached = 1;
+    gTel->tickMs = GetTickCount64();
+    gTel->gfxApi = NP_API_VULKAN;
+    gTel->hookFlags |= NP_HOOK_PRESENT;
+    gTel->lastError[0] = 0;
+    gLastPresentMs.store(gTel->tickMs);
+    if (!gTel->processName[0]) {
+        wchar_t selfPath[MAX_PATH]{};
+        if (GetModuleFileNameW(nullptr, selfPath, MAX_PATH)) {
+            char buf[NP_NAME_LEN]{};
+            WideCharToMultiByte(CP_UTF8, 0, selfPath, -1, buf, NP_NAME_LEN - 1, nullptr, nullptr);
+            const char* slash = strrchr(buf, '\\');
+            NPCopyStr(gTel->processName, NP_NAME_LEN, slash ? slash + 1 : buf);
+        }
+    }
+
+    NPConfig cfg = Cfg();
+    const bool paused = (cfg.pauseHook != 0);
+    if (!paused && gLastPresentQpc && now > gLastPresentQpc) {
+        float fm = (float)QpcMs(now - gLastPresentQpc);
+        if (fm > 0.02f && fm < 1000.0f) {
+            gTel->frameMs = fm;
+            gStats.push(fm);
+            gTel->frameTotal++;
+            uint32_t wi = gTel->frameWrite;
+            gTel->frames[wi] = fm;
+            gTel->cpuFrames[wi] = gTel->cpuFrameMs;
+            float sysBusy = Sens().gpuBusyMs;
+            if (sysBusy >= 0.0f) gTel->gpuFrameMs = sysBusy;
+            gTel->gpuFrames[wi] = gTel->gpuFrameMs;
+            gTel->frameWrite = (wi + 1) % NP_FRAME_CAP;
+
+            static np::Ema vkMsEma(0.10f);
+            gTel->frameMsAvg = vkMsEma.update(fm);
+            gTel->fpsAvg = gStats.avgFps(600);
+            double fpsRef = gTel->fpsAvg > 1.0f ? (double)gTel->fpsAvg : 60.0;
+            uint32_t n1s = std::clamp((uint32_t)(fpsRef * 1.0), 20u, np::FrameStats::kCap);
+            uint32_t n3s = std::clamp((uint32_t)(fpsRef * 3.0), 60u, np::FrameStats::kCap);
+            gTel->fpsLow1 = gStats.lowPercentileFps(99.0f, n1s);
+            gTel->fpsLow01 = gStats.lowPercentileFps(99.9f, n3s);
+            if (gTel->fpsAvg > 0.0f && gTel->fpsLow1 > gTel->fpsAvg) gTel->fpsLow1 = gTel->fpsAvg;
+            if (gTel->fpsLow01 > gTel->fpsLow1) gTel->fpsLow01 = gTel->fpsLow1;
+            gTel->p99Ms = gStats.percentileMs(99.0f);
+            gTel->p999Ms = gStats.percentileMs(99.9f);
+
+            uint32_t gi = gTel->graphWrite;
+            gTel->graphFrame[gi] = gTel->frameMs;
+            gTel->graphCpu[gi] = gTel->cpuFrameMs;
+            gTel->graphGpu[gi] = gTel->gpuFrameMs;
+            gTel->graphWrite = (gi + 1) % NP_GRAPH_CAP;
+            if (gTel->graphCount < NP_GRAPH_CAP) ++gTel->graphCount;
+        }
+    }
+    if (!paused) {
+        static uint32_t vkWinN = 0;
+        static uint64_t vkWinT0 = 0;
+        uint64_t msNow = GetTickCount64();
+        if (!vkWinT0) vkWinT0 = msNow;
+        ++vkWinN;
+        if (msNow - vkWinT0 >= 500) {
+            gTel->fps = (float)vkWinN * 1000.0f / (float)(msNow - vkWinT0);
+            vkWinN = 0;
+            vkWinT0 = msNow;
+        }
+        float l1 = 0, l01 = 0, fms = 0;
+        if (NPConfigGetEtwRelay(&cfg, (uint32_t)GetTickCount(), &l1, &l01, &fms)) {
+            if (l1 > 0.1f) {
+                gTel->fpsLow1 = l1;
+                gTel->fpsLow01 = (l01 > 0.1f) ? l01 : l1;
+            }
+            if (fms > 0.02f && fms < 1000.0f) {
+                gTel->frameMs = fms;
+                gTel->frameMsAvg = fms;
+                gTel->fps = 1000.0f / fms;
+            }
+        }
+    }
+    gLastPresentQpc = now;
+
+    uint64_t tp0 = NowQpc();
+    int32_t res = gOrigVkQueuePresent ? gOrigVkQueuePresent(queue, presentInfo) : 0;
+    uint64_t tp1 = NowQpc();
+
+    if (!paused && gPresentRetQpc && tp1 > gPresentRetQpc) {
+        float busyMs = std::max(0.0f, (float)QpcMs(tp0 - gPresentRetQpc));
+        float waitMs = std::max(0.0f, (float)QpcMs(tp1 - tp0));
+        float totMs = busyMs + waitMs;
+        if (totMs > 0.0f && totMs < 1000.0f) {
+            static np::Ema vkBusyEma(0.10f), vkWaitEma(0.10f), vkTotEma(0.10f);
+            gTel->cpuBusyMs = busyMs;
+            gTel->cpuWaitMs = waitMs;
+            gTel->cpuFrameMs = totMs;
+            gTel->cpuBusyAvg = vkBusyEma.update(busyMs);
+            gTel->cpuWaitAvg = vkWaitEma.update(waitMs);
+            gTel->cpuFrameMsAvg = vkTotEma.update(totMs);
+        }
+    }
+    gPresentRetQpc = tp1;
+    return res;
+}
+
+void* __stdcall NpVkGetDeviceProcAddr(void* device, const char* name) {
+    void* fn = gOrigVkGetDevProc ? gOrigVkGetDevProc(device, name) : nullptr;
+    if (gUnloading || !fn || !name || PointsIntoOurDll(fn)) return fn;
+    if (strcmp(name, "vkQueuePresentKHR") == 0) {
+        gOrigVkQueuePresent = (FnVkQueuePresentKHR)fn;
+        gVkProcAddrHandedOut.store(true, std::memory_order_release);
+        return (void*)&NpVkQueuePresentKHR;
+    }
+    if (strcmp(name, "vkCreateSwapchainKHR") == 0) {
+        gOrigVkCreateSwapchain = (FnVkCreateSwapchainKHR)fn;
+        gVkProcAddrHandedOut.store(true, std::memory_order_release);
+        return (void*)&NpVkCreateSwapchainKHR;
+    }
+    return fn;
+}
+
+void* __stdcall NpVkGetInstanceProcAddr(void* instance, const char* name) {
+    void* fn = gOrigVkGetInstProc ? gOrigVkGetInstProc(instance, name) : nullptr;
+    if (gUnloading || !fn || !name || PointsIntoOurDll(fn)) return fn;
+    if (strcmp(name, "vkGetDeviceProcAddr") == 0) {
+        gOrigVkGetDevProc = (FnVkGetDeviceProcAddr)fn;
+        gVkProcAddrHandedOut.store(true, std::memory_order_release);
+        return (void*)&NpVkGetDeviceProcAddr;
+    }
+    if (strcmp(name, "vkQueuePresentKHR") == 0) {
+        gOrigVkQueuePresent = (FnVkQueuePresentKHR)fn;
+        gVkProcAddrHandedOut.store(true, std::memory_order_release);
+        return (void*)&NpVkQueuePresentKHR;
+    }
+    if (strcmp(name, "vkCreateSwapchainKHR") == 0) {
+        gOrigVkCreateSwapchain = (FnVkCreateSwapchainKHR)fn;
+        gVkProcAddrHandedOut.store(true, std::memory_order_release);
+        return (void*)&NpVkCreateSwapchainKHR;
+    }
+    return fn;
+}
+
+bool PatchModuleVkIat(HMODULE mod) {
+    if (!mod || mod == gSelf) return false;
+    BYTE* base = reinterpret_cast<BYTE*>(mod);
+    auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
+    auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
+    DWORD rva = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress;
+    if (!rva) return false;
+    bool hitAny = false;
+    auto* imp = reinterpret_cast<const IMAGE_IMPORT_DESCRIPTOR*>(base + rva);
+    for (; imp->Name; ++imp) {
+        const char* dllName = reinterpret_cast<const char*>(base + imp->Name);
+        if (_stricmp(dllName, "vulkan-1.dll") != 0) continue;
+        auto* oft = imp->OriginalFirstThunk
+                        ? reinterpret_cast<const IMAGE_THUNK_DATA*>(base + imp->OriginalFirstThunk)
+                        : reinterpret_cast<const IMAGE_THUNK_DATA*>(base + imp->FirstThunk);
+        auto* ft = reinterpret_cast<IMAGE_THUNK_DATA*>(base + imp->FirstThunk);
+        for (; oft->u1.AddressOfData && ft->u1.Function; ++oft, ++ft) {
+            if (IMAGE_SNAP_BY_ORDINAL(oft->u1.Ordinal)) continue;
+            void* curFn = reinterpret_cast<void*>(ft->u1.Function);
+            if (PointsIntoOurDll(curFn)) continue;
+            auto* byName = reinterpret_cast<const IMAGE_IMPORT_BY_NAME*>(base + oft->u1.AddressOfData);
+            const char* fnName = reinterpret_cast<const char*>(byName->Name);
+            void* hookFn = nullptr;
+            if (strcmp(fnName, "vkQueuePresentKHR") == 0) {
+                gOrigVkQueuePresent = reinterpret_cast<FnVkQueuePresentKHR>(curFn);
+                hookFn = (void*)&NpVkQueuePresentKHR;
+            } else if (strcmp(fnName, "vkCreateSwapchainKHR") == 0) {
+                gOrigVkCreateSwapchain = reinterpret_cast<FnVkCreateSwapchainKHR>(curFn);
+                hookFn = (void*)&NpVkCreateSwapchainKHR;
+            } else if (strcmp(fnName, "vkGetDeviceProcAddr") == 0) {
+                gOrigVkGetDevProc = reinterpret_cast<FnVkGetDeviceProcAddr>(curFn);
+                hookFn = (void*)&NpVkGetDeviceProcAddr;
+            } else if (strcmp(fnName, "vkGetInstanceProcAddr") == 0) {
+                gOrigVkGetInstProc = reinterpret_cast<FnVkGetInstanceProcAddr>(curFn);
+                hookFn = (void*)&NpVkGetInstanceProcAddr;
+            }
+            if (!hookFn || gVkIatCount >= 64) continue;
+            void** slot = reinterpret_cast<void**>(&ft->u1.Function);
+            if (*slot == hookFn) continue;
+            DWORD oldProt = 0;
+            if (VirtualProtect(slot, sizeof(void*), PAGE_READWRITE, &oldProt)) {
+                gVkIat[gVkIatCount++] = {slot, *slot};
+                *slot = hookFn;
+                DWORD dummy = 0;
+                VirtualProtect(slot, sizeof(void*), oldProt, &dummy);
+                hitAny = true;
+            }
+        }
+    }
+    return hitAny;
+}
+
+void InstallVulkan() {
+    if (gVkHooked) return;
+    HMODULE hVk = GetModuleHandleW(L"vulkan-1.dll");
+    if (!hVk) return;
+    if (!gOrigVkQueuePresent)
+        gOrigVkQueuePresent = reinterpret_cast<FnVkQueuePresentKHR>(GetProcAddress(hVk, "vkQueuePresentKHR"));
+    if (!gOrigVkCreateSwapchain)
+        gOrigVkCreateSwapchain = reinterpret_cast<FnVkCreateSwapchainKHR>(GetProcAddress(hVk, "vkCreateSwapchainKHR"));
+    if (!gOrigVkGetDevProc)
+        gOrigVkGetDevProc = reinterpret_cast<FnVkGetDeviceProcAddr>(GetProcAddress(hVk, "vkGetDeviceProcAddr"));
+    if (!gOrigVkGetInstProc)
+        gOrigVkGetInstProc = reinterpret_cast<FnVkGetInstanceProcAddr>(GetProcAddress(hVk, "vkGetInstanceProcAddr"));
+
+    bool patched = false;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
+    if (snap != INVALID_HANDLE_VALUE) {
+        MODULEENTRY32W me{};
+        me.dwSize = sizeof(me);
+        wchar_t winDir[MAX_PATH]{};
+        GetWindowsDirectoryW(winDir, MAX_PATH);
+        size_t winLen = wcslen(winDir);
+        if (Module32FirstW(snap, &me)) {
+            do {
+                if (winLen && _wcsnicmp(me.szExePath, winDir, winLen) == 0) continue;
+                if (PatchModuleVkIat(me.hModule)) patched = true;
+            } while (Module32NextW(snap, &me));
+        }
+        CloseHandle(snap);
+    } else {
+        patched = PatchModuleVkIat(GetModuleHandleW(nullptr));
+    }
+    if (patched) {
+        gVkHooked = true;
+        Log("InstallVulkan: IAT hooked (%d slots)", gVkIatCount);
+    }
+}
+}  // namespace
+
 // ---------------------------------------------------------------------------
 // 还原所有 vtable 补丁。**幂等**，可以安全地重复调用。
 //
@@ -2876,8 +3299,25 @@ static void RestoreAllHooks() {
         if (!e.vt) continue;
         if (e.origPresent) Patch(e.vt, Vt::SwapChain::Present, (void*)e.origPresent, nullptr);
         if (e.origPresent1) Patch(e.vt, Vt::SwapChain::Present1, (void*)e.origPresent1, nullptr);
+        if (e.origResize) Patch(e.vt, Vt::SwapChain::ResizeBuffers, (void*)e.origResize, nullptr);
+        if (e.origResize1) Patch(e.vt, Vt::SwapChain::ResizeBuffers1, (void*)e.origResize1, nullptr);
     }
     gSwapVtCount = 0;
+    for (int i = 0; i < gVkIatCount; ++i) {
+        if (!gVkIat[i].slot || !gVkIat[i].orig) continue;
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (VirtualQuery(gVkIat[i].slot, &mbi, sizeof(mbi)) && mbi.State == MEM_COMMIT) {
+            DWORD oldProt = 0;
+            if (VirtualProtect(gVkIat[i].slot, sizeof(void*), PAGE_READWRITE, &oldProt)) {
+                *gVkIat[i].slot = gVkIat[i].orig;
+                DWORD dummy = 0;
+                VirtualProtect(gVkIat[i].slot, sizeof(void*), oldProt, &dummy);
+            }
+        }
+    }
+    gVkIatCount = 0;
+    gVkHooked = false;
+    gVkPresentSeen.store(false, std::memory_order_relaxed);
     if (gFactoryVt && gOrigCreateSC)
         Patch(gFactoryVt, Vt::Factory::CreateSwapChain, (void*)gOrigCreateSC, nullptr);
     if (gFactory2Vt) {
@@ -2916,20 +3356,13 @@ static void RestoreAllHooks() {
     {
         bool clean = (gSwapVtCount == 0 && gFactoryVt == nullptr &&
                       gFactory2Vt == nullptr && gQueueVt == nullptr && gClVt == nullptr &&
-                      gSehHandle == nullptr);
+                      gSehHandle == nullptr && gVkIatCount == 0);
         Log("SELFCHECK unloadClean = %s (swapVt=%d factory=%d factory2=%d queue=%d "
-            "cmdlist=%d seh=%d)",
+            "cmdlist=%d seh=%d vkIat=%d)",
             clean ? "OK" : "FAIL", gSwapVtCount, gFactoryVt ? 1 : 0, gFactory2Vt ? 1 : 0,
-            gQueueVt ? 1 : 0, gClVt ? 1 : 0, gSehHandle ? 1 : 0);
+            gQueueVt ? 1 : 0, gClVt ? 1 : 0, gSehHandle ? 1 : 0, gVkIatCount);
     }
 }
-
-// 指针是否落在**我们自己**的 DLL 里。
-// 用途：InstallDxgi 读到的「原函数」若在这里，说明上一次卸载没能还原，
-// 那读到的是上一份 DLL 的钩子 —— 当成原函数用就会调用自己（无限递归 -> 栈溢出）。
-// 用 PE 头算模块范围，不依赖 psapi。
-
-// 用 PE 头算模块范围，不依赖 psapi。
 
 static void SelfUnloadNow() {
     gUnloading = true;
@@ -2957,6 +3390,16 @@ static void SelfUnloadNow() {
     if (gFence) { gFence->Release(); gFence = nullptr; }
     if (gCtx11) { gCtx11->Release(); gCtx11 = nullptr; }
     if (gDev11) { gDev11->Release(); gDev11 = nullptr; }
+    if (gInfoQueue12) { gInfoQueue12->Release(); gInfoQueue12 = nullptr; }
+    gInfoQueueTried = false;
+    gInfoQueueSeen = 0;
+    gInfoQueueDumped = 0;
+    if (gReflexDev) {
+        reinterpret_cast<IUnknown*>(gReflexDev)->Release();
+        gReflexDev = nullptr;
+    }
+    gReflexTried = false;
+    gReflex.Shutdown();
     if (gQueue12) { gQueue12->Release(); gQueue12 = nullptr; }
     if (gDev12) { gDev12->Release(); gDev12 = nullptr; }
 
@@ -2968,6 +3411,13 @@ static void SelfUnloadNow() {
     if (gMapTel) { CloseHandle(gMapTel); gMapTel = nullptr; }
     if (gMapSens) { CloseHandle(gMapSens); gMapSens = nullptr; }
     if (gMapCfg) { CloseHandle(gMapCfg); gMapCfg = nullptr; }
+
+    if (gVkProcAddrHandedOut.load(std::memory_order_acquire)) {
+        Log("SelfUnloadNow: Vulkan GetProcAddr pointers handed to host -> staying resident in "
+            "pass-through mode to avoid stale function pointer crash");
+        gReady = false;
+        return;
+    }
 
     FreeLibraryAndExitThread(gSelf, 0);
 }
@@ -3064,6 +3514,8 @@ static DWORD WINAPI Worker(LPVOID) {
     uint64_t probeAtMs = GetTickCount64() + (gfxUp ? 800u : 6000u);
     int probeTries = 0;
     const int kMaxProbeTries = 3;
+    int vkTries = 0;
+    uint64_t vkAtMs = 0;
     Log("attach: hostGraphicsUp=%d hostApi=%d probe at +%ums", gfxUp ? 1 : 0, gHostApi,
         gfxUp ? 800u : 6000u);
 
@@ -3150,6 +3602,14 @@ static DWORD WINAPI Worker(LPVOID) {
                                      : 0;
 
             if (!hostIsD3D) {
+                if (gHostApi == NP_API_VULKAN && !gVkHooked && vkTries < 5) {
+                    uint64_t nowMs = GetTickCount64();
+                    if (nowMs >= vkAtMs) {
+                        ++vkTries;
+                        InstallVulkan();
+                        vkAtMs = nowMs + 2000;
+                    }
+                }
                 if (probeTries >= 0) {
                     probeTries = -1;   // 只提示一次
                     Log("probe disabled: host api=%d (non-D3D), refusing to create "
@@ -3164,8 +3624,9 @@ static DWORD WINAPI Worker(LPVOID) {
             }
         }
 
-        // 挂不上 Present 也要让主程序知道我们活着、以及卡在哪（Vulkan 之类）
-        if (!PresentHooked()) PublishMinimalTelemetry();
+        // 挂不上 Present 也要让主程序知道我们活着、以及卡在哪（Vulkan 若已接管呈现则不再写错误提示）
+        if (!PresentHooked() && !gVkPresentSeen.load(std::memory_order_relaxed))
+            PublishMinimalTelemetry();
 
         if (gTel) {
             gTel->aiModules = gAiModules;
@@ -3185,7 +3646,14 @@ void NpHookAttach(HMODULE self) {
     gWorker = CreateThread(nullptr, 0, Worker, nullptr, 0, nullptr);
 }
 
-void NpHookDetach() {
+void NpHookDetach(bool processTerminating) {
+    if (processTerminating) {
+        // 进程终止路径（lpReserved != nullptr）在 OS Loader Lock 内：
+        // worker 线程可能已被系统强杀（甚至持有着 gCs/堆锁），
+        // WaitForSingleObject / Log(gCs) / DeleteCriticalSection / 改 vtable 均可能死锁。
+        gReady = false;
+        return;
+    }
     // ★ 诊断（2026-10-11 加）：这一段**只在进程正在卸载 DLL 时**才会跑（DLL_PROCESS_DETACH）。
     //   它的唯一价值是回答用户报的「关了游戏窗口，进程却退不掉」到底卡在哪：
     //     * 日志里**根本没有 "DETACH: enter"** -> 游戏卡在卸载 DLL **之前**，与我们无关

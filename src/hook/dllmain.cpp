@@ -10,14 +10,14 @@
 
 #include "np_hook.h"
 
-BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
+BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID lpReserved) {
     switch (reason) {
         case DLL_PROCESS_ATTACH:
             DisableThreadLibraryCalls(module);
             NpHookAttach(module);
             break;
         case DLL_PROCESS_DETACH:
-            NpHookDetach();
+            NpHookDetach(lpReserved != nullptr);
             break;
         default:
             break;

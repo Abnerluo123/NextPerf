@@ -111,7 +111,7 @@ public:
             if (p < end && *p == '}') { ++p; return v; }
             while (p < end) {
                 ws();
-                if (*p != '"') { ok = false; break; }
+                if (p >= end || *p != '"') { ok = false; break; }
                 std::string k = parseStr();
                 ws();
                 if (p < end && *p == ':') ++p; else { ok = false; break; }
@@ -128,6 +128,7 @@ public:
             if (p < end && *p == ']') { ++p; return v; }
             while (p < end) {
                 v.arr.push_back(parse());
+                if (!ok) break;
                 ws();
                 if (p < end && *p == ',') { ++p; continue; }
                 if (p < end && *p == ']') { ++p; }
@@ -142,6 +143,12 @@ public:
             while (p < end && (isdigit((unsigned char)*p) || *p == '.' || *p == 'e' || *p == 'E' ||
                                *p == '-' || *p == '+'))
                 ++p;
+            if (p == s) {
+                ok = false;
+                if (p < end) ++p;
+                v.type = Null;
+                return v;
+            }
             v.num = strtod(std::string(s, p).c_str(), nullptr);
             return v;
         }

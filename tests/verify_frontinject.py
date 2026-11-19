@@ -60,25 +60,18 @@ def click(hwnd, x, y):
 
 
 def button_center(hwnd):
-    """按 ui.cpp 的 Layout() 复算出「注入到前台进程」按钮的中心点（客户区坐标）。
+    """按 ui.cpp 布局复算出「注入前台游戏」按钮的中心点（客户区坐标）。
 
-    缩放不取 GetDpiForWindow —— 程序里用的是 GetDeviceCaps(LOGPIXELSX)/96，
-    两者在部分 DPI 设置下不一致。直接拿客户区宽度反推 kWinW=1000 对应的倍率，
-    这样和程序内部的 gS 一定对齐。
+    缩放直接拿客户区宽度反推 kWinW=900 对应的倍率，保证与 C++ 侧客户区比例对齐。
     """
     cr = wt.RECT()
     u32.GetClientRect(hwnd, ctypes.byref(cr))
     cw, ch = cr.right - cr.left, cr.bottom - cr.top
-    gs = cw / 1000.0
+    gs = cw / 900.0
     S = lambda v: int(v * gs + 0.5)          # noqa: E731 和 C++ 的 (int)(v*gS+0.5f) 一致
-    lx = S(20)
-    # kListH 必须和 ui.cpp 里的常量一致。列表高度一改，游戏区和按钮位置全变，
-    # 这里不同步就会点空（或点到别的东西上）。
-    KLIST_H = 400
-    game_top = S(42) + S(KLIST_H) + S(16)
-    by = game_top + 3 * S(32) + S(10)
-    x0 = lx + S(270)
-    w, h = S(190), S(32)
+    x0 = S(754)
+    by = S(168)
+    w, h = S(116), S(28)
     return x0 + w // 2, by + h // 2, cw, ch, gs
 
 

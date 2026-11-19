@@ -2,6 +2,7 @@
 
 #include <dwrite.h>
 #include <d3dcompiler.h>
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <vector>
@@ -114,7 +115,7 @@ bool Overlay11::Init(ID3D11Device* dev) {
     sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
     sd.ComparisonFunc = D3D11_COMPARISON_NEVER;
     sd.MaxLOD = D3D11_FLOAT32_MAX;
-    if (FAILED(dev->CreateSamplerState(&sd, &samp_))) return false;
+    if (FAILED(dev->CreateSamplerState(&sd, &samp_))) { Release(); return false; }
 
     D3D11_BLEND_DESC bd{};
     bd.RenderTarget[0].BlendEnable = TRUE;
@@ -125,7 +126,7 @@ bool Overlay11::Init(ID3D11Device* dev) {
     bd.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
     bd.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
     bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
-    if (FAILED(dev->CreateBlendState(&bd, &blend_))) return false;
+    if (FAILED(dev->CreateBlendState(&bd, &blend_))) { Release(); return false; }
 
     // 必须显式建一个关掉背面剔除的光栅化状态并在绘制时绑定。
     // D3D11 的默认光栅化状态是 CullMode = BACK，而全屏三角形
@@ -136,8 +137,13 @@ bool Overlay11::Init(ID3D11Device* dev) {
     rd.CullMode = D3D11_CULL_NONE;
     rd.DepthClipEnable = TRUE;
     rd.ScissorEnable = FALSE;
-    if (FAILED(dev->CreateRasterizerState(&rd, &raster_))) return false;
+    if (FAILED(dev->CreateRasterizerState(&rd, &raster_))) { Release(); return false; }
     return true;
+}
+
+void Overlay11::OnResizeBuffers() {
+    if (rtv_) { rtv_->Release(); rtv_ = nullptr; }
+    if (rtvSrc_) { rtvSrc_->Release(); rtvSrc_ = nullptr; }
 }
 
 void Overlay11::Release() {
@@ -202,18 +208,38 @@ bool Overlay11::Draw(ID3D11Device* dev, ID3D11DeviceContext* ctx, ID3D11Texture2
     if (rtv_) { rtv_->Release(); rtv_ = nullptr; }
     if (FAILED(dev->CreateRenderTargetView(backbuffer, nullptr, &rtv_))) return false;
 
-    D3D11_TEXTURE2D_DESC bbd{};
-    backbuffer->GetDesc(&bbd);
-
-    D3D11_VIEWPORT vp{};
-    vp.Width = (float)bbd.Width;
-    vp.Height = (float)bbd.Height;
-    vp.MinDepth = 0; vp.MaxDepth = 1;
-    vp.TopLeftX = 0; vp.TopLeftY = 0;
+    // 完整保存并还原游戏 D3D11 管线状态，避免影响宿主下一帧或第三方叠加
+    ID3D11RenderTargetView* oldRtvs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT]{};
+    ID3D11DepthStencilView* oldDsv = nullptr;
+    ctx->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, oldRtvs, &oldDsv);
+    ID3D11RasterizerState* oldRs = nullptr;
+    ctx->RSGetState(&oldRs);
+    D3D11_VIEWPORT oldVps[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE]{};
+    UINT oldVpCount = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
+    ctx->RSGetViewports(&oldVpCount, oldVps);
+    D3D11_PRIMITIVE_TOPOLOGY oldTopo = D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED;
+    ctx->IAGetPrimitiveTopology(&oldTopo);
+    ID3D11InputLayout* oldIl = nullptr;
+    ctx->IAGetInputLayout(&oldIl);
+    ID3D11VertexShader* oldVs = nullptr;
+    ID3D11ClassInstance* oldVsInst[256]{};
+    UINT oldVsInstN = 256;
+    ctx->VSGetShader(&oldVs, oldVsInst, &oldVsInstN);
+    ID3D11PixelShader* oldPs = nullptr;
+    ID3D11ClassInstance* oldPsInst[256]{};
+    UINT oldPsInstN = 256;
+    ctx->PSGetShader(&oldPs, oldPsInst, &oldPsInstN);
+    ID3D11ShaderResourceView* oldSrv = nullptr;
+    ctx->PSGetShaderResources(0, 1, &oldSrv);
+    ID3D11SamplerState* oldSamp = nullptr;
+    ctx->PSGetSamplers(0, 1, &oldSamp);
+    ID3D11BlendState* oldBlend = nullptr;
+    float oldBlendFactor[4] = {0, 0, 0, 0};
+    UINT oldSampleMask = 0xffffffff;
+    ctx->OMGetBlendState(&oldBlend, oldBlendFactor, &oldSampleMask);
 
     ctx->OMSetRenderTargets(1, &rtv_, nullptr);
     ctx->RSSetState(raster_);          // 关掉背面剔除，否则全屏三角形会被剔掉
-    ctx->RSSetViewports(1, &vp);
     ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     ctx->IASetInputLayout(nullptr);
     ctx->VSSetShader(vs_, nullptr, 0);
@@ -223,11 +249,6 @@ bool Overlay11::Draw(ID3D11Device* dev, ID3D11DeviceContext* ctx, ID3D11Texture2
     float blendFactor[4] = {1, 1, 1, 1};
     ctx->OMSetBlendState(blend_, blendFactor, 0xffffffff);
 
-    // 用视口偏移实现面板位置：把三角形缩放到面板大小并平移
-    // 这里改用一个更简单的办法：直接按屏幕像素换算到 NDC
-    //   ndcX = 2*x/w - 1, ndcY = 1 - 2*y/h
-    // 由于着色器里写死了全屏三角形，我们改成用视口裁剪到面板区域：
-    //   视口设为 {x, y, w, h}，全屏三角形就会被拉伸到该矩形。
     D3D11_VIEWPORT panel{};
     panel.TopLeftX = x; panel.TopLeftY = y;
     panel.Width = (float)w; panel.Height = (float)h;
@@ -238,13 +259,38 @@ bool Overlay11::Draw(ID3D11Device* dev, ID3D11DeviceContext* ctx, ID3D11Texture2
     ctx->Draw(3, 0);
     gNpCountingOverlayDraws = false;
 
-    // 还原视口，尽量不打扰游戏
-    ctx->RSSetViewports(1, &vp);
-    // ★ 立刻解除绑定并释放后台缓冲的 RTV —— 绝不让这个引用活过本帧。
-    //   游戏随后调用 ResizeBuffers / 切独占全屏时，要求后台缓冲引用为 0，
-    //   留着它就会让那次调用失败（进而可能让游戏闪退）。见上面的长注释。
+    // 还原 D3D11 状态并立刻释放后台缓冲 RTV，确保 ResizeBuffers 时引用计数归零
+    ctx->OMSetBlendState(oldBlend, oldBlendFactor, oldSampleMask);
+    ctx->PSSetSamplers(0, 1, &oldSamp);
+    ctx->PSSetShaderResources(0, 1, &oldSrv);
+    ctx->PSSetShader(oldPs, oldPsInst, oldPsInstN);
+    ctx->VSSetShader(oldVs, oldVsInst, oldVsInstN);
+    ctx->IASetInputLayout(oldIl);
+    ctx->IASetPrimitiveTopology(oldTopo);
+    ctx->RSSetViewports(oldVpCount, oldVpCount ? oldVps : nullptr);
+    ctx->RSSetState(oldRs);
+
+    UINT rtvN = 0;
+    for (UINT i = 0; i < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; ++i) {
+        if (oldRtvs[i]) rtvN = i + 1;
+    }
+    ctx->OMSetRenderTargets(rtvN, rtvN ? oldRtvs : nullptr, oldDsv);
+
+    for (UINT i = 0; i < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; ++i) {
+        if (oldRtvs[i]) oldRtvs[i]->Release();
+    }
+    if (oldDsv) oldDsv->Release();
+    if (oldRs) oldRs->Release();
+    if (oldIl) oldIl->Release();
+    if (oldVs) oldVs->Release();
+    for (UINT i = 0; i < oldVsInstN; ++i) if (oldVsInst[i]) oldVsInst[i]->Release();
+    if (oldPs) oldPs->Release();
+    for (UINT i = 0; i < oldPsInstN; ++i) if (oldPsInst[i]) oldPsInst[i]->Release();
+    if (oldSrv) oldSrv->Release();
+    if (oldSamp) oldSamp->Release();
+    if (oldBlend) oldBlend->Release();
+
     if (rtv_) {
-        ctx->OMSetRenderTargets(0, nullptr, nullptr);
         rtv_->Release();
         rtv_ = nullptr;
     }
@@ -306,17 +352,19 @@ bool Overlay12::Init(ID3D12Device* dev) {
 
     D3D12_DESCRIPTOR_HEAP_DESC sh{};
     sh.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    sh.NumDescriptors = 1;
+    sh.NumDescriptors = 8;
     sh.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-    if (FAILED(dev->CreateDescriptorHeap(&sh, IID_PPV_ARGS(&srvHeap_)))) return false;
+    if (FAILED(dev->CreateDescriptorHeap(&sh, IID_PPV_ARGS(&srvHeap_)))) { Release(); return false; }
+    srvHeapSize_ = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    srvSlot_ = 0;
 
     D3D12_DESCRIPTOR_HEAP_DESC rh{};
     rh.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
     rh.NumDescriptors = 8;
-    if (FAILED(dev->CreateDescriptorHeap(&rh, IID_PPV_ARGS(&rtvHeap_)))) return false;
+    if (FAILED(dev->CreateDescriptorHeap(&rh, IID_PPV_ARGS(&rtvHeap_)))) { Release(); return false; }
     rtvHeapSize_ = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
 
-    if (FAILED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence_)))) return false;
+    if (FAILED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence_)))) { Release(); return false; }
     fenceValue_ = 0;
     return true;
 }
@@ -378,6 +426,18 @@ void Overlay12::Release() {
     if (vsBlob_) { vsBlob_->Release(); vsBlob_ = nullptr; }
     if (psBlob_) { psBlob_->Release(); psBlob_ = nullptr; }
     psoFormat_ = DXGI_FORMAT_UNKNOWN;
+    rtvHeapSwaps_ = 0;
+    settle_ = 0;
+    drawSkips_ = 0;
+    texW_ = 0;
+    texH_ = 0;
+    fenceValue_ = 0;
+    srvHeapSize_ = 0;
+    srvSlot_ = 0;
+    lastBbW_ = 0;
+    lastBbH_ = 0;
+    lastBbFormat_ = DXGI_FORMAT_UNKNOWN;
+    std::memset(bbByIdx_, 0, sizeof(bbByIdx_));
 }
 
 // 把资源挂到 fence 上延迟回收。
@@ -392,6 +452,7 @@ void Overlay12::Retire(IUnknown* r) {
 }
 
 void Overlay12::OnFrameCompleted() {
+    if (!fence_) return;
     UINT64 done = fence_->GetCompletedValue();
     for (int i = 0; i < pendingN_;) {
         if (pending_[i].value <= done) {
@@ -404,20 +465,138 @@ void Overlay12::OnFrameCompleted() {
     }
 }
 
+void Overlay12::OnResizeBuffers() {
+    OnFrameCompleted();
+    if (rtvHeap_) {
+        ID3D12Device* dev = nullptr;
+        if (SUCCEEDED(rtvHeap_->GetDevice(IID_PPV_ARGS(&dev))) && dev) {
+            D3D12_DESCRIPTOR_HEAP_DESC rh2{};
+            rh2.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+            rh2.NumDescriptors = 8;
+            ID3D12DescriptorHeap* fresh = nullptr;
+            if (SUCCEEDED(dev->CreateDescriptorHeap(&rh2, IID_PPV_ARGS(&fresh))) && fresh) {
+                Retire(rtvHeap_);
+                rtvHeap_ = fresh;
+            }
+            dev->Release();
+        }
+    }
+    rtvSlotsN_ = 0;
+    lastBbW_ = 0;
+    lastBbH_ = 0;
+    lastBbFormat_ = DXGI_FORMAT_UNKNOWN;
+    std::memset(bbByIdx_, 0, sizeof(bbByIdx_));
+    ++rtvHeapSwaps_;
+    settle_ = 30;
+}
+
+bool Overlay12::OnBackBuffer(ID3D12Device* dev, ID3D12Resource* backbuffer, UINT bbIdx,
+                             int bbW, int bbH, DXGI_FORMAT bbFormat) {
+    if (!dev || !backbuffer || !root_ || !rtvHeap_) return false;
+    OnFrameCompleted();
+
+    bool inSlots = false;
+    for (int i = 0; i < rtvSlotsN_; ++i) {
+        if (rtvSlots_[i].res == backbuffer) { inSlots = true; break; }
+    }
+    bool rebuild = (lastBbW_ != 0 && (bbW != lastBbW_ || bbH != lastBbH_ || bbFormat != lastBbFormat_)) ||
+                   (bbIdx < 16 && bbByIdx_[bbIdx] != nullptr && bbByIdx_[bbIdx] != backbuffer) ||
+                   (!inSlots && rtvSlotsN_ >= 8);
+    if (rebuild) {
+        ID3D12DescriptorHeap* fresh = nullptr;
+        D3D12_DESCRIPTOR_HEAP_DESC rh2{};
+        rh2.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+        rh2.NumDescriptors = 8;
+        if (SUCCEEDED(dev->CreateDescriptorHeap(&rh2, IID_PPV_ARGS(&fresh))) && fresh) {
+            Retire(rtvHeap_);
+            rtvHeap_ = fresh;
+        }
+        rtvSlotsN_ = 0;
+        std::memset(bbByIdx_, 0, sizeof(bbByIdx_));
+        ++rtvHeapSwaps_;
+        settle_ = 30;
+        lastBbW_ = bbW;
+        lastBbH_ = bbH;
+        lastBbFormat_ = bbFormat;
+        if (bbIdx < 16) bbByIdx_[bbIdx] = backbuffer;
+        return false;
+    }
+
+    lastBbW_ = bbW;
+    lastBbH_ = bbH;
+    lastBbFormat_ = bbFormat;
+    if (bbIdx < 16) bbByIdx_[bbIdx] = backbuffer;
+    return true;
+}
+
+static DXGI_FORMAT NormalizeRtvFormat(DXGI_FORMAT fmt) {
+    switch (fmt) {
+        case DXGI_FORMAT_R8G8B8A8_TYPELESS: return DXGI_FORMAT_R8G8B8A8_UNORM;
+        case DXGI_FORMAT_B8G8R8A8_TYPELESS: return DXGI_FORMAT_B8G8R8A8_UNORM;
+        case DXGI_FORMAT_R10G10B10A2_TYPELESS: return DXGI_FORMAT_R10G10B10A2_UNORM;
+        case DXGI_FORMAT_R16G16B16A16_TYPELESS: return DXGI_FORMAT_R16G16B16A16_FLOAT;
+        default: return fmt;
+    }
+}
+
 bool Overlay12::Record(ID3D12Device* dev, ID3D12GraphicsCommandList* list,
                        ID3D12Resource* backbuffer, D3D12_RESOURCE_STATES bbBefore,
                        const unsigned char* px, int w, int h, int stride, float x, float y,
                        float bbW, float bbH) {
-    if (!dev || !list || !backbuffer || !px || !root_) return false;
+    if (!dev || !list || !backbuffer || !px || !root_ || !fence_) return false;
+    LONG scLeft = std::max<LONG>(0, (LONG)x);
+    LONG scTop = std::max<LONG>(0, (LONG)y);
+    LONG scRight = std::min<LONG>((LONG)bbW, (LONG)(x + (float)w));
+    LONG scBottom = std::min<LONG>((LONG)bbH, (LONG)(y + (float)h));
+    if (scRight <= scLeft || scBottom <= scTop) return false;
+
     OnFrameCompleted();
-    DXGI_FORMAT bbFormat = backbuffer->GetDesc().Format;
+    DXGI_FORMAT bbFormat = NormalizeRtvFormat(backbuffer->GetDesc().Format);
     if (!EnsurePso(dev, bbFormat)) return false;
+
+    // ---- 后台缓冲 RTV（先完成槽位准备再更新纹理，避免 RTV 失败把 tex_ 留在 PSR 状态）
+    int slot = -1;
+    for (int i = 0; i < rtvSlotsN_; ++i)
+        if (rtvSlots_[i].res == backbuffer) { slot = rtvSlots_[i].slot; break; }
+
+    if (slot < 0 && rtvSlotsN_ >= 8) {
+        ID3D12DescriptorHeap* fresh = nullptr;
+        D3D12_DESCRIPTOR_HEAP_DESC rh2{};
+        rh2.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+        rh2.NumDescriptors = 8;
+        if (FAILED(dev->CreateDescriptorHeap(&rh2, IID_PPV_ARGS(&fresh))) || !fresh)
+            return false;              // 建不出来就这一帧不画，别硬来
+        Retire(rtvHeap_);              // 接管旧堆所有权，fence 后才 Release
+        rtvHeap_ = fresh;
+        rtvSlotsN_ = 0;
+        ++rtvHeapSwaps_;
+        settle_ = 30;
+    }
+
+    if (slot < 0) {
+        if (rtvSlotsN_ >= 8) return false;   // 换了 8 张缓冲还没复用？放弃，别硬来
+        slot = rtvSlotsN_;
+        D3D12_RENDER_TARGET_VIEW_DESC rv{};
+        rv.Format = bbFormat;
+        rv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+        rv.Texture2D.MipSlice = 0;
+        D3D12_CPU_DESCRIPTOR_HANDLE h = rtvHeap_->GetCPUDescriptorHandleForHeapStart();
+        h.ptr += (SIZE_T)slot * rtvHeapSize_;
+        dev->CreateRenderTargetView(backbuffer, &rv, h);
+        rtvSlots_[rtvSlotsN_].res = backbuffer;
+        rtvSlots_[rtvSlotsN_].slot = slot;
+        ++rtvSlotsN_;
+    }
 
     // ---- 面板纹理（按需重建）
     if (!tex_ || texW_ != w || texH_ != h) {
         // 旧纹理可能还被上一帧的命令列表引用着，交给 fence 回收，不能立刻 Release
-        if (tex_) { Retire(tex_); tex_ = nullptr; }
-        texW_ = w; texH_ = h;
+        if (tex_) {
+            Retire(tex_);
+            tex_ = nullptr;
+            srvSlot_ = (srvSlot_ + 1) % 8;
+        }
+        texW_ = 0; texH_ = 0;
         D3D12_RESOURCE_DESC td{};
         td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
         td.Width = (UINT64)w; td.Height = (UINT)h;
@@ -429,14 +608,19 @@ bool Overlay12::Record(ID3D12Device* dev, ID3D12GraphicsCommandList* list,
         D3D12_HEAP_PROPERTIES hp = NpHeapProps(D3D12_HEAP_TYPE_DEFAULT);
         if (FAILED(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td,
                                                 D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
-                                                IID_PPV_ARGS(&tex_))))
+                                                IID_PPV_ARGS(&tex_))) || !tex_) {
+            tex_ = nullptr;
             return false;
+        }
+        texW_ = w; texH_ = h;
         D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
         sv.Format = td.Format;
         sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
         sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
         sv.Texture2D.MipLevels = 1;
-        dev->CreateShaderResourceView(tex_, &sv, srvHeap_->GetCPUDescriptorHandleForHeapStart());
+        D3D12_CPU_DESCRIPTOR_HANDLE srvCpu = srvHeap_->GetCPUDescriptorHandleForHeapStart();
+        srvCpu.ptr += (SIZE_T)srvSlot_ * srvHeapSize_;
+        dev->CreateShaderResourceView(tex_, &sv, srvCpu);
     }
 
     // ---- 上传：行距必须按 D3D12_TEXTURE_DATA_PITCH_ALIGNMENT(256) 对齐
@@ -453,22 +637,23 @@ bool Overlay12::Record(ID3D12Device* dev, ID3D12GraphicsCommandList* list,
     for (int k = 0; k < (int)kUploadRing; ++k) {
         int i = (uploadRingNext_ + k) % (int)kUploadRing;
         if (uploadRing_[i] && uploadRingFence_[i] > doneNow) continue;   // 还在 GPU 手里
-        if (uploadRing_[i] && uploadRingSize_[i] != uploadSize) {        // 面板尺寸变了，重建
+        if (uploadRing_[i] && uploadRingSize_[i] < uploadSize) {        // 容量不够时重建
             Retire(uploadRing_[i]);
             uploadRing_[i] = nullptr;
             uploadRingSize_[i] = 0;
         }
         if (!uploadRing_[i]) {
+            UINT64 allocBytes = (std::max)(uploadSize, (UINT64)(4 * 1024 * 1024));
             D3D12_RESOURCE_DESC ud{};
             ud.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-            ud.Width = uploadSize; ud.Height = 1; ud.DepthOrArraySize = 1; ud.MipLevels = 1;
+            ud.Width = allocBytes; ud.Height = 1; ud.DepthOrArraySize = 1; ud.MipLevels = 1;
             ud.SampleDesc.Count = 1; ud.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
             D3D12_HEAP_PROPERTIES up = NpHeapProps(D3D12_HEAP_TYPE_UPLOAD);
             if (FAILED(dev->CreateCommittedResource(&up, D3D12_HEAP_FLAG_NONE, &ud,
                                                     D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
                                                     IID_PPV_ARGS(&uploadRing_[i]))))
                 return false;
-            uploadRingSize_[i] = uploadSize;
+            uploadRingSize_[i] = allocBytes;
         }
         upload = uploadRing_[i];
         slotIdx = i;
@@ -509,75 +694,6 @@ bool Overlay12::Record(ID3D12Device* dev, ID3D12GraphicsCommandList* list,
         list->ResourceBarrier(1, &b);
     }
 
-    // ---- 后台缓冲 RTV
-    //
-    // 每种后台缓冲占**各自**一个描述符槽。原来只有一个槽、每帧按当前缓冲重写：
-    // 上一帧的命令列表可能还在执行，而 GPU 是执行时才去读描述符的，
-    // 结果就是让它画到另一张缓冲上 —— 轻则画面错乱，重则设备 removed。
-    int slot = -1;
-    for (int i = 0; i < rtvSlotsN_; ++i)
-        if (rtvSlots_[i].res == backbuffer) { slot = rtvSlots_[i].slot; break; }
-
-    // ★ 槽位满了 => 交换链被重建过多次（全屏独占转换 / ResizeBuffers 都会换掉一整批
-    //   后台缓冲对象，每个新对象占一个新槽）。
-    //   旧槽里的描述符仍然引用着**已经作废的旧后台缓冲** —— 这既让游戏的
-    //   ResizeBuffers 失败（就是刚修好的那个闪退），也让我们自己画到旧缓冲上
-    //   （用户实测：全屏后换场景开始**闪烁**，闪一会就**看不见**了，正是槽位用尽后
-    //   本函数返回 false 停止绘制）。
-    //
-    //   所以这里**重置整组槽位**，把对旧后台缓冲的引用放掉。
-    //   ⚠ 必须确认没有在途命令列表：GPU 是**执行时**才去读描述符堆的，
-    //     覆盖一个正在被读的槽会让它画到错的地方。pendingN_ == 0 表示我们记录过的
-    //     命令全部已完成（OnFrameCompleted 每帧回收），此时覆盖是安全的。
-    //     不满足就这一帧先不画，下一帧再试 —— 宁可不画，也不画错。
-    if (slot < 0 && rtvSlotsN_ >= 8) {
-        // ★ 换一个**全新的描述符堆**，旧堆交给 Retire() 延迟释放。
-        //
-        // 为什么必须换堆而不是覆盖旧槽位：
-        //   GPU 是**执行时**才去读描述符堆的，而读它的是**游戏自己的命令列表**
-        //   （我们只是往那个列表里录了 OMSetRenderTargets）。所以"没有在途命令列表"
-        //   这件事我们根本无法判断 —— pending_ 只跟踪我们自己的上传缓冲。
-        //   之前用 pendingN_ == 0 做判据是**不够的**，会覆盖正在被读的描述符，
-        //   表现就是偶发闪退 + 闪烁。
-        //   换堆则绕开了整个问题：旧堆原封不动留给还在执行的那几帧用，
-        //   由 Retire -> OnFrameCompleted 在 fence 确认后才 Release。
-        //
-        // 顺带这也是正确的资源管理：旧堆里的描述符引用着**已经作废的旧后台缓冲**，
-        // 只有把堆放掉才能真正释放它们（否则游戏的 ResizeBuffers 会失败 = 闪退）。
-        ID3D12DescriptorHeap* fresh = nullptr;
-        D3D12_DESCRIPTOR_HEAP_DESC rh2{};
-        rh2.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-        rh2.NumDescriptors = 8;
-        if (FAILED(dev->CreateDescriptorHeap(&rh2, IID_PPV_ARGS(&fresh))) || !fresh)
-            return false;              // 建不出来就这一帧不画，别硬来
-        Retire(rtvHeap_);              // 接管旧堆所有权，fence 后才 Release
-        rtvHeap_ = fresh;
-        rtvSlotsN_ = 0;
-        ++rtvHeapSwaps_;
-        // ★ 交换链刚被重建（全屏/窗口切换）-> 静默若干帧。
-        //   实测证据：切换窗口/无边框/全屏时会在 nvwgf2umx.dll+0x330124
-        //   （NVIDIA 用户态驱动，同一偏移反复出现 = 驱动里一个确定的崩溃点）触发
-        //   0xC0000005 把游戏带走，而崩溃只发生在交换链重建那段窗口期。
-        //   我们改不了驱动，但可以**避开那个时刻**：这几十帧不往游戏的命令列表里
-        //   录屏障与绘制，等重建彻底稳定下来再继续。
-        settle_ = 30;
-    }
-
-    if (slot < 0) {
-        if (rtvSlotsN_ >= 8) return false;   // 换了 8 张缓冲还没复用？放弃，别硬来
-        slot = rtvSlotsN_;
-        D3D12_RENDER_TARGET_VIEW_DESC rv{};
-        rv.Format = bbFormat;
-        rv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
-        rv.Texture2D.MipSlice = 0;
-        D3D12_CPU_DESCRIPTOR_HANDLE h = rtvHeap_->GetCPUDescriptorHandleForHeapStart();
-        h.ptr += (SIZE_T)slot * rtvHeapSize_;
-        dev->CreateRenderTargetView(backbuffer, &rv, h);
-        rtvSlots_[rtvSlotsN_].res = backbuffer;
-        rtvSlots_[rtvSlotsN_].slot = slot;
-        ++rtvSlotsN_;
-    }
-
     // ---- 录制绘制
     D3D12_RESOURCE_BARRIER pre = NpTransition(
         backbuffer, bbBefore, D3D12_RESOURCE_STATE_RENDER_TARGET);
@@ -587,17 +703,17 @@ bool Overlay12::Record(ID3D12Device* dev, ID3D12GraphicsCommandList* list,
     list->SetGraphicsRootSignature(root_);
     ID3D12DescriptorHeap* heaps[1] = {srvHeap_};
     list->SetDescriptorHeaps(1, heaps);
-    list->SetGraphicsRootDescriptorTable(0, srvHeap_->GetGPUDescriptorHandleForHeapStart());
+    D3D12_GPU_DESCRIPTOR_HANDLE srvGpu = srvHeap_->GetGPUDescriptorHandleForHeapStart();
+    srvGpu.ptr += (SIZE_T)srvSlot_ * srvHeapSize_;
+    list->SetGraphicsRootDescriptorTable(0, srvGpu);
     list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 
     D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtvHeap_->GetCPUDescriptorHandleForHeapStart();
     rtv.ptr += (SIZE_T)slot * rtvHeapSize_;
     list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
 
-    // 用裁剪矩形把全屏三角形限制到面板区域
-    D3D12_RECT scissor{};
-    scissor.left = (LONG)x; scissor.top = (LONG)y;
-    scissor.right = (LONG)(x + w); scissor.bottom = (LONG)(y + h);
+    // 用裁剪矩形把全屏三角形限制到合法后备缓冲区域
+    D3D12_RECT scissor{scLeft, scTop, scRight, scBottom};
     D3D12_VIEWPORT vp{};
     vp.TopLeftX = x; vp.TopLeftY = y;
     vp.Width = (float)w; vp.Height = (float)h;

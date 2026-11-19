@@ -11,16 +11,15 @@ build.bat
 1. **找 zig 编译器**，按顺序：
    `NP_ZIG` 环境变量 → PATH 里的 `zig.exe` → 常见 Python 环境的
    `Lib\site-packages\ziglang\zig.exe` → 都找不到就 `pip install ziglang` 再找一遍；
-2. 编译 `dist\NextPerf.exe` 和 `dist\NextPerfHook.dll`；
-3. 复制一份 `NextPerfHook64.dll`，清掉 `.pdb` / `.lib`。
+2. 编译 `dist\NextPerfHook.dll`（64 位钩子）与 `dist\NextPerfHook32.dll`（32 位钩子）；
+3. 编译 `dist\NextPerf.exe` 并通过 `src/app/hook_embed.S`（`.incbin`）内嵌双份钩子载荷，实现单 EXE 复制到 U 盘即插即用，同时清理 `.pdb` / `.lib` 与冗余副本 `NextPerfHook64.dll`。
 
 > 缓存固定写在项目内的 `.zig-global\` / `.zig-cache\`（可用 `ZIG_GLOBAL_CACHE_DIR` /
 > `ZIG_LOCAL_CACHE_DIR` 覆盖）。zig 默认写 `%LOCALAPPDATA%\zig`，在受限环境（沙箱、
 > 只读用户目录）会直接以 `AccessDenied` 失败。这两个目录可以随时删掉回收空间
 > （约 100 MB），删了下次重新构建即可。
 
-> 脚本文件本身是 **GBK + CRLF** 编码的。用 UTF-8/LF 保存会让 `cmd.exe`
-> 在中文和 `for /f` 语句上解析出错（踩过），改脚本时注意保持。
+> 脚本文件保持 **UTF-8 + CRLF**（勿改为 LF，避免 `cmd.exe` 解析批处理异常）。
 
 ## 方式二：手动编译
 
@@ -41,21 +40,27 @@ pip install ziglang
 ZIG="<venv>/Scripts/python-zig.exe"
 CXX="-target x86_64-windows-gnu -O2 -std=c++20 -DUNICODE -D_UNICODE -fno-exceptions -I src"
 
-# 主程序
-$ZIG c++ $CXX -o dist/NextPerf.exe \
-    src/app/main.cpp src/app/ui.cpp src/app/overlay.cpp src/app/injector.cpp src/app/settings.cpp \
-    src/common/np_panel.cpp src/common/np_build.cpp src/common/np_bitmap.cpp \
-    src/sensors/np_vendor.cpp src/sensors/np_sensors.cpp src/etw/np_etw.cpp \
-    -Wl,--subsystem,windows \
-    -luser32 -lgdi32 -lshell32 -ladvapi32 -lole32 -loleaut32 -luuid -lcomctl32 -lcomdlg32 \
-    -lpdh -lpsapi -ldxgi -ld3d11 -ld2d1 -ldwrite -lshlwapi -lwinmm -lmsimg32 -ltdh
-
-# 钩子 DLL（-shared，不要 subsystem 参数）
+# 先编出 64/32 位钩子 DLL（NextPerf.exe 会通过 hook_embed.S 将其 .incbin 进只读段）
 $ZIG c++ $CXX -shared -o dist/NextPerfHook.dll \
     src/hook/dllmain.cpp src/hook/np_hook.cpp src/hook/np_draw.cpp \
     src/common/np_panel.cpp src/common/np_build.cpp src/common/np_bitmap.cpp \
     -luser32 -lgdi32 -lshell32 -ladvapi32 -lole32 -loleaut32 -luuid \
     -ldxgi -ld3d11 -ld3d12 -ld2d1 -ldwrite -lshlwapi
+
+$ZIG c++ $CXX -target x86-windows-gnu -shared -o dist/NextPerfHook32.dll \
+    src/hook/dllmain.cpp src/hook/np_hook.cpp src/hook/np_draw.cpp \
+    src/common/np_panel.cpp src/common/np_build.cpp src/common/np_bitmap.cpp \
+    -luser32 -lgdi32 -lshell32 -ladvapi32 -lole32 -loleaut32 -luuid \
+    -ldxgi -ld3d11 -ld3d12 -ld2d1 -ldwrite -lshlwapi
+
+# 主程序（内嵌双份钩子）
+$ZIG c++ $CXX -o dist/NextPerf.exe \
+    src/app/main.cpp src/app/ui.cpp src/app/overlay.cpp src/app/injector.cpp src/app/settings.cpp src/app/hook_embed.S \
+    src/common/np_panel.cpp src/common/np_build.cpp src/common/np_bitmap.cpp \
+    src/sensors/np_vendor.cpp src/sensors/np_sensors.cpp src/etw/np_etw.cpp \
+    -Wl,--subsystem,windows \
+    -luser32 -lgdi32 -lshell32 -ladvapi32 -lole32 -loleaut32 -luuid -lcomctl32 -lcomdlg32 \
+    -lpdh -lpsapi -ldxgi -ld3d11 -ld2d1 -ldwrite -lshlwapi -lwinmm -lmsimg32 -ltdh
 ```
 
 ### 如果用 MSVC

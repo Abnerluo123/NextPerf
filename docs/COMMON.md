@@ -33,14 +33,14 @@
 共用 `np_build`（组装行）+ `np_panel`（排版绘制）+ `np_bitmap`（光栅化）之后，
 两种模式只差最后一步"把位图交给谁"。
 
-| 文件 | 行数 | 职责 | 谁用 |
-| --- | --- | --- | --- |
-| `np_common.h` | 497 | 三块共享内存的结构体、计数器位、枚举、宏、`NPCopyStr` / `NPDefaultConfig` / `NPClearSensors` / `NPClearTelemetry` | 双方 |
-| `np_stats.h` | 269 | `np::FrameStats`（帧时间环形缓冲 + 各种百分位/Low 帧口径）、`np::Ema`、`np::RunningMax` | 双方（**实际只有钩子在 push**，主程序侧图表走 `NPHistory`） |
-| `np_panel.h/.cpp` | 130 / 545 | Direct2D + DirectWrite 面板渲染器：三列网格、行配色、方括号区间、行内折线图、宽度锁定 | 双方 |
-| `np_build.h/.cpp` | 13 / 473 | 把 `NPConfig + NPSensors + NPTelemetry + NPHistory` 组装成 `PanelData`（一行行文本 + 颜色 + 曲线指针） | 双方 |
-| `np_bitmap.h/.cpp` | 52 / 102 | 把面板光栅化进一张 BGRA DIB（自上而下、**预乘 alpha**）；单例 D2D/DWrite 工厂 + 光栅倍率 | 双方（三处复用） |
-| `np_json.h` | 218 | 极简 JSON 读/写，**只服务配置持久化** | 只有主程序 |
+| 文件 | 职责 | 谁用 |
+| --- | --- | --- |
+| `np_common.h` | 三块共享内存的结构体、计数器位、4 档预设 `NP_PRESET_*`、位域读写、`NPCopyStr` / `NPDefaultConfig` / `NPClearSensors` / `NPClearTelemetry` | 双方 |
+| `np_stats.h` | `np::FrameStats`（帧时间环形缓冲 + 各种百分位/Low 帧口径）、`np::Ema`、`np::RunningMax` | 双方（**实际只有钩子在 push**，主程序侧图表走 `NPHistory`） |
+| `np_panel.h/.cpp` | Direct2D + DirectWrite Apple Metal HUD 渲染器：2 行等宽顶栏、核心 4 行（`FPS:`/`Pre:`/`GPU:`/`Mem:` + `[min max]`/`[VRAM]` 对齐）、10 格双通道示波器（`dualChart`）、`ThemeFor` 4 套 Apple 材质（Metal 黑/液态暗灰/浅雾透明/极简纯字）、横向极简条与宽度锁定 | 双方 |
+| `np_build.h/.cpp` | `BuildPanelData` / `ShortGpuName` / `NPComputeBottleneck`：把 `NPConfig + NPSensors + NPTelemetry + NPHistory` 组装成 `PanelData` | 双方 |
+| `np_bitmap.h/.cpp` | 把面板光栅化进一张 BGRA DIB（自上而下、**预乘 alpha**）；单例 D2D/DWrite 工厂 + 光栅倍率 | 双方（三处复用） |
+| `np_json.h` | 极简 JSON 读/写（含越界与推进保护），**只服务配置持久化** | 只有主程序 |
 
 `np_bitmap` 是这套设计的关键：**一份绘制代码，三条输出通路**
 （桌面叠加 `UpdateLayeredWindow` / D3D11 `UpdateSubresource` / D3D12 上传堆 + `CopyTextureRegion`）。
@@ -170,8 +170,8 @@ float percentileMs(float p /* 0..100 */, uint32_t window = kCap) const {
 | --- | --- | --- | --- | --- |
 | ① 最差 x% 取平均 | `lowPct(pct, window)` | 取最慢 `ceil(take*pct/100)` 帧，求**帧时间**平均 → 换算 FPS | CapFrameX / OCAT 老口径 | **保留供对照**，当前无调用点 |
 | ② integral（按**时间**累加） | `lowIntegral(pct, window)` | 帧时间**降序**排，依次累加直到累计时间 ≥ 总时长的 `pct%`，取**刚越过边界的那一帧** → 换算 FPS | MSI Afterburner；CapFrameX ≥ 1.5.3 | 保留供对照，当前无调用点 |
-| ③ 百分位（按**帧数**） | `lowPercentileFps(pct, window)` | 帧时间的第 pct 百分位（线性插值）→ 换算 FPS | **NVIDIA 驱动面板 / FrameView**；Intel PresentMon（倒数指标排名反转） | **兜底**：窗口数不足 4 个（刚进游戏）时才用它 |
-| ④ 窗口平均 | `lowWindowed(pct, windowMs, lookback)` | 先把帧时间按 `windowMs` 分组求**窗口平均**，再取最差 `pct%` 的窗口平均求平均 → 换算 FPS | 游戏内 overlay / 驱动面板显示的本来就是窗口平均 FPS | ✅ **当前实际使用的是它**（1000ms 窗口、回看约 10 秒） |
+| ③ 百分位（按**帧数**） | `lowPercentileFps(pct, window)` | 滑动窗口内的样本直接按帧数取百分位（线性插值）→ 换算 FPS | **NVIDIA 驱动面板 / FrameView**；Intel PresentMon（倒数指标排名反转） | ✅ **当前实际使用**（`np_hook.cpp` 的 `lowPercentileFps(99.0/99.9, n1s)`；管理员由 ETW 经 `NPConfig.reserved[]` 中继 1s/3s 窗口百分位） |
+| ④ 窗口平均 | `lowWindowed(pct, windowMs, lookback)` | 先把帧时间按 `windowMs` 分组求**窗口平均**，再取最差 `pct%` 的窗口平均求平均 → 换算 FPS | 早期体感方案 | **已退休**，只留在 `np_stats.h` 作历史对照 |
 
 **为什么会走这么多弯路（每一句都有实测依据）：**
 
@@ -279,47 +279,50 @@ t.p999Ms   = gStats.percentileMs(99.9f);
 * `EnsureFormats` 只在 `fabs(fs - fontSize_) >= 0.01f` 时重建全部 `IDWriteTextFormat`，
   并在重建时**把 `latchedW_ = 0`**（字号变了宽度锁要重来）。
 * 字体链（**第一个能创建成功的就用**）：
-  * 标签/标题（`fmt_` / `fmtHead_`）：`NSimSun` → `SimSun` → `MS Gothic` → `Microsoft YaHei UI`
+  * 标签/标题（`fmt_` / `fmtHead_`）：`Microsoft YaHei UI` → `Microsoft YaHei` → `NSimSun` → `SimSun`
+    （现代无衬线字体，与设置界面及右侧 `Cascadia Mono` 风格统一，并避免 `NSimSun` 下 `0.1%` 点号间距异常）
   * 数值/括号（`fmtR_` / `fmtSmall_` / `fmtSmallL_`）：`Cascadia Mono` → `Consolas` →
     `Lucida Console` → `Courier New`
-* **中文标签也必须是等宽的**（`NSimSun` 是 Windows 自带的等宽中文字体）——
-  否则中英混排时左侧栅格是歪的（用户反馈过"左侧字体也没改"）。
 * 分组标题用**与正文同号**的字号（曾给 0.92× 被用户反馈"明显偏小"），只靠**加粗**区分。
 * `lineHeight_` 由 DWrite 实测得到：用样本文本 `L"Ag0.帧°%"` 建一个 `CreateTextLayout`
   再 `GetLineMetrics`；失败兜底 `fs * 1.30f`。
   **行高不能小于字体自身行距**，否则 `D2D1_DRAW_TEXT_OPTIONS_CLIP` 会把字形上下裁掉，
   各行视觉高低也会不齐。
-* `Init()` 失败（没有 D2D/DWrite）时 `Measure()` 返回 `240 x 110` 兜底，不会崩。
+* `Measure()` 入口会先在 `dwrite_ != nullptr` 时调用 `EnsureFormats((float)c.fontHeight * c.scale)` 保证首帧即按真实字号排版（不再首帧误返回 `240 x 110` 兜底）；若 `c.counters` 变化（如取消勾选监控项），同步重置 `latchedW_ = 0` 使面板允许收窄。`Init()` 未调用或失败（无 D2D/DWrite）时仍安全返回 `240 x 110` 兜底。
+* `np_bitmap.cpp` 的 `GfxInit()` 使用 `D2D1_FACTORY_TYPE_MULTI_THREADED`，与 `np_panel.cpp` 保持一致。
 
 ### 4.2 布局常量（`Layout()`，**测量与绘制共用同一套数字**）
 
 | 量 | 公式 | 出处/理由 |
 | --- | --- | --- |
-| `pad` | `4.0f * scale + 3.0f` | 那 `3.0f` 是用户指定的"四周留一圈黑"（原来是 `行高/6 ≈ 2.85`） |
-| `lh` | `max(fontHeight * 1.14f * scale, lineHeight_)` | 金属 HUD 行距约 1.18 倍字号；普通界面 1.34 会显得松散 |
+| `pad` | `5.0f * scale` | 紧凑四周留黑（复刻 Apple Metal HUD 贴边紧凑感） |
+| `lh` | `max(fontHeight * 1.12f * scale, lineHeight_)` | Metal HUD 紧凑行距；`D2D1_DRAW_TEXT_OPTIONS_CLIP` 下不裁字形 |
 | `headH` | `= lh` | 标题与正文同号 |
-| `chartH` | `max(11.0f, graphHeight * 0.26f) * scale` | 曲线区比文字区矮得多（原来 0.42 显得又高又空） |
-| `rowGap` | `1.0f * scale` | |
+| `chartH` | `max(11.0f, graphHeight * 0.24f) * scale` | 可选行内小图紧凑高度 |
+| `dualPlotH` | `max(30.0f, (float)c.graphHeight) * scale` | 全宽 10 格双通道示波器区域高度 |
+| `rowGap` | `0.8f * scale` | 紧凑行间距 |
 | `chartGap` | `2.0f * scale` | |
-| `colGap` | `2.0f * scale` | |
+| `colGap` | `4.0f * scale` | 解耦核心列与扩展列间留白 |
 
 > 布局常量集中在一个匿名命名空间里，**就是为了避免"测量和绘制各算各的"** ——
 > 源码注释写着：*"以前就因此错位过"*。
 
-### 4.3 三列网格与列宽（`ComputeGrid()`）
+### 4.3 解耦网格与紧凑列宽（`ComputeGridT()` / `PanelRenderer::Grid`）
 
 ```
-[标签 + 异色提示] ······ [ (范围列) ][ 数值列 ]
- labelX              rngX  rngRight  valueRightEdge(=面板右缘 - pad)
+[coreLabelW] [coreValW] ··· [coreRngW]   (Apple Metal 核心 4 行)
+[extLabel ··············· extValue   ]   (下方扩展指标 / 合并多合一汇总行)
 ```
 
 列的取宽规则：
 
-| 列 | 宽度 | 说明 |
+| 网格成员 | 语义 | 说明 |
 | --- | --- | --- |
-| 标签列 | `cols(maxLabel)`，`cols(px) = ceil(px / chW) * chW` | **量化到整字符格**；`maxLabel` 按 `r.label + r.hint` 量（提示也要占位，否则会压到右边的列） |
-| 数值列 | **固定 `14 * chW`** | 数据层 `np_build.cpp::FitCols(..., 14)` 已把过长的值截断，所以既不会裁掉显示，也不会因某个值变长而撑宽面板 |
-| 范围列 | `wantRange ? 12 * chW : 0` | `wantRange` 现在是**硬编码 `false`**（区间显示被用户要求关闭） |
+| `coreLabelW` | 核心 4 行标签列宽 | 按 `FPS:` / `Pre:` / `GPU:` / `Mem:` 最大实测宽，使核心数值紧贴标签右侧（不再被下方中文长标签推远） |
+| `coreValW` | 核心 4 行数值列宽 | 按核心行即时值实测最大宽右对齐（`Mem:` 紧接核心数值列） |
+| `coreRngW` | `[min max]` / `[VRAM]` 列宽 | 开启 `NPConfigShowRange` 时取最右列并贴齐面板右缘 `rightX` |
+| `extW` | 下方扩展区最小行宽 | `max(r.label + r.hint + gap + r.value)`，保证合并后的 `Low: 1% · 0.1%` / `CPU` / `GPU` / `Draw/Disp` 与扩展中文标签同右 align 不裁切、不强撑 core 区 |
+| `want`（面板最小宽） | `max(156.0f * scale, max(headW, max(coreW, extW)) + pad * 2)` | 去掉旧 `248px` 过宽下限，由内容真实撑开并随 `latchedW_` 防抖（扩展开启多合一汇总后标准竖版约 `204~216px`） |
 
 **`fmtSmall` 的 `chW`（一个等宽字符宽）怎么量**：
 
@@ -331,6 +334,8 @@ if (chW <= 0.0f) chW = fmtSmall->GetFontSize() * 0.6f;   // 兜底
 ⚠ **不要用 `MeasureW(L"  ")` 去量空格**：DWrite 会把**行尾空格裁掉**，量出来接近 0，
 结果是括号里的最小值与最大值直接黏在一起（实测显示成 `0.4426.23`）。
 等宽字体里每个字符（含空格）宽度相同，用"一个字符宽"推算即可。
+
+⚠ `np_build.cpp` 同步对扩展行执行多合一紧凑合流：`NP_C_LOW1` 与 `NP_C_LOW01` 同开时合并为单行 `Low: 1% X · 0.1% Y`；`CPU` 占比/温度/功耗多开时合并为单行 `CPU`；`GPU` 占比/温度/功耗多开时合并为单行 `GPU`；`Draw`/`Dispatch` 同开时合并为 `Draw/Disp`。
 
 ### 4.4 面板宽度锁定：`latchedW_` **只增不减**
 
@@ -379,15 +384,13 @@ static float MeasureW(IDWriteFactory* f, IDWriteTextFormat* fmt, const std::wstr
 
 * 行级颜色来自 `PanelRow::level`（`PanelLevel`），由 `np_build.cpp` 决定，
   渲染器按 `LevelRGB()` 映射（表在 [`DATA-STRUCTS.md` §8.3](DATA-STRUCTS.md#83-行配色np_panelcpp-levelrgb-与-npconfig-颜色的关系)）。
-  * **CPU 侧指标一律蓝 `PL_CPU`；GPU 侧一律绿 `PL_GPU`；FPS/帧时间/内存类用白。**
-* 标签色固定 `0.95,0.95,0.95`；`hint`（如「低延迟」）固定**亮黄** `1.00,0.85,0.15`，
-  单独绘制一次（异色），所以标签列宽必须按 `label + hint` 量。
+  * **CPU 侧指标一律蓝 `PL_CPU`；GPU 侧（含功耗/核心显存/风扇转速及未超温热点结温）一律绿 `PL_GPU`；FPS/帧时间/内存类用白。**
+* 标签色为柔和高亮银白 `{0.84,0.88,0.93}`（alpha × `0.92`），标题为更高对比 `{0.96,0.98,1.00}` 加粗；`hint`（如「低延迟」）固定**亮黄** `1.00,0.85,0.15`，单独绘制一次（异色），所以标签列宽必须按 `label + hint` 量。
 * 括号里的数字与**数值同色**，不做单独预警（用户要求："数值什么色就是什么色"）。
 * `cfg.textOpacity` 乘进**每一个**画刷的 alpha；`cfg.bgOpacity` 乘进背景色的 alpha
   （`bg.a = clamp(bg.a * bgOpacity)`）。`cfg.textColor/accentColor/warnColor`
   **渲染器根本不读**（见 [`DATA-STRUCTS.md` §8.3](DATA-STRUCTS.md)）。
-* 背景：`FillRoundedRectangle`，圆角 `11.0f * scale`。
-  ⚠ 源码开头的风格注释写的是"方角纯深底"，**代码其实是轻微圆角** —— 以代码为准。
+* 背景：`FillRoundedRectangle`，圆角 `11.0f * scale`，当 `bgOpacity > 0.05` 时叠加 1px 淡白玻璃内描边。
 
 ### 4.7 方括号 `[ min  max ]` 的对齐（现在处于"关闭但代码保留"状态）
 
@@ -428,7 +431,7 @@ drawAt(L"]", fmtSmallL_, bbrk, closeL, rEdge); // ← 用**左对齐**格式
   yMin = max(0, avg - span); yMax = avg + span
   unit == 1（%）→ 再夹到 [0,100]，并保证 yMax - yMin ≥ 1
   ```
-* 画：6 条等分竖网格（白 ×0.10）+ 上下两条边线 + 指标色 1px 折线；**没有 Y 轴刻度**
+* 画：浅色底填充（白 ×0.025）+ 水平中线（白 ×0.05）+ 5 条内分竖网格（白 ×0.10）+ 上下两条边线 + 指标色折线；**没有 Y 轴刻度**
   （金属 HUD 把区间数值放在方括号里）。
 * **采样点铺满整个宽度**（`frac = i / (n-1)`），**不按固定时间轴**。
   原来按固定时间轴定位 —— 数据不足时线只挤在右边缘一小段，看起来像坏掉了
@@ -491,12 +494,12 @@ struct RowAcc {
 | 分组 | `hideTitle` | `gapBefore` | 说明 |
 | --- | --- | --- | --- |
 | `帧率与延迟` | **`true`** | `0.0f` | 首组：标题**不显示**（用户要求），也不留顶端间距 |
-| `CPU` | `false` | `9.0f` | 显示标题 |
-| `GPU` | `false` | `3.0f` | 显示标题 |
-| `系统` | **`true`** | `9.0f` | 标题不显示，只留间距（用户要求 `帧率与延迟` / `系统` 这两个小标题不要出现） |
+| `CPU` | `false` | `8.0f` | 显示标题（内部项名 `占用` / `温度` / `频率` / `功耗` 与 GPU 对称） |
+| `GPU` | `false` | `8.0f` | 显示标题（统一分组间距 8px） |
+| `系统` | **`true`** | `8.0f` | 标题不显示，只留 8px 间距（用户要求 `帧率与延迟` / `系统` 这两个小标题不要出现） |
 
 * `flush()` 里 `if (pending.empty()) return;` —— **空组不输出标题**（避免空标题行）。
-* ⚠ 这三个 `gapBefore` 值（`0 / 9 / 3 / 9`）在 `np_build.cpp` 里是**字面量**，
+* ⚠ 三个组间 `gapBefore`（`0 / 8 / 8 / 8`）在 `np_build.cpp` 里是**字面量**，
   **没有乘 `cfg.scale`**；而 `np_panel.cpp` 的 `Layout()` 里其它间距都乘了 `scale`。
   高缩放（scale = 2.0）时分组留白会显得偏紧 —— 已知的不一致，改的时候一起处理。
 * `hideTitle == true` 的分组在 `Measure/Render` 里会被当成分隔处理：
@@ -540,7 +543,7 @@ void rowRange(label, value, level, active, series, h, dec, warnMinBelow, warnMax
 | `Num(v, dec, unit)` | `v < -1000` → `—` |
 | `PctV` | `Num(v, 0, "%")` |
 | `Msv` | `Num(v, 2, " ms")` |
-| `Cv` | `v < -200` → `—`，否则 `%.0f ℃`（配合 `-273` 哨兵） |
+| `Cv` | `v < -200` → `—`，否则 `%.0f \u00b0C`（`°C`，配合 `-273` 哨兵） |
 | `Wv` / `MHzv` / `GBv` | `v < 0` → `—` |
 
 **哨兵值 → `—`** 的映射必须与 [`DATA-STRUCTS.md` §3.1](DATA-STRUCTS.md) 的约定一致。
@@ -600,8 +603,10 @@ void rowRange(label, value, level, active, series, h, dec, warnMinBelow, warnMax
   | `< 3` | 置上 `NP_C_GRAPH \| NP_C_CHART_FPS \| NP_C_CHART_LATENCY` |
   | `< 4` | 置上 `NP_C_CPU_CLOCK \| NP_C_CPU_POWER`（新开关对老用户默认打开，否则"看起来功能没做出来"） |
   | `< 5` | **清掉** `NP_C_CPU_BUSY \| NP_C_CPU_WAIT`（高级项默认关；**只清一次**，不覆盖用户后来的勾选） |
+  | `< 7` | 迁移 Apple Metal HUD 主题/预设/2 行顶栏与区间开关默认值 |
+  | `< 8` | 收紧默认字号 (`13`)、波高 (`46`)、背景不透明度 (`0.82`) 与主题 (`0`) |
 
-  当前写出的 `cfgVersion = 5`。**加新计数器位并希望老用户默认勾上，就必须加一条迁移并升版本号。**
+  当前写出的 `cfgVersion = 8`。**加新计数器位并希望老用户默认勾上，就必须加一条迁移并升版本号。**
 
 ---
 
@@ -805,15 +810,16 @@ python tests\merge_algo_check.py        # 帧内重复 Present 的合并算法
 
 ## 10. 未确认 / 待办（诚实标注）
 
-1. `sizeof` 数值未经本机编译验证（无编译器可用）：136 / 55736 与 ctypes 复现完全一致，
-   448 含 4 字节尾部填充。**建议加 `static_assert` 固定这三个尺寸。**
-2. `lowIntegral` / `lowPct` / `RunningMax` / `medianMs` / `HistRange` / `HystWarn`
+1. **`sizeof` 编译期固定与全字段测试**：`np_common.h` 已用 `#ifdef __cplusplus static_assert(...)`
+   锁定 `NPConfig == 136`、`NPSensors == 448`（含 4B 尾部填充）、`NPTelemetry == 55736`，
+   并与 `tests/struct_check.py` / `tests/verify_inject.py` 的全结构体逐字段偏移校对同步通过。
+2. `lowIntegral` / `lowPct` / `lowWindowed` / `RunningMax` / `medianMs` / `HistRange` / `HystWarn`
    当前**无调用点**（保留供对照或恢复功能）。是否删除需要产品决策。
 3. `NPSensors` 的 `domExt` / `domExtPresent` / `hwRtTensorSrc` / `gpuPowerLimit` /
    `screenW` / `screenH` / `refreshHz` 目前**面板不显示**（只在日志/诊断里）。
 4. `autoInject` 功能已废（`AppAutoInjectTick()` 故意留空），字段与 JSON 键仍在。
-5. 「恢复默认设置」**不会**复位 `autoInject` / `pauseHook` / `learnedAutoHook` / `detachPid`
-   （`NPDefaultConfig()` 不碰它们）—— 这算 bug 还是 feature 未确认。
+5. `NPDefaultConfig()` 现已显式将 `autoInject` / `pauseHook` / `learnedAutoHook` / `detachPid` 清零；
+   UI 的「恢复默认设置」（`A_DEFAULT`）在调用后立即按 `gApp.monitoring` 重新同步 `pauseHook`。
 6. `NPConfig::version` 恒为 1（不是 `sizeof`），与另外两个结构体的约定不一致；
    统一它需要同时改 `tests/diag.py` 与 `DATA-STRUCTS.md`。
 7. **源码在动**：本文写作期间 `np_common.h` 被并行修改过一次

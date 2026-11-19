@@ -6,8 +6,10 @@ COM 接口的 vtable 槽位顺序 == 虚函数声明顺序（含继承链上的�
 
 用法： python tests/vt_check.py
 """
+import glob
 import os
 import re
+import shutil
 import sys
 
 ZIG_LIB_CANDIDATES = [
@@ -19,9 +21,10 @@ ZIG_LIB_CANDIDATES = [
 EXPECTED = {
     "IDXGISwapChain": {
         "Present": 8, "GetBuffer": 9, "GetFullscreenState": 11, "GetDesc": 12,
+        "ResizeBuffers": 13,
     },
     "IDXGISwapChain1": {"GetHwnd": 20, "Present1": 22},
-    "IDXGISwapChain3": {"GetCurrentBackBufferIndex": 36},
+    "IDXGISwapChain3": {"GetCurrentBackBufferIndex": 36, "ResizeBuffers1": 39},
     "IDXGIFactory": {"CreateSwapChain": 10},
     "IDXGIFactory2": {"CreateSwapChainForHwnd": 15, "CreateSwapChainForComposition": 24},
     "ID3D12CommandQueue": {
@@ -46,12 +49,24 @@ VIRTUAL_RE = re.compile(r"^\s*virtual\s+[^;{]*?\b(\w+)\s*\(", re.M)
 
 
 def find_include_dir():
-    import glob
-    for base in ZIG_LIB_CANDIDATES:
-        for b in glob.glob(base):
-            p = os.path.join(b, "libc", "include", "any-windows-any")
-            if os.path.isdir(p):
-                return p
+    bases = []
+    np_zig = os.environ.get("NP_ZIG", "").strip().strip('"')
+    if np_zig and os.path.exists(np_zig):
+        bases.append(os.path.join(os.path.dirname(np_zig), "lib"))
+    which_zig = shutil.which("zig")
+    if which_zig:
+        bases.append(os.path.join(os.path.dirname(which_zig), "lib"))
+    try:
+        import ziglang
+        bases.append(os.path.join(os.path.dirname(ziglang.__file__), "lib"))
+    except Exception:
+        pass
+    for pattern in ZIG_LIB_CANDIDATES:
+        bases.extend(glob.glob(pattern))
+    for b in bases:
+        p = os.path.join(b, "libc", "include", "any-windows-any")
+        if os.path.isdir(p):
+            return p
     sys.exit("找不到 mingw 头文件目录（ziglang 装在哪？）")
 
 

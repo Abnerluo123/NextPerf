@@ -9,10 +9,21 @@
 #include "np_app.h"
 
 #include <tlhelp32.h>
+#include <psapi.h>
 #include <shellapi.h>
+#include <sddl.h>
+#include <aclapi.h>
+#include <atomic>
 #include <cstdarg>
 #include <cstdio>
 #include <algorithm>
+
+extern "C" {
+extern const uint8_t np_embed_hook64_begin[];
+extern const uint8_t np_embed_hook64_end[];
+extern const uint8_t np_embed_hook32_begin[];
+extern const uint8_t np_embed_hook32_end[];
+}
 
 namespace npa {
 
@@ -131,17 +142,178 @@ bool AdminRelaunch() {
     return true;
 }
 
-// ---------------------------------------------------------------- 路径
-std::wstring DllPath() {
-    if (!gApp.dllPath.empty()) return gApp.dllPath;
+// ---------------------------------------------------------------- 路径与单文件内嵌 DLL 释放
+std::wstring ExeDir() {
+    if (!gApp.exeDir.empty()) return gApp.exeDir;
     wchar_t buf[MAX_PATH]{};
     GetModuleFileNameW(nullptr, buf, MAX_PATH);
     std::wstring exe(buf);
     size_t p = exe.find_last_of(L"\\/");
-    std::wstring dir = (p == std::wstring::npos) ? L"." : exe.substr(0, p);
-    gApp.exeDir = dir;
-    gApp.dllPath = dir + L"\\NextPerfHook.dll";
-    return gApp.dllPath;
+    gApp.exeDir = (p == std::wstring::npos) ? L"." : exe.substr(0, p);
+    return gApp.exeDir;
+}
+
+bool HookEmbedInfo(size_t* bytes64, size_t* bytes32) {
+    size_t s64 = (size_t)(np_embed_hook64_end - np_embed_hook64_begin);
+    size_t s32 = (size_t)(np_embed_hook32_end - np_embed_hook32_begin);
+    if (bytes64) *bytes64 = s64;
+    if (bytes32) *bytes32 = s32;
+    return s64 > 1024 && s32 > 1024;
+}
+
+static uint64_t Fnv1a64(const uint8_t* data, size_t n) {
+    uint64_t h = 14695981039346656037ULL;
+    for (size_t i = 0; i < n; ++i) {
+        h ^= data[i];
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+static void GrantAppPackagesReadExec(const std::wstring& path) {
+    PSID sid = nullptr;
+    // S-1-15-2-1 = ALL APPLICATION PACKAGES，确保商店/UWP 游戏也能 LoadLibraryW
+    if (!ConvertStringSidToSidW(L"S-1-15-2-1", &sid) || !sid) return;
+    EXPLICIT_ACCESSW ea{};
+    ea.grfAccessPermissions = GENERIC_READ | GENERIC_EXECUTE;
+    ea.grfAccessMode = GRANT_ACCESS;
+    ea.grfInheritance = NO_INHERITANCE;
+    ea.Trustee.TrusteeForm = TRUSTEE_IS_SID;
+    ea.Trustee.TrusteeType = TRUSTEE_IS_WELL_KNOWN_GROUP;
+    ea.Trustee.ptstrName = reinterpret_cast<LPWSTR>(sid);
+    PACL oldDacl = nullptr, newDacl = nullptr;
+    PSECURITY_DESCRIPTOR sd = nullptr;
+    if (GetNamedSecurityInfoW(path.c_str(), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, nullptr,
+                              nullptr, &oldDacl, nullptr, &sd) == ERROR_SUCCESS) {
+        if (SetEntriesInAclW(1, &ea, oldDacl, &newDacl) == ERROR_SUCCESS && newDacl) {
+            SetNamedSecurityInfoW(const_cast<wchar_t*>(path.c_str()), SE_FILE_OBJECT,
+                                  DACL_SECURITY_INFORMATION, nullptr, nullptr, newDacl, nullptr);
+            LocalFree(newDacl);
+        }
+        if (sd) LocalFree(sd);
+    }
+    LocalFree(sid);
+}
+
+static void PruneOldHookDirs(const std::wstring& hooksRoot, const std::wstring& keepHash) {
+    static bool sPruned = false;
+    if (sPruned) return;
+    sPruned = true;
+    WIN32_FIND_DATAW fd{};
+    HANDLE hf = FindFirstFileW((hooksRoot + L"\\*").c_str(), &fd);
+    if (hf == INVALID_HANDLE_VALUE) return;
+    do {
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+        if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
+        if (keepHash == fd.cFileName) continue;
+        std::wstring sub = hooksRoot + L"\\" + fd.cFileName;
+        DeleteFileW((sub + L"\\NextPerfHook.dll").c_str());
+        DeleteFileW((sub + L"\\NextPerfHook32.dll").c_str());
+        RemoveDirectoryW(sub.c_str());
+    } while (FindNextFileW(hf, &fd));
+    FindClose(hf);
+}
+
+static bool FileMatchesSize(const std::wstring& path, size_t expected) {
+    WIN32_FILE_ATTRIBUTE_DATA fad{};
+    if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &fad)) return false;
+    if (fad.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) return false;
+    uint64_t sz = ((uint64_t)fad.nFileSizeHigh << 32) | (uint64_t)fad.nFileSizeLow;
+    return sz == (uint64_t)expected;
+}
+
+static std::wstring ExtractEmbeddedHook(bool is32) {
+    const uint8_t* beg = is32 ? np_embed_hook32_begin : np_embed_hook64_begin;
+    const uint8_t* end = is32 ? np_embed_hook32_end : np_embed_hook64_end;
+    size_t sz = (end >= beg) ? (size_t)(end - beg) : 0;
+    if (sz < 1024) return {};
+
+    wchar_t tmpDir[MAX_PATH]{};
+    DWORD n = GetEnvironmentVariableW(L"TEMP", tmpDir, MAX_PATH);
+    std::wstring base = (n && n < MAX_PATH) ? std::wstring(tmpDir) : ExeDir();
+    std::wstring npDir = base + L"\\NextPerf";
+    std::wstring hooksRoot = npDir + L"\\hooks";
+    CreateDirectoryW(npDir.c_str(), nullptr);
+    CreateDirectoryW(hooksRoot.c_str(), nullptr);
+
+    // 同一版本号哈希下放 64+32 两份 DLL，按整包合并哈希区分版本
+    uint64_t h = Fnv1a64(np_embed_hook64_begin, (size_t)(np_embed_hook64_end - np_embed_hook64_begin));
+    h ^= Fnv1a64(np_embed_hook32_begin, (size_t)(np_embed_hook32_end - np_embed_hook32_begin)) * 0x9E3779B97F4A7C15ULL;
+    wchar_t hex[24]{};
+    swprintf(hex, 24, L"%016llx", (unsigned long long)h);
+
+    std::wstring verDir = hooksRoot + L"\\" + hex;
+    CreateDirectoryW(verDir.c_str(), nullptr);
+    PruneOldHookDirs(hooksRoot, hex);
+
+    std::wstring target = verDir + (is32 ? L"\\NextPerfHook32.dll" : L"\\NextPerfHook.dll");
+    if (FileMatchesSize(target, sz)) return target;
+
+    wchar_t tmpPath[MAX_PATH]{};
+    swprintf(tmpPath, MAX_PATH, L"%ls.%lu.tmp", target.c_str(), (unsigned long)GetCurrentProcessId());
+    HANDLE hf = CreateFileW(tmpPath, GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS,
+                            FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hf == INVALID_HANDLE_VALUE) {
+        return FileMatchesSize(target, sz) ? target : std::wstring();
+    }
+    const uint8_t* p = beg;
+    size_t rem = sz;
+    bool writeOk = true;
+    while (rem > 0) {
+        DWORD chunk = (DWORD)std::min<size_t>(rem, 1024u * 1024u);
+        DWORD wr = 0;
+        if (!WriteFile(hf, p, chunk, &wr, nullptr) || wr != chunk) {
+            writeOk = false;
+            break;
+        }
+        p += wr;
+        rem -= wr;
+    }
+    CloseHandle(hf);
+
+    if (!writeOk) {
+        DeleteFileW(tmpPath);
+        return FileMatchesSize(target, sz) ? target : std::wstring();
+    }
+    if (!MoveFileExW(tmpPath, target.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+        DeleteFileW(tmpPath);
+        if (!FileMatchesSize(target, sz)) return {};
+    }
+    GrantAppPackagesReadExec(target);
+    return target;
+}
+
+std::wstring DllPath() {
+    {
+        AppLock lk;
+        if (!gApp.dllPath.empty() && GetFileAttributesW(gApp.dllPath.c_str()) != INVALID_FILE_ATTRIBUTES)
+            return gApp.dllPath;
+    }
+    std::wstring dir = ExeDir();
+    std::wstring path = ExtractEmbeddedHook(false);
+    if (path.empty()) path = dir + L"\\NextPerfHook.dll";
+    {
+        AppLock lk;
+        gApp.dllPath = path;
+    }
+    return path;
+}
+
+std::wstring DllPath32() {
+    {
+        AppLock lk;
+        if (!gApp.dllPath32.empty() &&
+            GetFileAttributesW(gApp.dllPath32.c_str()) != INVALID_FILE_ATTRIBUTES)
+            return gApp.dllPath32;
+    }
+    std::wstring dir = ExeDir();
+    std::wstring path = ExtractEmbeddedHook(true);
+    if (path.empty()) path = dir + L"\\NextPerfHook32.dll";
+    {
+        AppLock lk;
+        gApp.dllPath32 = path;
+    }
+    return path;
 }
 
 static std::wstring InjectMutexName(DWORD pid) {
@@ -309,12 +481,9 @@ bool InjectInto(DWORD pid) {
 
     // ---- 按目标进程位数选 DLL
     // 32 位进程**加载不了** 64 位 DLL（反之亦然），必须各用各的。
-    // 原来的行为是检测到 32 位目标就直接拒绝注入，现在两边都编了，改用 32 位那份。
+    // 现已内置 64/32 位双份钩子并按需释放到 %TEMP%，失败时回退到 exe 同目录。
     if (ProcessIsWow64(pid)) {
-        size_t dot = dll.find_last_of(L'.');
-        std::wstring p32 = (dot == std::wstring::npos)
-                               ? dll + L"32"
-                               : dll.substr(0, dot) + L"32" + dll.substr(dot);
+        std::wstring p32 = DllPath32();
         if (GetFileAttributesW(p32.c_str()) != INVALID_FILE_ATTRIBUTES) {
             dll = p32;
             AppLog("inject %s: target is 32-bit, using 32-bit hook %ls", who.c_str(),
@@ -322,8 +491,7 @@ bool InjectInto(DWORD pid) {
         } else {
             AppLog("inject %s: target is 32-bit but NextPerfHook32.dll is missing",
                    who.c_str());
-            SetNotice("目标是 32 位进程，但程序目录下没有 NextPerfHook32.dll，无法注入：" + who,
-                      1, 20000);
+            SetNotice("目标是 32 位进程，但 32 位钩子提取/定位失败：" + who, 1, 20000);
             return false;
         }
     }
@@ -331,7 +499,7 @@ bool InjectInto(DWORD pid) {
     DWORD attr = GetFileAttributesW(dll.c_str());
     if (attr == INVALID_FILE_ATTRIBUTES) {
         AppLog("inject %s: DLL not found at %ls", who.c_str(), dll.c_str());
-        SetNotice("找不到 NextPerfHook.dll（应在 " + std::string("程序目录") + "），无法注入", 1);
+        SetNotice("找不到 NextPerfHook.dll（内嵌释放及同目录均未找到），无法注入", 1);
         return false;
     }
 
@@ -491,69 +659,138 @@ static std::vector<ProcEntry> EnumProcesses() {
 // 下次再注入这个游戏，钩子一看 detachPid == 自己就**立刻又自卸载**。
 // 2.5 秒足够钩子（200ms 一轮）完成 SelfUnloadNow。
 static uint32_t gDetachAt = 0;
+static std::vector<DWORD> gDetachQueue;
+static std::atomic<bool> gAsyncBusy{false};
 
 void RequestHookDetach(DWORD pid) {
     if (!pid) return;
-    gApp.cfg.detachPid = pid;
-    gDetachAt = GetTickCount() ? GetTickCount() : 1;
+    bool publishNow = false;
+    {
+        AppLock lk;
+        if (gApp.cfg.detachPid == 0) {
+            gApp.cfg.detachPid = pid;
+            gDetachAt = GetTickCount() ? GetTickCount() : 1;
+            publishNow = true;
+        } else if (gApp.cfg.detachPid != pid) {
+            bool queued = false;
+            for (DWORD q : gDetachQueue) {
+                if (q == pid) { queued = true; break; }
+            }
+            if (!queued) gDetachQueue.push_back(pid);
+        }
+    }
     AppLog("detach: 请求 pid=%lu 的钩子自卸载", (unsigned long)pid);
+    if (publishNow) AppPublish();
 }
 
-// 移除第 index 条游戏记录：**先卸载钩子再删条目**。
-// 不卸载的话，学习逻辑会立刻从还活着的数据里把它重新学回来 ——
-// 这正是用户报的「清空后又自己回来」。
-void ForgetGameAt(int index) {
-    if (index < 0 || index >= (int)gApp.games.size()) return;
+static bool ClearStaleDetachPidWithAliveLocked(bool stillAlive) {
+    if (gApp.cfg.detachPid == 0) return false;
+    bool stillInjected = stillAlive && IsInjected(gApp.cfg.detachPid);
+    uint32_t tnow = GetTickCount();
+    bool timeout = gDetachAt && tnow - gDetachAt >= 5000;
+    if (stillInjected && !timeout) return false;
+
+    AppLog("detach: 清除 detachPid（pid=%lu %s）",
+           (unsigned long)gApp.cfg.detachPid,
+           !stillAlive ? "已退出" : (!stillInjected ? "互斥量已释放" : "已超时 5s"));
+    gApp.cfg.detachPid = 0;
+    gDetachAt = 0;
+
+    while (!gDetachQueue.empty()) {
+        DWORD next = gDetachQueue.front();
+        gDetachQueue.erase(gDetachQueue.begin());
+        if (ProcessAlive(next) && IsInjected(next)) {
+            gApp.cfg.detachPid = next;
+            gDetachAt = tnow ? tnow : 1;
+            AppLog("detach: 从队列推进下一卸载目标 pid=%lu", (unsigned long)next);
+            break;
+        }
+    }
+    return true;
+}
+
+static bool ClearStaleDetachPidLocked(const std::vector<ProcEntry>& procs) {
+    if (gApp.cfg.detachPid == 0) return false;
+    bool stillAlive = false;
+    for (const auto& p : procs) {
+        if (p.pid == gApp.cfg.detachPid) { stillAlive = true; break; }
+    }
+    return ClearStaleDetachPidWithAliveLocked(stillAlive);
+}
+
+static bool ClearStaleDetachPidByAliveLocked() {
+    if (gApp.cfg.detachPid == 0) return false;
+    return ClearStaleDetachPidWithAliveLocked(ProcessAlive(gApp.cfg.detachPid));
+}
+
+static bool IsPidQueuedForDetachLocked(DWORD pid) {
+    if (!pid) return false;
+    if (gApp.cfg.detachPid == pid) return true;
+    for (DWORD q : gDetachQueue) {
+        if (q == pid) return true;
+    }
+    return false;
+}
+
+// 内部：已在 AppLock 下移除 index 并清理内存状态，收集需要异步下发卸载的 pid
+static void RemoveGameLocked(size_t index, const std::vector<ProcEntry>* procs,
+                             std::vector<DWORD>* outDetachPids, std::wstring* outName) {
+    if (index >= gApp.games.size()) return;
     DWORD pid = gApp.games[index].pid;
     std::wstring nm = gApp.games[index].name.empty() ? ExeNameOf(gApp.games[index].path)
                                                      : gApp.games[index].name;
-
-    // ★ pid 为 0 时**当场按名字查一遍进程**。
-    //   g.pid 是由 InjectorScanNow 填的，而它在 !monitoring 时直接 return，
-    //   所以监视关着、或条目刚学习完还没被扫过时 pid 都是 0 ——
-    //   原来 `if (pid)` 不成立就**根本没请求卸载**（用户报的「清空没有正确退出 hook」）。
-    if (!pid && !nm.empty()) {
-        for (auto& p : EnumProcesses()) {
+    if (!pid && !nm.empty() && procs) {
+        for (const auto& p : *procs) {
             if (p.pid == GetCurrentProcessId()) continue;
             if (p.name == nm) { pid = p.pid; break; }
         }
     }
-
     if (pid) {
-        RequestHookDetach(pid);
-
-        // ★ 摘掉「已注入」记录：否则 IsInjected 仍为真 -> 界面显示"已接管"、
-        //   而且自动注入不会再处理它（用户报的「接管状态没清空」）。
-        {
-            AppLock lk;
-            for (size_t i = gApp.injected.size(); i-- > 0;) {
-                if (gApp.injected[i] == pid) gApp.injected.erase(gApp.injected.begin() + i);
-            }
-            // ★ 遥测属于这个 pid 就清掉：否则 attached 仍为真，面板还以为钩子活着。
-            if (gApp.telemetry.pid == pid) {
-                NPClearTelemetry(&gApp.telemetry);
-                AppLog("forget: 已清空 pid=%lu 的遥测（接管状态）", (unsigned long)pid);
-            }
-            gApp.games.erase(gApp.games.begin() + index);
+        if (outDetachPids) outDetachPids->push_back(pid);
+        for (size_t i = gApp.injected.size(); i-- > 0;) {
+            if (gApp.injected[i] == pid) gApp.injected.erase(gApp.injected.begin() + i);
         }
-    } else {
-        AppLock lk;
-        gApp.games.erase(gApp.games.begin() + index);
+        if (gApp.telemetry.pid == pid) {
+            NPClearTelemetry(&gApp.telemetry);
+            AppLog("forget: 已清空 pid=%lu 的遥测（接管状态）", (unsigned long)pid);
+        }
     }
+    gApp.games.erase(gApp.games.begin() + index);
+    if (outName) *outName = nm;
+}
 
-    AppLog("forget: 已移除 %ls（pid=%lu，已请求卸载钩子）", nm.c_str(), (unsigned long)pid);
+// 移除第 index 条游戏记录：**先卸载钩子再删条目**。
+void ForgetGameAt(int index) {
+    auto procs = EnumProcesses();
+    std::vector<DWORD> detachPids;
+    std::wstring nm;
+    {
+        AppLock lk;
+        if (index < 0 || index >= (int)gApp.games.size()) return;
+        RemoveGameLocked((size_t)index, &procs, &detachPids, &nm);
+    }
+    for (DWORD pid : detachPids) RequestHookDetach(pid);
+    AppLog("forget: 已移除 %ls（已请求 %zu 个进程卸载钩子）", nm.c_str(), detachPids.size());
     SettingsSave();
 }
 
-// 清空「学习来的」条目（手动添加的保留）。逐条走 ForgetGameAt 同一入口。
+// 清空「学习来的」条目（手动添加的保留）。
 int ForgetLearned() {
+    auto procs = EnumProcesses();
+    std::vector<DWORD> detachPids;
     int n = 0;
-    for (size_t i = gApp.games.size(); i-- > 0;) {
-        if (gApp.games[i].learned) {
-            ForgetGameAt((int)i);
-            ++n;
+    {
+        AppLock lk;
+        for (size_t i = gApp.games.size(); i-- > 0;) {
+            if (gApp.games[i].learned) {
+                RemoveGameLocked(i, &procs, &detachPids, nullptr);
+                ++n;
+            }
         }
     }
+    for (DWORD pid : detachPids) RequestHookDetach(pid);
+    if (n > 0) SettingsSave();
+    AppLog("forget learned: removed %d entries (detach queued=%zu)", n, detachPids.size());
     return n;
 }
 
@@ -579,7 +816,7 @@ void InjectorScanNow() {
         //   反复 LoadLibrary，撞 loader lock 就挂死）。
         //   根因修复见 main.cpp `CleanupAndExit` 里的说明（2026-10-11）。
         if (gApp.cfg.quit) return;
-        if (!gApp.monitoring || gApp.games.empty()) return;
+        if (!gApp.monitoring) return;
     }
 
     auto procs = EnumProcesses();   // 纯本线程数据，锁外做，别占着锁
@@ -588,9 +825,11 @@ void InjectorScanNow() {
     // InjectInto 里那个 WaitForSingleObject 最长等 10 秒，如果在锁里做，
     // 主线程的界面刷新（AppPublish / AppPollSensors 都要拿这把锁）会一起卡死。
     std::vector<DWORD> toInject;
+    bool detachDirty = false;
 
     {
         AppLock lk;
+        detachDirty = ClearStaleDetachPidLocked(procs);
         // 每轮把「配置的游戏现在是什么状态」重新算一遍，UI 直接显示这个。
         // 用户看到的「待注入」原来没有任何解释，这一栏就是解释。
         for (auto& g : gApp.games) {
@@ -605,27 +844,6 @@ void InjectorScanNow() {
             for (auto& p : procs) {
                 if (p.pid == GetCurrentProcessId()) continue;
                 if (p.name == want) { pid = p.pid; break; }
-            }
-            // detachPid 用完就清，两种情况都清：
-            //   a) 目标 pid 已退出
-            //   b) 请求发出超过 2.5 秒（卸载早就完成了）—— 这一条是必须的：
-            //      只在退出时清的话，游戏还活着时 detachPid 会一直留着，
-            //      下次再注入它会立刻又被卸载。
-            //   pid 复用的问题也由此解决（清掉之后就不会误伤新进程）。
-            if (gApp.cfg.detachPid != 0) {
-                bool stillAlive = false;
-                for (auto& p : procs) {
-                    if (p.pid == gApp.cfg.detachPid) { stillAlive = true; break; }
-                }
-                uint32_t tnow = GetTickCount();
-                bool timeout = gDetachAt && tnow - gDetachAt >= 2500;
-                if (!stillAlive || timeout) {
-                    AppLog("detach: 清除 detachPid（pid=%lu %s）",
-                           (unsigned long)gApp.cfg.detachPid,
-                           stillAlive ? "已超时 2.5s，卸载应已完成" : "已退出");
-                    gApp.cfg.detachPid = 0;
-                    gDetachAt = 0;
-                }
             }
             if (pid != g.pid) {
                 if (pid) AppLog("watch: %ls is running (pid=%lu)", want.c_str(), (unsigned long)pid);
@@ -649,7 +867,7 @@ void InjectorScanNow() {
                 if (g.pid == p.pid) {      // 只注入这一轮匹配上的那个进程
                     // ★ 正在请求它卸载的 pid 不要注入：否则就是那个死循环的另一半
                     //   （注入 -> 钩子看到 detachPid==自己 -> 立刻卸载 -> 下一轮又注入）。
-                    if (gApp.cfg.detachPid == p.pid) break;
+                    if (IsPidQueuedForDetachLocked(p.pid)) break;
                     // ★ 不要「一看到进程就注入」。
                     //   实测（2026-10-11，生化危机8 · DX12）：进程刚起来就注入 -> **游戏闪退**；
                     //   进到游戏里再手动注入 -> 不闪退。原因是早期注入正好撞上游戏自己
@@ -676,6 +894,8 @@ void InjectorScanNow() {
             }
         }
     }
+
+    if (detachDirty) AppPublish();
 
     for (DWORD pid : toInject) {
         InjectInto(pid);                   // 自己会加锁登记
@@ -710,24 +930,27 @@ void InjectorShutdown() {
 
 void InjectorTick() {
     // 主循环里定期调用，清理已经退出的进程
-    // ★ 整段都在锁里：它遍历/修改 gApp.injected，而这个 vector 同时被守护线程
-    //   （InjectorScanNow）和主线程的 AppPublish 读写。
-    AppLock lk;
-    for (size_t i = 0; i < gApp.injected.size();) {
-        if (!ProcessAlive(gApp.injected[i])) gApp.injected.erase(gApp.injected.begin() + i);
-        else ++i;
+    bool detachDirty = false;
+    {
+        AppLock lk;
+        detachDirty = ClearStaleDetachPidByAliveLocked();
+        for (size_t i = 0; i < gApp.injected.size();) {
+            if (!ProcessAlive(gApp.injected[i])) gApp.injected.erase(gApp.injected.begin() + i);
+            else ++i;
+        }
+        // 已经退出的进程，遥测映射也一起收掉，免得读到一堆陈旧数据
+        for (size_t i = 0; i < gApp.telSlots.size();) {
+            DWORD pid = gApp.telSlots[i].pid;
+            bool keep = false;
+            for (DWORD k : gApp.injected) if (k == pid) keep = true;
+            if (keep) { ++i; continue; }
+            if (gApp.telSlots[i].view) UnmapViewOfFile(gApp.telSlots[i].view);
+            if (gApp.telSlots[i].map) CloseHandle(gApp.telSlots[i].map);
+            if (gApp.telemetryPid == pid) gApp.telemetryPid = 0;
+            gApp.telSlots.erase(gApp.telSlots.begin() + i);
+        }
     }
-    // 已经退出的进程，遥测映射也一起收掉，免得读到一堆陈旧数据
-    for (size_t i = 0; i < gApp.telSlots.size();) {
-        DWORD pid = gApp.telSlots[i].pid;
-        bool keep = false;
-        for (DWORD k : gApp.injected) if (k == pid) keep = true;
-        if (keep) { ++i; continue; }
-        if (gApp.telSlots[i].view) UnmapViewOfFile(gApp.telSlots[i].view);
-        if (gApp.telSlots[i].map) CloseHandle(gApp.telSlots[i].map);
-        if (gApp.telemetryPid == pid) gApp.telemetryPid = 0;
-        gApp.telSlots.erase(gApp.telSlots.begin() + i);
-    }
+    if (detachDirty) AppPublish();
 }
 
 void TelemetryCloseAll() {
@@ -767,6 +990,281 @@ std::wstring ProcessExeName(DWORD pid) {
     std::wstring p = ProcessImagePath(pid);
     size_t i = p.find_last_of(L"\\/");
     return (i == std::wstring::npos) ? p : p.substr(i + 1);
+}
+
+static bool IsIgnoredNonGameExe(const std::wstring& lowerName) {
+    static const wchar_t* kSkip[] = {
+        L"nextperf.exe", L"explorer.exe", L"dwm.exe", L"csrss.exe",
+        L"applicationframehost.exe", L"shellexperiencehost.exe", L"searchhost.exe",
+        L"startmenuexperiencehost.exe", L"textinputhost.exe", L"systemsettings.exe",
+        L"taskmgr.exe", L"chrome.exe", L"msedge.exe", L"firefox.exe", L"opera.exe",
+        L"brave.exe", L"code.exe", L"devenv.exe", L"discord.exe", L"wechat.exe",
+        L"weixin.exe", L"qq.exe", L"tim.exe", L"obsidian.exe", L"antigravity.exe",
+        L"cmd.exe", L"powershell.exe", L"pwsh.exe", L"windowsterminal.exe",
+        L"conhost.exe", L"svchost.exe"
+    };
+    for (const wchar_t* s : kSkip) {
+        if (lowerName == s) return true;
+    }
+    return false;
+}
+
+static bool IsGraphicsModuleName(const wchar_t* mod) {
+    if (!mod) return false;
+    return _wcsicmp(mod, L"D3D12Core.dll") == 0 || _wcsicmp(mod, L"d3d12.dll") == 0 ||
+           _wcsicmp(mod, L"d3d11.dll") == 0 || _wcsicmp(mod, L"vulkan-1.dll") == 0 ||
+           _wcsicmp(mod, L"d3d9.dll") == 0;
+}
+
+static bool ProcessUsesGraphicsApi(DWORD pid, bool* outEnumFailed) {
+    if (outEnumFailed) *outEnumFailed = false;
+    HANDLE hProc = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
+    if (hProc) {
+        for (int attempt = 0; attempt < 3; ++attempt) {
+            HMODULE mods[1024]{};
+            DWORD needed = 0;
+            if (EnumProcessModulesEx(hProc, mods, sizeof(mods), &needed, LIST_MODULES_ALL)) {
+                size_t count = std::min<size_t>(needed / sizeof(HMODULE), 1024);
+                bool hit = false;
+                for (size_t i = 0; i < count; ++i) {
+                    wchar_t baseName[MAX_PATH]{};
+                    if (GetModuleBaseNameW(hProc, mods[i], baseName, MAX_PATH) &&
+                        IsGraphicsModuleName(baseName)) {
+                        hit = true;
+                        break;
+                    }
+                }
+                CloseHandle(hProc);
+                return hit;
+            }
+            if (GetLastError() != ERROR_BAD_LENGTH) break;
+            Sleep(5);
+        }
+        CloseHandle(hProc);
+    }
+
+    HANDLE snap = INVALID_HANDLE_VALUE;
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
+        if (snap != INVALID_HANDLE_VALUE) break;
+        if (GetLastError() != ERROR_BAD_LENGTH) break;
+        Sleep(5);
+    }
+    if (snap == INVALID_HANDLE_VALUE) {
+        if (outEnumFailed) *outEnumFailed = true;
+        return false;
+    }
+    bool hit = false;
+    MODULEENTRY32W me{};
+    me.dwSize = sizeof(me);
+    if (Module32FirstW(snap, &me)) {
+        do {
+            if (IsGraphicsModuleName(me.szModule)) {
+                hit = true;
+                break;
+            }
+        } while (Module32NextW(snap, &me));
+    }
+    CloseHandle(snap);
+    return hit;
+}
+
+int ScanRunningGames() {
+    struct WinCand {
+        DWORD pid = 0;
+        bool  isUwp = false;
+    };
+    struct Cand {
+        DWORD pid = 0;
+        std::wstring path;
+        std::wstring lowerName;
+    };
+    std::vector<WinCand> wins;
+    struct EnumCtx {
+        std::vector<WinCand>* wins;
+        DWORD selfPid;
+    } ctx{&wins, GetCurrentProcessId()};
+
+    EnumWindows(
+        [](HWND hw, LPARAM lp) -> BOOL {
+            if (!IsWindowVisible(hw)) return TRUE;
+            RECT rc{};
+            if (!GetWindowRect(hw, &rc) || (rc.right - rc.left) < 160 ||
+                (rc.bottom - rc.top) < 120)
+                return TRUE;
+            auto* c = reinterpret_cast<EnumCtx*>(lp);
+            DWORD pid = 0;
+            GetWindowThreadProcessId(hw, &pid);
+            if (!pid || pid == c->selfPid) return TRUE;
+            bool isUwp = false;
+
+            // 若是 UWP 外壳窗口，顺带尝试解出子窗口真实 PID
+            wchar_t cls[64]{};
+            GetClassNameW(hw, cls, 64);
+            if (_wcsicmp(cls, L"ApplicationFrameWindow") == 0) {
+                isUwp = true;
+                EnumChildWindows(
+                    hw,
+                    [](HWND ch, LPARAM clp) -> BOOL {
+                        auto* outPid = reinterpret_cast<DWORD*>(clp);
+                        DWORD cp = 0;
+                        GetWindowThreadProcessId(ch, &cp);
+                        if (cp && cp != *outPid) {
+                            *outPid = cp;
+                            return FALSE;
+                        }
+                        return TRUE;
+                    },
+                    reinterpret_cast<LPARAM>(&pid));
+            }
+            for (const auto& existing : *c->wins)
+                if (existing.pid == pid) return TRUE;
+            c->wins->push_back({pid, isUwp});
+            return TRUE;
+        },
+        reinterpret_cast<LPARAM>(&ctx));
+
+    auto procs = EnumProcesses();
+    std::vector<Cand> discovered;
+    for (const auto& wc : wins) {
+        DWORD pid = wc.pid;
+        std::wstring path = ProcessImagePath(pid);
+        std::wstring nm = ExeNameOf(path);
+        if (nm.empty()) {
+            for (auto& pr : procs) {
+                if (pr.pid == pid) { nm = pr.name; break; }
+            }
+        }
+        if (nm.empty() || IsIgnoredNonGameExe(nm) || IsAntiCheatExeName(nm)) continue;
+        std::wstring pathLower = path;
+        std::transform(pathLower.begin(), pathLower.end(), pathLower.begin(), ::towlower);
+        bool enumFailed = false;
+        bool hasGfx = ProcessUsesGraphicsApi(pid, &enumFailed);
+        bool uwpFallback = enumFailed &&
+                           (wc.isUwp || pathLower.find(L"\\windowsapps\\") != std::wstring::npos);
+        if (!hasGfx && !uwpFallback) continue;
+        discovered.push_back({pid, path, nm});
+    }
+
+    int added = 0;
+    {
+        AppLock lk;
+        for (auto& c : discovered) {
+            bool dup = false;
+            for (auto& g : gApp.games) {
+                std::wstring gn = g.name.empty() ? ExeNameOf(g.path) : g.name;
+                if (gn == c.lowerName) {
+                    if (g.path.empty() && !c.path.empty()) g.path = c.path;
+                    dup = true;
+                    break;
+                }
+            }
+            if (dup) continue;
+            GameEntry ge;
+            ge.path = c.path;
+            ge.name = c.lowerName;
+            gApp.games.push_back(ge);
+            ++added;
+            AppLog("scan games: added %ls (pid=%lu)", c.lowerName.c_str(), (unsigned long)c.pid);
+        }
+    }
+    if (added > 0) {
+        SettingsSave();
+        InjectorScanNow();
+        SetNotice("扫描完成：已添加 " + std::to_string(added) + " 个运行中的 3D 游戏", 0, 8000);
+    } else {
+        SetNotice("扫描完成：未发现新的可追踪 3D 游戏窗口", 0, 5000);
+    }
+    return added;
+}
+
+static void NotifyUiAsyncDone() {
+    if (HWND hw = UiWindow()) PostMessageW(hw, WM_USER + 101, 0, 0);
+}
+
+static DWORD WINAPI AsyncInjectThread(LPVOID param) {
+    DWORD pid = (DWORD)(uintptr_t)param;
+    InjectInto(pid);
+    {
+        AppLock lk;
+        for (auto& g : gApp.games) {
+            if (g.pid == pid) g.injected = IsInjected(pid);
+        }
+    }
+    gAsyncBusy.store(false, std::memory_order_release);
+    NotifyUiAsyncDone();
+    return 0;
+}
+
+static DWORD WINAPI AsyncScanThread(LPVOID) {
+    ScanRunningGames();
+    gAsyncBusy.store(false, std::memory_order_release);
+    NotifyUiAsyncDone();
+    return 0;
+}
+
+bool IsAsyncJobRunning() {
+    return gAsyncBusy.load(std::memory_order_acquire);
+}
+
+void RequestInjectPidAsync(DWORD pid) {
+    if (!pid) return;
+    bool expected = false;
+    if (!gAsyncBusy.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+        SetNotice("正在执行上一项注入或扫描任务，请稍候…", 0, 3000);
+        return;
+    }
+    SetNotice("正在注入目标进程，请稍候…", 0, 5000);
+    HANDLE h = CreateThread(nullptr, 0, AsyncInjectThread, (LPVOID)(uintptr_t)pid, 0, nullptr);
+    if (!h) {
+        gAsyncBusy.store(false, std::memory_order_release);
+        InjectInto(pid);
+        NotifyUiAsyncDone();
+        return;
+    }
+    CloseHandle(h);
+}
+
+void RequestInjectFrontAsync() {
+    DWORD targetPid = gApp.forePid;
+    if (!targetPid) {
+        HWND fg = GetForegroundWindow();
+        if (fg) {
+            DWORD p = 0;
+            GetWindowThreadProcessId(fg, &p);
+            if (p && p != GetCurrentProcessId()) targetPid = p;
+        }
+    }
+    if (!targetPid) {
+        SetNotice("没有可用的前台游戏进程：请先切回游戏窗口后再注入", 1, 10000);
+        NotifyUiAsyncDone();
+        return;
+    }
+    RequestInjectPidAsync(targetPid);
+}
+
+void RequestScanGamesAsync() {
+    bool expected = false;
+    if (!gAsyncBusy.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+        SetNotice("正在执行上一项注入或扫描任务，请稍候…", 0, 3000);
+        return;
+    }
+    SetNotice("正在扫描运行中的 3D 游戏窗口…", 0, 5000);
+    HANDLE h = CreateThread(nullptr, 0, AsyncScanThread, nullptr, 0, nullptr);
+    if (!h) {
+        gAsyncBusy.store(false, std::memory_order_release);
+        ScanRunningGames();
+        NotifyUiAsyncDone();
+        return;
+    }
+    CloseHandle(h);
+}
+
+uint32_t GameAutoInjectRemainingMs(const GameEntry& g) {
+    if (!gApp.monitoring || !g.pid || g.injected || !g.seenAtMs) return 0;
+    if (g.learned && !gApp.cfg.learnedAutoHook) return 0;
+    DWORD age = GetTickCount() - g.seenAtMs;
+    return (age >= kAutoInjectDelayMs) ? 0u : (uint32_t)(kAutoInjectDelayMs - age);
 }
 
 }  // namespace npa

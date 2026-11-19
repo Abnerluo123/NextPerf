@@ -27,6 +27,7 @@ enum {
     NP_TRAY_EXIT = 1004,
     NP_TRAY_ELEVATE = 1005,
     NP_TRAY_LOGDIR = 1006,
+    NP_TRAY_LAYOUT = 1007,
 };
 
 void AppTrayNotify(UINT notifyMsg);
@@ -51,6 +52,19 @@ struct GameEntry {
     // true = 由「注入成功后自动学习」加的（见 main.cpp 的学习逻辑）；
     // false = 用户手动添加的。
     bool  learned = false;
+};
+
+struct BenchmarkSummary {
+    bool        valid = false;
+    uint32_t    samples = 0;
+    float       durationSec = 0.0f;
+    float       avgFps = 0.0f;
+    float       minFps = 0.0f;
+    float       maxFps = 0.0f;
+    float       low1Fps = 0.0f;
+    float       low01Fps = 0.0f;
+    std::string processName;
+    std::wstring csvPath;
 };
 
 struct AppState {
@@ -106,10 +120,12 @@ struct AppState {
 
     std::string statusText;
     std::wstring dllPath;
+    std::wstring dllPath32;
     std::wstring exeDir;
 
     uint64_t lastPoll = 0;
     uint64_t lastOverlay = 0;
+    BenchmarkSummary lastBench;
 };
 
 extern AppState gApp;
@@ -165,12 +181,22 @@ void ForgetGameAt(int index);
 int  ForgetLearned();
 void InjectorTick();
 void InjectorScanNow();
+int  ScanRunningGames();
+void RequestInjectPidAsync(DWORD pid);
+void RequestInjectFrontAsync();
+void RequestScanGamesAsync();
+bool IsAsyncJobRunning();
+uint32_t GameAutoInjectRemainingMs(const GameEntry& g);
+std::wstring ExeDir();
 std::wstring DllPath();
+std::wstring DllPath32();
+bool HookEmbedInfo(size_t* bytes64, size_t* bytes32);
 // 进程信息小工具
 bool         ProcessAlive(DWORD pid);
 std::wstring ProcessImagePath(DWORD pid);
 std::wstring ProcessExeName(DWORD pid);   // 带扩展名，原样大小写
 bool         ProcessIsWow64(DWORD pid);   // 32 位进程跑在 64 位系统上
+bool         IsAntiCheatExeName(const std::wstring& lowerName);
 void         TelemetryCloseAll();         // 关闭全部遥测映射
 
 // ---- ui.cpp
@@ -183,5 +209,11 @@ HWND UiWindow();
 void AppPollSensors();
 void AppPublish();
 void AppTrackForeground();   // 记录最近一个非本进程的前台窗口
+void BenchmarkToggle();
+bool BenchmarkActive();
+void AppResetHistory();
+bool AppCopyDiagToClipboard();
+bool AppOverlayVisible();
+void AppSetOverlayOff(bool off);
 
 }  // namespace npa

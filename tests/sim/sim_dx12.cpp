@@ -118,7 +118,9 @@ private:
 
     bool CreateDeviceAndQueue(std::string* err);
     bool CreateSwapChain(std::string* err);
+    bool CreateBackBufferRtvs(std::string* err);
     bool CreateFrameResources(std::string* err);
+    void CreateComputeResources();
     void ReleaseBackBuffers();
     bool WaitForFrameRing(int slot, DWORD timeout_ms);
     void ReadSlotTimestamps(int slot);
@@ -142,6 +144,9 @@ private:
     Com<ID3D12QueryHeap> ts_heap_;
     Com<ID3D12Resource> ts_resolve_;    // ResolveQueryData 的目标（DEFAULT 堆）
     Com<ID3D12Resource> bb_[kMaxBuffers];
+    Com<ID3D12RootSignature> cs_rs_;
+    Com<ID3D12PipelineState> cs_pso_;
+    Com<ID3D12Resource> cs_uav_;
 
     FrameRes ring_[kFrameRing];
     UINT rtv_inc_ = 0;
@@ -314,22 +319,24 @@ void Dx12Engine::ReleaseBackBuffers() {
     for (int i = 0; i < kMaxBuffers; ++i) bb_[i].Reset();
 }
 
-bool Dx12Engine::CreateFrameResources(std::string* err) {
-    // RTV 描述符堆
-    D3D12_DESCRIPTOR_HEAP_DESC hd{};
-    hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-    hd.NumDescriptors = (UINT)buffer_count_;
-    hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;  // RTV 堆不参与 shader 可见绑定
-    HRESULT hr = dev_->CreateDescriptorHeap(&hd, IID_PPV_ARGS(rtv_heap_.Put()));
-    if (FAILED(hr)) {
-        *err = "CreateDescriptorHeap(RTV) 失败";
-        return false;
+bool Dx12Engine::CreateBackBufferRtvs(std::string* err) {
+    if (!rtv_heap_) {
+        // RTV 描述符堆（Resize 时复用原有堆，不重复创建）
+        D3D12_DESCRIPTOR_HEAP_DESC hd{};
+        hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+        hd.NumDescriptors = (UINT)buffer_count_;
+        hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;  // RTV 堆不参与 shader 可见绑定
+        HRESULT hr = dev_->CreateDescriptorHeap(&hd, IID_PPV_ARGS(rtv_heap_.Put()));
+        if (FAILED(hr)) {
+            *err = "CreateDescriptorHeap(RTV) 失败";
+            return false;
+        }
+        rtv_inc_ = dev_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
     }
-    rtv_inc_ = dev_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
 
     D3D12_CPU_DESCRIPTOR_HANDLE h = rtv_heap_->GetCPUDescriptorHandleForHeapStart();
     for (int i = 0; i < buffer_count_; ++i) {
-        hr = swap_->GetBuffer((UINT)i, IID_PPV_ARGS(bb_[i].Put()));
+        HRESULT hr = swap_->GetBuffer((UINT)i, IID_PPV_ARGS(bb_[i].Put()));
         if (FAILED(hr) || !bb_[i]) {
             *err = "交换链 GetBuffer(" + std::to_string(i) + ") 失败";
             return false;
@@ -338,6 +345,12 @@ bool Dx12Engine::CreateFrameResources(std::string* err) {
         rh.ptr += (SIZE_T)i * rtv_inc_;
         dev_->CreateRenderTargetView(bb_[i].Get(), nullptr, rh);
     }
+    return true;
+}
+
+bool Dx12Engine::CreateFrameResources(std::string* err) {
+    if (!CreateBackBufferRtvs(err)) return false;
+    HRESULT hr = S_OK;
 
     // 每帧的命令分配器 + 时间戳回读缓冲
     for (int i = 0; i < kFrameRing; ++i) {
@@ -444,6 +457,85 @@ bool Dx12Engine::CreateFrameResources(std::string* err) {
     return true;
 }
 
+void Dx12Engine::CreateComputeResources() {
+    // 动态加载 D3D12SerializeRootSignature 与 D3DCompile（零额外链接依赖）；
+    // 即使在精简环境找不到 d3dcompiler_47.dll，也只跳过 Compute Pass，不阻塞初始化。
+    typedef HRESULT(WINAPI* PFN_D3DCompile)(LPCVOID, SIZE_T, LPCSTR, const void*, void*, LPCSTR,
+                                            LPCSTR, UINT, UINT, ID3DBlob**, ID3DBlob**);
+    typedef HRESULT(WINAPI* PFN_SerRS)(const D3D12_ROOT_SIGNATURE_DESC*, D3D_ROOT_SIGNATURE_VERSION,
+                                       ID3DBlob**, ID3DBlob**);
+    HMODULE modD3D12 = GetModuleHandleW(L"d3d12.dll");
+    HMODULE modComp = LoadLibraryW(L"d3dcompiler_47.dll");
+    if (!modComp) modComp = LoadLibraryW(L"d3dcompiler.dll");
+    auto pSer = modD3D12 ? (PFN_SerRS)GetProcAddress(modD3D12, "D3D12SerializeRootSignature") : nullptr;
+    auto pComp = modComp ? (PFN_D3DCompile)GetProcAddress(modComp, "D3DCompile") : nullptr;
+    if (!pSer || !pComp) return;
+
+    static const char* kCsSrc =
+        "RWByteAddressBuffer outBuf : register(u0);\n"
+        "[numthreads(8, 8, 1)]\n"
+        "void main(uint3 id : SV_DispatchThreadID) {\n"
+        "  uint v = id.x * 13u + id.y * 7u;\n"
+        "  if (id.x == 0 && id.y == 0) outBuf.Store(0, v);\n"
+        "}\n";
+
+    Com<ID3DBlob> csBlob, errBlob, rsBlob;
+    if (FAILED(pComp(kCsSrc, strlen(kCsSrc), "sim_cs.hlsl", nullptr, nullptr, "main", "cs_5_0",
+                     0, 0, csBlob.Put(), errBlob.Put())) || !csBlob) {
+        return;
+    }
+
+    D3D12_ROOT_PARAMETER param{};
+    param.ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    param.Descriptor.ShaderRegister = 0;
+    param.Descriptor.RegisterSpace = 0;
+    param.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+    D3D12_ROOT_SIGNATURE_DESC rsd{};
+    rsd.NumParameters = 1;
+    rsd.pParameters = &param;
+    rsd.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
+    if (FAILED(pSer(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, rsBlob.Put(), errBlob.Put())) || !rsBlob) {
+        return;
+    }
+    if (FAILED(dev_->CreateRootSignature(0, rsBlob->GetBufferPointer(), rsBlob->GetBufferSize(),
+                                         IID_PPV_ARGS(cs_rs_.Put()))) || !cs_rs_) {
+        cs_rs_.Reset();
+        return;
+    }
+
+    D3D12_COMPUTE_PIPELINE_STATE_DESC cpd{};
+    cpd.pRootSignature = cs_rs_.Get();
+    cpd.CS.pShaderBytecode = csBlob->GetBufferPointer();
+    cpd.CS.BytecodeLength = csBlob->GetBufferSize();
+    if (FAILED(dev_->CreateComputePipelineState(&cpd, IID_PPV_ARGS(cs_pso_.Put()))) || !cs_pso_) {
+        cs_rs_.Reset();
+        cs_pso_.Reset();
+        return;
+    }
+
+    D3D12_HEAP_PROPERTIES hp{};
+    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC rd{};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    rd.Width = 256;
+    rd.Height = 1;
+    rd.DepthOrArraySize = 1;
+    rd.MipLevels = 1;
+    rd.SampleDesc.Count = 1;
+    rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    if (FAILED(dev_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+                                             D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+                                             IID_PPV_ARGS(cs_uav_.Put()))) || !cs_uav_) {
+        cs_rs_.Reset();
+        cs_pso_.Reset();
+        cs_uav_.Reset();
+        return;
+    }
+    SimLog("D3D12 Compute Dispatch 着色器就绪（可用于 Tensor/Compute 钩子对照）");
+}
+
 bool Dx12Engine::Init(HWND hwnd, const SimConfig& cfg, std::string* err) {
     hwnd_ = hwnd;
     width_ = cfg.width;
@@ -459,6 +551,7 @@ bool Dx12Engine::Init(HWND hwnd, const SimConfig& cfg, std::string* err) {
     if (!CreateDeviceAndQueue(err)) return false;
     if (!CreateSwapChain(err)) return false;
     if (!CreateFrameResources(err)) return false;
+    CreateComputeResources();
     SimLog("D3D12 就绪 buffers=%d fmt=BGRA8 flip_discard", buffer_count_);
     return true;
 }
@@ -594,6 +687,14 @@ void Dx12Engine::DrawFrame(int64_t frame_index, ID3D12GraphicsCommandList* list)
             float c[4] = {bg[2], bg[0], bg[1], 1.0f};
             list->ClearRenderTargetView(rtv, c, 0, nullptr);
         }
+    }
+
+    // 轻量 Compute Pass：每帧发起少量真实 Dispatch，让 NextPerf 的 Compute/Tensor 钩子可实测校验。
+    if (cs_rs_ && cs_pso_ && cs_uav_) {
+        list->SetComputeRootSignature(cs_rs_.Get());
+        list->SetPipelineState(cs_pso_.Get());
+        list->SetComputeRootUnorderedAccessView(0, cs_uav_->GetGPUVirtualAddress());
+        list->Dispatch(2, 2, 1);
     }
 
     bar.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
@@ -732,7 +833,17 @@ bool Dx12Engine::Resize(int w, int h, std::string* err) {
     // 等 GPU 把所有在用这条交换链的命令做完，否则 ResizeBuffers 会
     // 返回 DXGI_ERROR_INVALID_CALL 或者更糟：设备被移除。
     for (int i = 0; i < kFrameRing; ++i) WaitForFrameRing(i, 2000);
-    // 清掉每槽记录的 fence 值：backbuffer 都换了，旧值没有意义了。
+    if (queue_ && fence_) {
+        const UINT64 drainVal = ++fence_value_;
+        if (SUCCEEDED(queue_->Signal(fence_.Get(), drainVal)) &&
+            fence_->GetCompletedValue() < drainVal && fence_event_) {
+            ResetEvent(fence_event_);
+            if (SUCCEEDED(fence_->SetEventOnCompletion(drainVal, fence_event_))) {
+                WaitForSingleObject(fence_event_, 2000);
+            }
+        }
+    }
+    // 清掉每槽记录的 fence 值：队列已排空且 backbuffer 即将重建。
     for (int i = 0; i < kFrameRing; ++i) ring_[i].fence_value = 0;
 
     ReleaseBackBuffers();
@@ -751,11 +862,13 @@ bool Dx12Engine::Resize(int w, int h, std::string* err) {
             width_ = (int)d.Width;
             height_ = (int)d.Height;
         }
+        std::string ignored;
+        CreateBackBufferRtvs(&ignored);
         return false;
     }
     width_ = w;
     height_ = h;
-    if (!CreateFrameResources(err)) return false;
+    if (!CreateBackBufferRtvs(err)) return false;
     ++generation_;
     SimLog("交换链已重设到 %dx%d（generation=%d）", w, h, generation_);
     return true;

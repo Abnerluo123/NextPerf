@@ -91,7 +91,7 @@ typedef NvPhysicalGpuHandleRec* NvPhysicalGpuHandle;
 #define NVAPI_SHORT_STRING_MAX               64
 
 #define NP_MAKE_NVAPI_VERSION(typeName, ver) \
-    (NvU32)((sizeof(typeName) & 0xffff) << 16 | ((ver) & 0xffff))
+    (NvU32)((sizeof(typeName) & 0xffffu) | (((ver) & 0xffffu) << 16))
 
 typedef struct {
     NvU32 version;
@@ -108,11 +108,13 @@ typedef struct {
 
 typedef struct {
     NvU32 version;
+    NvU32 flags;
     struct {
-        NvU32 bIsPresent : 1;
-        NvU32 percentage : 31;
+        NvU32 presentFlags; // bit0 = bIsPresent
+        NvU32 percentage;
     } utilization[NVAPI_MAX_GPU_UTILIZATIONS];
 } NV_GPU_DYNAMIC_PSTATES_INFO_EX;
+static_assert(sizeof(NV_GPU_DYNAMIC_PSTATES_INFO_EX) == 72, "NV_GPU_DYNAMIC_PSTATES_INFO_EX must be 72 bytes");
 #define NV_GPU_DYNAMIC_PSTATES_INFO_EX_VER_1 NP_MAKE_NVAPI_VERSION(NV_GPU_DYNAMIC_PSTATES_INFO_EX, 1)
 
 // NVAPI_GPU_GetUsages：usages[] 里下标 2 历史上是 3D 引擎占用（单位 1/100 %？实测为百分比）
@@ -147,7 +149,7 @@ typedef struct {
 #define NP_NVAPI_CLK_PROCESSOR 7
 #define NP_NVAPI_CLK_VIDEO     8
 
-typedef NvAPI_Status (*NvAPI_QueryInterface_t)(NvU32 interfaceId, void** pFunction);
+typedef void* (*NvAPI_QueryInterface_t)(NvU32 interfaceId);
 
 struct NvapiApi {
     bool loaded = false;
@@ -169,6 +171,7 @@ struct NvapiApi {
 
     NvPhysicalGpuHandle gpus[NVAPI_MAX_PHYSICAL_GPUS]{};
     NvU32 gpuCount = 0;
+    int loadErr = 0;
 
     bool Load();
     void Unload();

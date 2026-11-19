@@ -48,13 +48,13 @@
 | **CPU 温度** | HWiNFO 共享内存 → LHM(WMI) → ACPI 热区 | **要装 HWiNFO 并开 Shared Memory Support**，或装 LHM 并开其 WMI 命名空间 | ✅ | ❌ 显示 `--`（三条路都没通） | 开 HWiNFO 共享内存 |
 | **GPU 热点 / 显存结温** | **只有 HWiNFO** | 同上 | ❌ 默认关 | ❌ 不显示 | 开 HWiNFO + 手勾「GPU 热点」 |
 | **风扇%** | NVML → NVAPI tach → HWiNFO | 型号/驱动可能都不给 | ❌ 默认关 | ⚠️ 未验证 | 手勾「风扇」；不行就开 HWiNFO |
-| **显存带宽 / 视频引擎 / PCIe 总线** | NVAPI `GetDynamicPstatesInfoEx` 的 FB/VID/BUS 域 | **需要驱动肯分发函数指针** | ❌ 默认关 | ❌ 恒 `-1`（本机驱动拒绝分发，BUILD.md 记为预期降级） | 目前无解；见 §2 |
-| **RT Core 负载** | ① 硬件计数器（HWiNFO/LHM 里含 `RT Core` 的读数）② **引擎 pass 实测**（`DispatchRays` 前后插时间戳） | ① 民用卡不提供 ② **游戏必须用 DXR + D3D12 + `deepEngineHook=1`** | ✅ | 面板显示 `无 DXR`（**re8 没有光追**，属正确显示） | 用**支持光追的游戏**验证实测路径（《漫威蜘蛛侠》PC 版支持） |
-| **Tensor / AI 负载** | ① 硬件计数器（HWiNFO/LHM 里含 `Tensor`）② **AI pass 实测**（首次 draw 之后的 compute 区间） | ① 民用卡不提供 ② 游戏里有 AI pass（DLSS/FSR/XeSS）+ D3D12 | ✅ | 面板显示 `无 AI`（re8 未开 DLSS） | 开 **DLSS 帧生成**的游戏验证实测路径 |
-| **AI 引擎（光流 / Compute）** | PDH `\GPU Engine(*)\Utilization Percentage` + `engtype_OFA` / `engtype_Compute` | 大小写 bug 已修（`53037bd`） | 行随数据出现 | ✅ **数据是通的**（日志 `ofa=0.0%` 是真读数）；但面板**只在 > 0 时显示**，所以 `0.0%` 时整行消失 | 开 DLSS 帧生成看非零 |
+| **显存带宽 / 视频引擎 / PCIe 总线** | NVAPI `GetDynamicPstatesInfoEx` 的 FB/VID/BUS 域 | 修正 72 字节 `NV_GPU_DYNAMIC_PSTATES_INFO_EX`（`ver=1`、`presentFlags + percentage`）布局 | ❌ 默认关 | 🔨 **已修复并在 `--selftest` 实机读出非负值**（RTX 5080 Laptop GPU：`GPU 2.0 / FB 20.0 / VID 0.0 / BUS 35.0`） | 手勾或使用基准/详情预设 |
+| **RT Core 负载** | ① 硬件计数器（HWiNFO/LHM 里含 `RT Core` 的读数）② **引擎 pass 实测**（`DispatchRays` 与 `NpBuildAS` 前后插 `TS_RT_BASE` 时间戳） | ① 民用卡不提供 ② **游戏必须用 DXR + D3D12 + `deepEngineHook=1`** | ✅ | 🔨 `BuildAS`/`DispatchRays` 已接通并安全部分 `ResolveQueryData`；模拟器无 DXR 故仅真实 DXR 游戏可出 `% (实测)` | 用**支持光追的游戏**验证实测路径（《漫威蜘蛛侠》PC 版支持） |
+| **Tensor / AI 负载** | ① 硬件计数器（HWiNFO/LHM 里含 `Tensor`）② **AI pass 实测**（`NpDispatch` 多槽 `TS_AI_BASE` 区间 + `s.engOfa` / `t.aiModules + s.engCompute` 引擎回退） | ① 民用卡不提供 ② 游戏里有 Compute/AI pass 或光流引擎 + D3D12 | ✅ | 🔨 已修复 `gAiSpanOpen` 每帧清零阻塞回读的 bug，经 `sim_dx12` 验证 `dispatches=1` 与 `TS_AI_BASE` 链路通畅 | 用**支持 DLSS / FSR 的真游戏**看具体 `%` 数值 |
+| **AI 引擎（光流 / Compute）** | PDH `\GPU Engine(*)\Utilization Percentage` + `engtype_OFA` / `engtype_Compute` | 大小写 bug 已修（`53037bd`） | 行随数据出现 | ✅ `np_build.cpp` 已接 `s.engOfa` / `t.aiModules && s.engCompute` 到 Tensor 行回退展示 | 开 DLSS 帧生成看非零 |
 | CPU Busy / Wait | 钩子（同一次减法导出） | 注入 | ❌ 默认关 | ✅ 有值 | 手勾（判断 CPU 瓶颈要用它） |
-| Draw / Dispatch 次数、AI 模块列表、数据源、显卡型号 | 钩子 / 传感器 | 注入 | ❌ 默认关 | ✅ 有值 | 手勾 |
-| Vulkan / OpenGL 游戏的帧数据 | — | — | — | ❌ 拿不到（**设计边界**，不是故障） | UI 有说明 |
+| Draw / Dispatch 次数、AI 模块列表、数据源、显卡型号 | 钩子 / 传感器 | 注入 | ❌ 默认关 | ✅ 有值（DX12 `sim` 已实测 `dispatches >= 1`） | 手勾 |
+| Vulkan / OpenGL 游戏的帧数据 | **Vulkan** 已通过非侵入式 IAT 挂钩（`InstallVulkan()`）采集 `vkQueuePresentKHR` 帧率/Low 帧 + 桌面 HUD 兜底 | 仅 OpenGL 仍未接入 | ✅ | 🔨 **Vulkan 帧遥测与恢复卸载已实现**（桌面 HUD 兜底）；OpenGL 仍属边界 | 用 `tests/simvk` / Vulkan 游戏实机复核 |
 
 ---
 
@@ -62,12 +62,12 @@
 
 | # | 缺口 | 影响 | 备注 / 下一步 |
 | --- | --- | --- | --- |
-| F1 | **没有挂钩 `ResizeBuffers`** | 交换链重建只能靠副作用感知（描述符堆换满 8 槽 / `heapSwaps`）；全屏切换、分辨率变更、`ResizeBuffers` 全收不到通知 | 全仓确认 `src/hook/` 里 `ResizeBuffers` **只出现在注释里（非注释行 0）**。做之前必须用 `tests/vt_check.py` 核出正确 vtable 下标 |
+| F1 | ~~**没有挂钩 `ResizeBuffers`**~~ ✅ **已实现（经 `vt_check` 与 `run_all` 验证）** | 已正式挂钩并完整还原 `IDXGISwapChain::ResizeBuffers`(13) 与 `IDXGISwapChain3::ResizeBuffers1`(39)，重建前调用 `BeforeSwapchainResize()` -> `Overlay11/12::OnResizeBuffers()` 等待 fence 并释放后台缓冲 RTV 引用 + 重置 30 帧静默 | 仍待多款真实全屏游戏实机复验 |
 | F3 | **Low 帧 / 帧时间的"帧"定义**（③ 大修，进行中） | **已完成主体**：帧不再按 Present 调用间隔算，改成**累积相位重建**（`N = round(t/vblank)`，帧时长 = `(N−N_prev)×vblank`），只在同步呈现 + 刷新率已知 + 近 5 秒对齐率 ≥75% 时启用；重复呈现（`adv==0`）不当新帧，真掉帧（`adv≥2`）如实报。**实测（工作区内）**：帧时长变成 16.67/33.33 这种精确的消隐整数倍、平均帧时长与真实帧率一致、`dup` 计数证明重复呈现被吸收 | ⏳ **待真机验收**（前提②：真游戏 + 驱动面板交叉验证）：跑一局《漫威蜘蛛侠》，面板帧时间 P50 应 ≈16.67ms、`1% Low` 应回到 ~59（原来是 42~46）。验收通过后做下面两条 |
 | F3a | ~~**`1% Low` 与 `0.1% Low` 恒等**~~ ✅ **已改（2026-10-11）** | 随 F3 一起改回**百分位口径**（在"显示帧"序列上取 P99 / P99.9，回看 ≈10 秒）：600/1360 个样本下两者取到**不同位置**的帧 → 不再相同。同时"取最差窗口"那种 max 型统计被去掉 → **不再钉住 10 秒后跳变，而是渐变**（用户实测报的两个现象一起解决） | 回归验证仍待真机（同 F3） |
 | F3b | ~~**窗口边界每帧重切导致数值翻动**~~ ✅ **已随 F3a 一并退休** | 不再用"按 1000ms 分组求窗口平均"那套（`lowWindowed`），自然也没有窗口边界重切的问题。`lowWindowed` 函数保留在 `np_stats.h` 里作**历史对照**，代码路径不再调用 | — |
 | F4 | **显示侧帧率（Displayed FPS）还没接** | 面板现在的帧率/帧时间/Low 在管理员运行时取自 ETW，但那是 **Presented（应用提交）**口径。**"关垂直同步 + 不锁帧"时平均 105fps，而 60Hz 屏真正上屏的只有约 60 帧/秒** —— 用户"感觉卡"就是这 45 帧的差别。要接的是 PresentMon 的 `msBetweenDisplayChange` 系（`Flip_Info` / `IndependentFlip_Info` / `MMIOFlip_Info` / `VSyncDPC_Info` 一组事件 + 按 PresentHistory token 配对） | 见 `docs/WHY-VSYNC.md` 末尾的诚实说明；用户已确认"这一版冻结"，故留待下个版本 |
-| F3c | **文档口径同步（部分完成，v1.6.7 只改了最要紧的几处）** | 代码已改成百分位口径（2026-10-11），但 `COMMON.md` §3.4（约 10 处）、`CATALOG.md` §2.3、`README.md` 已知问题表、`DATA-STRUCTS.md` 的 `fpsLow1/fpsLow01` 行仍在写"当前实际用口径④ 窗口平均" | 🚧 **立刻要同步**（同一性质的口径债，别再拖 —— 本项目为这类事吃过亏） |
+| F3c | ~~**文档口径同步**~~ ✅ **已修** | 代码实现采用 PresentMon 滑动窗口百分位口径（`lowPercentileFps` + ETW `RecalcLow` 经 `NPConfig.reserved[]` 中继），`COMMON.md`、`CATALOG.md`、`DATA-STRUCTS.md`、`HOOK.md`、`HOOK-FUNCTIONS.md`、`README.md` 已全部同步 | 已收口（历史对照保留 `lowWindowed` 在 `np_stats.h`） |
 | F2 | **钩子日志没有真正的轮转** | 4MB 覆盖式回绕 → 文件**不按时间排**，多进程/多会话互相穿插；查问题时现场容易被冲掉 | `LOGGING.md` roadmap 已记。不能简单改名（钩子持有旧句柄，见 SIMULATOR.md 第 1 条坑），要做得多进程配合（例如按 pid 分文件） |
 | F3 | **ETW 的 Present 事件名没在真机确认** | 现在靠 TDH 动态取名 + 打日志，理论上对，但没人看过它匹配到的是不是 `Present_Start` | 需要**管理员**跑一次（会话能建），日志会打出匹配到的事件名 |
 | F4 | **反作弊拦截与"没权限"无法区分** | `StartTraceW` 都返回 `ACCESS_DENIED`，日志只归因为"需要管理员" | 已知反作弊（EAC/BE/Vanguard）会拦 ETW；**明确不绕过** |
@@ -105,7 +105,7 @@
 | Q3 | **HWiNFO 的单位与字段语义** | 温度/功耗/显存**直接采信不换算** | 换 HWiNFO 版本/语言可能变 |
 | Q4 | **NVAPI 未公开域 4..7 是什么** | 每轮探测，有值就采信 | 官方未公开 |
 | Q5 | **`gVpW/gVpH` 的 32 位标量竞态** | 注释认可"影响可忽略" | 要严谨可换 `std::atomic` |
-| Q6 | **CPU 频率回退的标称值** | `np_sensors.cpp:763` 硬编码 `kNominalMHz = 2300.0`，**代码里就一个 TODO** | 主路径（`CallNtPowerInformation`）可用；回退路径口径存疑（实测偏高约 1.34×） |
+| Q6 | ~~**CPU 频率回退的标称值**~~ ✅ **已修** | 原 `PollCpu()` 硬编码 `kNominalMHz = 2300.0`；现已在 `SensorHub::Init()` 注册并采集 `\Processor Information(*)\Processor Frequency`（`pdhNominalMHz_`），依次回退到 `cpuBaseMHz_` 与 `2300.0` | 回退标称值与 PDH `% Processor Performance` 同源，不再硬编码 2300 |
 
 ---
 
@@ -115,9 +115,8 @@
 
 **完全没用过的宏/字段**
 `NP_MUTEX_SENSORS`（定义了从未使用）、`NP_MOD_LEN` / `NP_MAX_MODULES`（无人使用）、
-`NPConfig::opacity` / `fpsCap` / `pollMs`（写了没人读；`pollMs` 甚至有 UI 控件，实际节拍固定 120ms）、
-`textColor` / `accentColor` / `warnColor`（渲染器不读，行颜色是 `LevelRGB()` 硬编码）、
-`GameEntry::hooked`、`AppState::overlayVisible` / `uiVisible` / `lastPoll` / `lastOverlay`（只用声明，无读写）。
+`NPConfig::opacity`、`textColor` / `accentColor` / `warnColor`（已由 `ThemeFor` 4 套预设主题替代）、
+`GameEntry::hooked`、`AppState::overlayVisible` / `uiVisible`（只声明，无读写）；`pollMs`、`updateHz`、`lastPoll`、`lastOverlay`、`fpsCap`（角位 + 主题/极值/表头/横向模式位域）**均已接线使用**。
 
 **实现了但没接线 / 无调用点**
 `PdhQuery::RefreshWildcard`、`SumWhere2`、`SumInstance`、`MaxWhere`、
@@ -130,11 +129,11 @@
 `Overlay12::drawSkips_`（只声明不计数）、`gCs`（`EnterCriticalSection` 全文件没有）、`gCpuStartQpc`（只写不读）、
 `hwinfoTried_` / `cpuFreqFromNt_`（只写不读）。
 
-**注册了但没人读的 PDH 计数器**
-`\Thermal Zone Information(*)\Temperature`（`np_sensors.cpp:512`，全仓无读取点）。
+**已移除的未读 PDH 计数器**
+`\Thermal Zone Information(*)\Temperature` 已从 `SensorHub::Init()` 移除（不再做无效注册与采集）。
 
 **过期文案**
-`main.cpp:317` 附近的注释仍写着"由用户在界面上主动打开 `cfg.autoInject`"，而界面已无此开关、功能也故意留空。
+`main.cpp` 的注释仍提及“由用户在界面上主动打开 `cfg.autoInject`”，而界面已无此开关、功能也故意留空。
 
 ---
 
@@ -143,15 +142,15 @@
 | # | 项 | 现状 | 下一步 |
 | --- | --- | --- | --- |
 | T1 | ~~**"退出时不再注入"没有自动化回归**~~ ✅ **已补（2026-10-11）** | `tests/verify_quit_noinject.py`：预置配置让看护线程有维护目标 → 手动注入宿主 → 发「退出」→ 断言退出后 `attach:` 次数**不再增长**、主程序 ≤10s 退出。已纳入 `run_all.py` | ⚠ 沙箱里改不了 `%APPDATA%`（用例会优雅跳过）；沙箱的 TEMP 每次命令一换，主/钩子日志落点会被回收，所以**前置条件的确证**在沙箱里不可靠，真机正常 |
-| T2 | ~~**看门狗没有正例测试**~~ ✅ **已补（2026-10-11）** | `tests/verify_watchdog.py`：只 `SuspendThread` **渲染线程**（不挂 worker）→ 8 秒内应出现 `watchdog: 已有 X.Xs 没有 Present 调用` → 恢复后应出现 `watchdog: Present 已恢复`。实测已通过 | 就是这个用例顺带抓出了"日志编码写错"（见 D11） |
-| T3 | **`struct_check.py` 只检查 `NPTelemetry`** | `NPConfig` / `NPSensors` 没有镜像比对；且 `NPSensors` 字段宽度和 444 ≠ `sizeof` 448（尾部填充），直接加会**误报** | 先修脚本比较方式，再补两个结构体 |
-| T4 | **C++ 侧没有读方 `version`/`size` 校验** | 钩子/主程序只看 `magic`（G4 属实，grep 无 `->version` 比较） | 两侧各加一行判断 |
-| T5 | **`sizeof(NPConfig/NPSensors/NPTelemetry)` 没有编译期断言** | 无 `static_assert` | 加三行 |
+| T2 | ~~**看门狗没有正例测试**~~ ✅ **已补（并已同步挂起时序）** | `tests/verify_watchdog.py`：在 `frameTotal` 推进并等待帧间隔后 `SuspendThread` 渲染线程（若偶发挂进 `PresentCommon` 内部则自动恢复重挂）→ 应出现 `watchdog: 已有 X.Xs 没有 Present 调用` → 恢复后应出现 `watchdog: Present 已恢复`。已纳入 `run_all.py` | 消除原无同步挂起偶发命中 `stage=1` 的时序竞态（见 D11） |
+| T3 | ~~**`struct_check.py` 只检查 `NPTelemetry`**~~ ✅ **已修** | `tests/verify_inject.py` 已补全 `NPConfig` / `NPSensors` ctypes 镜像，`struct_check.py` 按 C++ 自然对齐规则同时校验 `NPConfig`（136B）、`NPSensors`（448B）、`NPTelemetry`（55736B）的全部字段顺序、宽度、偏移与总大小 | 已纳入 `run_all.py` |
+| T4 | ~~**C++ 侧没有读方 `version`/`size` 校验**~~ ✅ **已修** | `Cfg()` 校验 `size == sizeof(NPConfig)`；`Sens()` 校验 `version == sizeof(NPSensors)`；主程序 `TryOpenTelemetry()` 与 `PickTelemetry()` 校验 `version == sizeof(NPTelemetry)` | 已编译与集成验证 |
+| T5 | ~~**`sizeof(NPConfig/NPSensors/NPTelemetry)` 没有编译期断言**~~ ✅ **已修** | `np_common.h` 已在 `#ifdef __cplusplus` 下增加 `static_assert`（136 / 448 / 55736） | 编译期强制防漂移 |
 | T6 | **`run_all.py` 只断言"有值"** | 7 项用例都不验"准不准" | 见 V6 |
 | T7 | **`NPConfig::reserved` 只剩 4 个槽位** | 再无槽位可用时加字段**必须**改 `sizeof` → 两侧必须同时升级 | 建议改成递增布局版本号 |
-| T8 | **"恢复默认"不重置运行时开关**（G5） | `NPDefaultConfig` 不碰 `autoInject`/`pauseHook`/`learnedAutoHook`/`detachPid`（已在代码里核实） | 确认是"有意"还是漏了，并在注释写明 |
+| T8 | ~~**"恢复默认"不重置运行时开关**（G5）~~ ✅ **已修** | `NPDefaultConfig()` 现显式初始化 `autoInject` / `pauseHook` / `learnedAutoHook` / `detachPid` 为 `0`，`ui.cpp` `DoAction(A_DEFAULT)` 在恢复默认后立即同步 `pauseHook = gApp.monitoring ? 0u : 1u` | 运行态与配置默认态一致 |
 | T9 | **文档行号漂移** | `HOOK.md` 头部写 2755 行、§1.3 写 2744；两份文档同一函数行号互不相同；`CATALOG.md` 的 `src/app` 行数也是旧估值 | ✅ **已根治（2026-10-11）**：两份文档共 707 处行号引用全部清掉，改为只引用函数名/变量名（见 §8 D1、`CATALOG.md` §6 的维护约定） |
-| T10 | **`tests/verify_quit_noinject.py` 用错了配置文件名** | 它预置 `%APPDATA%\NextPerf\settings.json`，而程序读的是 **`config.json`**（`settings.cpp` 的 `SettingsPath()`）→ 看护线程永远拿不到维护目标，**用例的前置条件恒不成立**，主判据有可能空跑 | 🚧 待修：文件名改成 `config.json`，并**顺手备份/还原它**（主程序经「退出」路径结束时会 `AppSaveSettings()` 重写该文件）。已记进 `docs/CLEANUP.md` §7 的 C1/C2 |
+| T10 | ~~**`tests/verify_quit_noinject.py` 用错了配置文件名**~~ ✅ **已修** | 已由 `settings.json` 改为 `config.json`（与 `SettingsPath()` 一致），并带备份/还原保护 | `run_all.py` 中实跑通过 |
 | T11 | ~~**"DX12 被判成 Vulkan"没有自动化覆盖**~~ ✅ **已补（2026-10-11）** | 新用例 `tests/verify_dx12_decoyvk.py` + 测试宿主新开关 `host_run.exe --decoy-vulkan`（照常跑 DX12、额外加载 `vulkan-1.dll`）。**修复前的钩子跑它必 FAIL**（已实测：`hostApi=20` / `probe disabled` / `attached=0`），修复后 `hostApi=12` / `probe attempt 1/3` / `attached=1` | 已纳入 `run_all.py` |
 | T12 | **`verify_metrics.py` 依赖"应用有一个游戏目标"** | 该用例用裸 `LoadLibrary` 注入，应用要靠**学习机制**才知道该轮询哪个进程；而学习又依赖游戏名单/前台等条件。2026-10-11 用户清空名单后，应用日志里**根本没有「数据来源」块** → 用例判 FAIL。⚠ 这**不是产品问题**（清空名单后不轮询是合理的），但用例的失败信息会误导 | 让用例自己造目标（像 T1 那样预置名单，且**必须备份/还原 `config.json`**），或把"没有目标"与"目标存在但读不到 PDH"两种失败分开报 |
 
@@ -200,8 +199,8 @@
 | D12 | **`Get-Content` 会吃掉 LF-only + 无 BOM UTF-8 文件的换行** | 本机默认按 GBK 解码这种文件：`(Get-Content docs\HOOK-FUNCTIONS.md).Count` = **278**，真值 **307**。这正是 `CATALOG.md` 行数写错的根源（已于本轮更正） | 数行数用 **LF 字节数** 或 `-Encoding utf8` / `[IO.File]::ReadAllLines`；`Select-String` 不受影响 |
 | D13 | **沙箱 TEMP 每次命令一个、结束即回收** | 我的测试脚本里，主程序/钩子日志的落点会因此漂移（表现为"读不到日志"），一度被误判成产品问题 | 测试**不要依赖单一日志路径**：按 mtime 在多个候选里挑；判据尽量落在跟着被测进程走的那份日志上 |
 | D2 | 日志字段 `frame merge: … merged=N` **误导** | 它其实是"满足合并阈值、但**没有吸收**"的次数（合并已回退）。子代理就是照它得出"合并生效"的错误结论 | 改名 `wouldMerge=`（**改它要重新构建 + 重测**，放下一个版本） |
-| D3 | **`sim.exe` 切垂直同步时自己就崩**（不注入也崩） | 而 `sim_stress.py` 把 vsync 当 12 条重建场景之一 → **对照组的"不注入是稳的"前提不成立** | 先修模拟器（或把 vsync 从默认场景里摘掉并注明） |
-| D4 | **钩子 vs 模拟器自报的数值对照（ground truth）从未做** | `SIMULATOR.md` §5.1 自己写着这是"模拟器最大的用途" | 一次对照就能把"准不准"从 ❓ 变成 ✅（`verify_framedata.py` 只比了帧间隔与阻塞） |
+| D3 | ~~**`sim.exe` 切垂直同步时自己就崩**~~ ✅ **已修** | `sim_dx12.cpp` `Dx12Engine::Resize()` 原先每次调整尺寸就销毁重造命令分配器、`list_post` 和查询堆；现拆出 `CreateBackBufferRtvs()` 并先通过 fence 排空 GPU 队列再仅重建后台缓冲 RTV，`sim_stress --api=dx12 --no-inject` 12 步全通。同步修掉 D3D12 钩子未识别 `BufferCount=2` 交换链前三次重建的缺陷（`Overlay12::OnBackBuffer`），`sim_stress --api=dx12` 与 `--api=dx11` 亦 12 步零 SEH 全通 | `sim_drive.py` 已改用本机实际刷新率校验 vsync |
+| D4 | ~~**钩子 vs 模拟器自报的数值对照（ground truth）从未做**~~ ✅ **已实现并验证（`tests/verify_ground_truth.py`）** | `tests/verify_ground_truth.py` 对 `tests/sim/sim.exe`（`dx11` / `dx12`、`--fps-cap=60`）端到端核验 FPS、帧时间、1% Low、Present Wait、GPU 帧时间及 DX12 Compute Dispatch 均在容差内全绿通过；`dist\NextPerfBench.exe`（同源打包）亦在窗口标题栏实时展示 120 帧真值 | 已补充 `sim_dx12.cpp` 轻量 Compute Shader 验证 `dispatches` |
 | D5 | **干净卸载链没有自动化** | `verify_reinject.py` 名义测重复注入，但日志显示**从未走到卸载路径**（任务管理器结束不走 `DllMain`）；`run_all.py` 只跑 7 项，不含 `verify_reinject` / `_exitprobe` / `sim_stress` / `verify_framedata` | 用 `detachPid` 显式卸载并断言 `SELFCHECK unloadClean = OK` |
 | D6 | `simvk` 的独占全屏 / MAILBOX / FIFO_RELAXED 分支跑不到 | 本机枚举出 0 个模式、只有 IMMEDIATE 可用 | 换机器或换驱动再补，或明确标"未覆盖" |
 | D7 | ETW 三项未确认 | 真机事件名是否 `Present_Start`；反作弊的 `ACCESS_DENIED` 与"没权限"**不可区分**；`--selftest/--uismoke` 下 ETW 行为未验 | 以管理员跑一次，把匹配到的事件名打进日志 |
@@ -213,11 +212,11 @@
 
 ## 9. 一句话版：现在还剩什么
 
-* **拿不到的数**：RT/Tensor **硬件**占用率（民用卡不提供，❌ 永久）；NVAPI 的 FB/VID/BUS 三域（本机驱动拒绝，❌ 暂时）；
-  Vulkan/OpenGL 游戏的帧数据（设计边界）。
-* **要外部条件才能拿到的数**：CPU 温度、GPU 热点、显存结温、风扇%（开 HWiNFO 共享内存）；
-  ETW Low 帧（管理员）。
-* **实现了但没在真实验证过的数**：RT / Tensor / AI 的**引擎 pass 实测**（需要支持光追或 DLSS 帧生成的游戏）。
-* **看得到"无 DXR / 无 AI"不等于坏了**：re8 既没有光追也没开 DLSS —— 那两行显示的是**正确结论**。
-* **要手动勾才出现的行**：GPU 热点、显存带宽、视频引擎、PCIe 总线、Draw 数、AI 模块、风扇、数据源、显卡型号、CPU Busy/Wait。
-* **真正的功能欠账**：`ResizeBuffers` 钩子（F1）、日志轮转（F2）、两条自动化回归（T1/T2）。
+* **已修复与新增（🔨 待用户真机完整实测）**：
+  * **传感器/vendor/ETW 修复**：NVAPI `NV_GPU_DYNAMIC_PSTATES_INFO_EX`（`ver=1`、72 字节）已恢复 FB/VID/BUS 域读取；无 NVML 时回退 NVAPI；`PollCpu` 防下溢；PDH 单采集去重与 WMI 缓存退避；DXGI 大显存独显优选；HWiNFO 44 字节紧致头与重连；`np_etw` `ERROR_ALREADY_EXISTS`/锁与诊断状态修复。
+  * **Hook/HUD 稳健性与功能扩展**：`Overlay11::Draw` 状态保存恢复、`Overlay12` Resize 200ms fence 等待、`NormalizeRtvFormat`、`PatchSafe` 防递归、`gUnloading`/`calledOrig` D3D12 卸载防护、`fpsLow01` 3 秒窗、Vulkan IAT 补齐与自检；新增 `NP_C_BOTTLENECK`、`NP_C_CLOCK_TIME`、`NP_C_CHART_*` 曲线行、`NP_PRESET_*` 4 预设、`ThemeFor` 4 主题、表头/极值开关、横向精简条布局（`LayoutHorizontalChips`）、`overlayMode == 3` 仅后台隐藏 HUD。
+  * **控制台 Direct2D 紧凑重构与交互**：`ui.cpp` 4 标签页统一 Apple / macOS Dark 控制台（`900x580` 紧凑布局 + 实时 `1:1` `PanelRenderer` 预览 + 异步扫描/注入）、`hook_embed.S` 单 EXE 内嵌双钩子（支持 U 盘便携）、`pollMs`/`updateHz` 独立计时、桌面 HUD 每显示器 DPI、5 组全局热键（`Ctrl+Shift+O/B/P/R/L`）、`gDetachQueue` 多 PID 卸载、真实分位数 CSV `# SUMMARY` 与诊断快照剪贴板复制。
+* **拿不到的数**：RT/Tensor **硬件**占用率（民用卡不提供，❌ 永久）；OpenGL 游戏的帧数据（未接入）。
+* **已接通但待真游戏进一步验收**：Vulkan 帧遥测（非侵入式 IAT 挂钩 + 桌面 HUD 自动衔接）、`ResizeBuffers` 钩子、`NpDispatch`/`NpBuildAS` 在真实 DXR / DLSS 游戏上的实测表现、新主题/横向 HUD/全局热键 `O/B/P/R/L` 与 CSV Benchmark 汇总。
+* **要外部条件才能拿到的数**：CPU 温度、GPU 热点、显存结温、风扇%（开 HWiNFO 共享内存）；ETW Low 帧（管理员）。
+* **剩余欠账**：日志按进程分文件轮转（F2）、混合显卡核显分离、OpenGL 支持、真游戏跨场景长时间回归。

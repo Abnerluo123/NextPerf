@@ -127,6 +127,8 @@ public:
 
 private:
     void ProbeSources();
+    void UpdateSourceUsed(uint32_t mask, bool present, bool used, const char* note = nullptr);
+    void EnsureLhmPolled(uint64_t nowMs);
     void PollCpu(NPSensors& out);
     void PollRam(NPSensors& out);
     void PollGpuNvidia(NPSensors& out);
@@ -159,6 +161,7 @@ private:
     // 置 false 说明回退到了 PDH 路径，读数可能系统性偏低。
     bool     cpuFreqFromNt_ = false;
     double   cpuBaseMHz_ = 0;
+    double   pdhNominalMHz_ = 0;
 
     int      nvmlIndex_ = -1;
     bool     comInited_ = false;
@@ -179,6 +182,20 @@ private:
     float    maxGpuTemp_ = -1.0f;   // GPU 温度上限
     float    encUtil_ = -1.0f;      // 编码器占用
     float    decUtil_ = -1.0f;      // 解码器占用
+
+    // PDH / HWiNFO / WMI 调度与缓存（避免同轮重复采集与主线程频繁 WMI RPC）
+    uint64_t lastPdhCollectMs_ = 0;
+    uint64_t hwinfoNextTryMs_ = 0;
+    int      hwinfoFailStreak_ = 0;
+    uint64_t lhmNextTryMs_ = 0;
+    uint64_t acpiNextTryMs_ = 0;
+    bool     lhmPresent_ = false;
+    float    cachedLhmCpuTemp_ = -273.0f;
+    float    cachedLhmRt_ = -1.0f;
+    float    cachedLhmTensor_ = -1.0f;
+    float    cachedAcpiTemp_ = -273.0f;
+    float    cpuPowerEma_ = 0.0f;
+    uint64_t lastCpuPowerMs_ = 0;
 
     // 按游戏进程读 GPU 引擎数据的差分基线
     std::string gameGpuDiag_;

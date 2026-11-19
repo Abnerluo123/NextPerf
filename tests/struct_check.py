@@ -42,7 +42,7 @@ PYWIDTH = {
 
 
 def cpp_fields(header, struct_name):
-    """从 C++ 头文件里按**声明顺序**取出结构体字段：(名字, 字节宽度)。"""
+    """从 C++ 头文件里按**声明顺序**取出结构体字段：(名字, 字节宽度, 成员对齐)。"""
     src = open(header, encoding="utf-8", errors="ignore").read()
     m = re.search(r"struct\s+%s\s*\{(.*?)\n\};" % re.escape(struct_name), src, re.S)
     if not m:
@@ -78,12 +78,27 @@ def cpp_fields(header, struct_name):
                     if dm:
                         dim = dm.group(1)
                 width = w * int(dim)
-            out.append((name, width))
+            out.append((name, width, w))
     return out
 
 
+def compute_c_layout(fields):
+    """按 Windows x64 C++ 自然对齐规则计算每个成员偏移与结构体总大小（含内部与尾部填充）。"""
+    off = 0
+    max_align = 1
+    offsets = []
+    for _, width, align in fields:
+        off = (off + align - 1) // align * align
+        offsets.append(off)
+        off += width
+        if align > max_align:
+            max_align = align
+    total = (off + max_align - 1) // max_align * max_align
+    return offsets, total
+
+
 def py_fields(module_path, class_name):
-    """从 Python 里取出 ctypes 镜像字段：(名字, 字节宽度)。"""
+    """从 Python 里取出 ctypes 镜像字段：(名字, 字节宽度, 偏移列表), sizeof, 类。"""
     sys.path.insert(0, os.path.dirname(module_path))
     mod_name = os.path.splitext(os.path.basename(module_path))[0]
     mod = __import__(mod_name)
@@ -99,19 +114,20 @@ def py_fields(module_path, class_name):
             w = PYWIDTH.get(getattr(base, "__name__", ""), -1) * n
         else:
             w = PYWIDTH.get(getattr(ctype, "__name__", ""), -1)
-        out.append((name, w))
+        out.append((name, w, getattr(cls, name).offset))
     return out, ctypes.sizeof(cls)
 
 
 def check(struct_name, py_class):
     cpp = cpp_fields(os.path.join(ROOT, "src", "common", "np_common.h"), struct_name)
     py, pysize = py_fields(os.path.join(HERE, "verify_inject.py"), py_class)
+    cpp_offsets, cppsize = compute_c_layout(cpp)
 
     ok = True
     if len(cpp) != len(py):
         print("  ❌ 字段数量不同：C++ %d 个，Python %d 个" % (len(cpp), len(py)))
         ok = False
-    for i, ((cn, cw), (pn, pw)) in enumerate(zip(cpp, py)):
+    for i, ((cn, cw, _), coff, (pn, pw, poff)) in enumerate(zip(cpp, cpp_offsets, py)):
         if cn != pn:
             print("  ❌ 第 %d 个字段名字不同：C++=%s，Python=%s" % (i + 1, cn, pn))
             ok = False
@@ -119,12 +135,15 @@ def check(struct_name, py_class):
             print("  ❌ 第 %d 个字段 %s 宽度不同：C++=%d 字节，Python=%d 字节"
                   % (i + 1, cn, cw, pw))
             ok = False
-    cppsize = sum(w for _, w in cpp)
+        elif coff != poff:
+            print("  ❌ 第 %d 个字段 %s 偏移不同：C++=%d，Python=%d"
+                  % (i + 1, cn, coff, poff))
+            ok = False
     if ok and cppsize != pysize:
-        print("  ❌ 总大小不同：C++ 字段合计 %d，Python sizeof %d" % (cppsize, pysize))
+        print("  ❌ 总大小不同：C++ 对齐推算 %d，Python sizeof %d" % (cppsize, pysize))
         ok = False
     if ok:
-        print("  ✅ %s：%d 个字段，顺序/名字/宽度/大小全部一致（%d 字节）"
+        print("  ✅ %s：%d 个字段，顺序/名字/宽度/偏移/大小全部一致（%d 字节）"
               % (struct_name, len(cpp), pysize))
     return ok
 
@@ -132,7 +151,9 @@ def check(struct_name, py_class):
 def main():
     print("### 结构体镜像一致性（C++ vs Python ctypes）")
     allok = True
-    for cname, pyname in (("NPTelemetry", "NPTelemetry"),):
+    for cname, pyname in (("NPConfig", "NPConfig"),
+                          ("NPSensors", "NPSensors"),
+                          ("NPTelemetry", "NPTelemetry")):
         if not check(cname, pyname):
             allok = False
     print("结果：%s" % ("PASS —— 镜像一致" if allok else "FAIL —— 镜像不一致，测试会读到错位字节"))

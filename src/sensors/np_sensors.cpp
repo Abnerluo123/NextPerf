@@ -381,11 +381,12 @@ void SensorHub::PollGameGpu(uint32_t pid, uint32_t frameDelta, NPSensors& out) {
     if (!gameGpuOk_) { gameGpuDiag_ = "Running Time 计数器在 Init 时没加上"; gameGpuPid_ = 0; lastGameGpuSec_ = -1.0; lastBusyMs_ = -1.0f; return; }
     if (!pid) { gameGpuDiag_ = "还没有目标进程"; gameGpuPid_ = 0; lastGameGpuSec_ = -1.0; lastBusyMs_ = -1.0f; return; }
 
-    // 目标进程变了（或者第一次）：动态实例列表不需要重新展开，
-    // 下面那次 Collect() 既建基线又取值，这里不用再多采一次
-    // （原来这里是 pid 变化时先 Collect 一次、紧接着又 Collect 一次，
-    //   两次采样间隔几乎为 0，对速率型计数器只会产生一个无意义的样本）。
-    if (!pdh_.Collect()) { gameGpuDiag_ = "PdhCollectQueryData 失败"; return; }
+    // 避免与 SensorHub::Poll() 在同一毫秒内重复 Collect 导致速率计数器样本塌缩为 0
+    uint64_t collectNow = GetTickCount64();
+    if (collectNow - lastPdhCollectMs_ >= 80) {
+        if (!pdh_.Collect()) { gameGpuDiag_ = "PdhCollectQueryData 失败"; return; }
+        lastPdhCollectMs_ = collectNow;
+    }
 
     wchar_t kw[64];
     swprintf(kw, 64, L"pid_%lu_", (unsigned long)pid);
@@ -510,6 +511,7 @@ bool SensorHub::Init() {
         // `Energy Meter` 暴露 Intel RAPL 域。注意对象名不是 `Energy Meter Interface`。
         pdh_.AddStarCounter(L"\\Energy Meter(*)\\Power");
         pdh_.AddWildcard(L"\\GPU Adapter Memory(*)\\Dedicated Usage");
+        pdh_.AddStarCounter(L"\\GPU Adapter Memory(*)\\Dedicated Usage");
         pdh_.AddWildcard(L"\\GPU Adapter Memory(*)\\Shared Usage");
         pdh_.AddWildcard(L"\\Processor Information(*)\\% Processor Performance");
         // ★ 同一路计数器**必须也进 stars_ 表**，否则 MaxStarCounter /
@@ -517,26 +519,35 @@ bool SensorHub::Init() {
         //   CPU 频率就是靠这里读 % Processor Performance 的 ——
         //   只注册 Wildcard 的话 pct 恒为 0，会静默回落到 NT 路径并恒显示基准频率。
         pdh_.AddStarCounter(L"\\Processor Information(*)\\% Processor Performance");
-        pdh_.AddWildcard(L"\\Thermal Zone Information(*)\\Temperature");
-        pdh_.Collect();  // 第一次采集给速率型计数器做基线
+        pdh_.AddWildcard(L"\\Processor Information(*)\\Processor Frequency");
+        pdh_.AddStarCounter(L"\\Processor Information(*)\\Processor Frequency");
+        if (pdh_.Collect()) lastPdhCollectMs_ = GetTickCount64();  // 第一次采集给速率型计数器做基线
     }
 
-    // 显卡基础信息用 DXGI 拿，跨厂商通用
+    // 显卡基础信息用 DXGI 拿，优先挑选非软件模拟且专用显存最大的适配器（兼容核显+独显双卡）
     {
         IDXGIFactory1* f = nullptr;
         if (SUCCEEDED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), reinterpret_cast<void**>(&f))) && f) {
             IDXGIAdapter1* a = nullptr;
-            if (SUCCEEDED(f->EnumAdapters1(0, &a)) && a) {
+            bool picked = false;
+            for (UINT idx = 0; f->EnumAdapters1(idx, &a) != DXGI_ERROR_NOT_FOUND; ++idx) {
+                if (!a) continue;
                 DXGI_ADAPTER_DESC1 d{};
                 if (SUCCEEDED(a->GetDesc1(&d))) {
-                    char name[NP_NAME_LEN]{};
-                    WideCharToMultiByte(CP_UTF8, 0, d.Description, -1, name, NP_NAME_LEN - 1,
-                                        nullptr, nullptr);
-                    dxgiName_ = name;
-                    dxgiVendorId_ = d.VendorId;
-                    dxgiVramBytes_ = d.DedicatedVideoMemory;
+                    if ((d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) == 0) {
+                        if (!picked || d.DedicatedVideoMemory > dxgiVramBytes_) {
+                            char name[NP_NAME_LEN]{};
+                            WideCharToMultiByte(CP_UTF8, 0, d.Description, -1, name,
+                                                NP_NAME_LEN - 1, nullptr, nullptr);
+                            dxgiName_ = name;
+                            dxgiVendorId_ = d.VendorId;
+                            dxgiVramBytes_ = d.DedicatedVideoMemory;
+                            picked = true;
+                        }
+                    }
                 }
                 a->Release();
+                a = nullptr;
             }
             f->Release();
         }
@@ -583,6 +594,19 @@ void SensorHub::Shutdown() {
     adl_.Unload();
     hwinfo_.Close();
     pdh_.Close();
+    pdhNominalMHz_ = 0.0;
+    lastPdhCollectMs_ = 0;
+    hwinfoNextTryMs_ = 0;
+    hwinfoFailStreak_ = 0;
+    lhmNextTryMs_ = 0;
+    acpiNextTryMs_ = 0;
+    lhmPresent_ = false;
+    cachedLhmCpuTemp_ = -273.0f;
+    cachedLhmRt_ = -1.0f;
+    cachedLhmTensor_ = -1.0f;
+    cachedAcpiTemp_ = -273.0f;
+    cpuPowerEma_ = 0.0f;
+    lastCpuPowerMs_ = 0;
     if (comInited_) { CoUninitialize(); comInited_ = false; }
 }
 
@@ -596,18 +620,76 @@ void SensorHub::ProbeSources() {
 
     add(NP_SRC_NVML, nvml_.loaded, "NVML (NVIDIA)",
         nvml_.loaded ? "占用率/显存/温度/功耗/频率/风扇" : "未检测到 NVIDIA 驱动或 nvml.dll");
-    add(NP_SRC_NVAPI, nvapi_.loaded, "NVAPI (NVIDIA)",
-        nvapi_.loaded ? "利用率域：图形/显存控制器/视频引擎/PCIe + 扩展域探测"
-                      : "未检测到 nvapi64.dll");
+    {
+        char nvNote[96];
+        if (nvapi_.loaded) {
+            snprintf(nvNote, sizeof(nvNote), "温度/频率/风扇/利用率域 (gpu=%u)", (unsigned)nvapi_.gpuCount);
+        } else {
+            snprintf(nvNote, sizeof(nvNote), "未加载 (loadErr=%d)", nvapi_.loadErr);
+        }
+        add(NP_SRC_NVAPI, nvapi_.loaded, "NVAPI (NVIDIA)", nvNote);
+    }
     add(NP_SRC_ADL, adl_.loaded, "ADL (AMD)",
         adl_.loaded ? "占用率/温度 (Overdrive5)" : "未检测到 atiadlxx.dll");
     add(NP_SRC_HWINFO, hwinfo_.loaded, "HWiNFO 共享内存",
-        hwinfo_.loaded ? "温度/功耗/风扇等主板级传感器"
+        hwinfo_.loaded ? "温度/功耗/热点/主板传感器"
                        : "需在 HWiNFO 设置里开启 Shared Memory Support");
+    add(NP_SRC_LHM, lhmPresent_, "LibreHardwareMonitor",
+        lhmPresent_ ? "WMI CPU 温度 / 硬件传感器" : "未检测到 WMI root\\LibreHardwareMonitor");
     add(NP_SRC_PDH, pdh_.Count() > 0, "PDH 性能计数器",
-        pdh_.Count() > 0 ? "通用 GPU 引擎占用 / 显存占用 / CPU 性能百分比"
+        pdh_.Count() > 0 ? "进程 GPU 帧时间 / CPU 频率功耗 / 显存"
                          : "无可用 GPU 性能计数器");
-    add(NP_SRC_WMI, comInited_, "WMI", "ACPI 温度区等兜底读数");
+    add(NP_SRC_WMI, comInited_, "WMI (ACPI)", "ACPI 热区温度兜底读数");
+}
+
+void SensorHub::UpdateSourceUsed(uint32_t mask, bool present, bool used, const char* note) {
+    for (auto& s : srcInfo_) {
+        if (s.mask == mask) {
+            s.present = present;
+            s.used = used;
+            if (note) s.note = note;
+            break;
+        }
+    }
+}
+
+void SensorHub::EnsureLhmPolled(uint64_t nowMs) {
+    if (!comInited_ || nowMs < lhmNextTryMs_) return;
+    std::vector<WmiRow> rows;
+    if (WmiRows(L"root\\LibreHardwareMonitor", L"SELECT Name,Value FROM Sensor",
+                {L"Value"}, {L"Name"}, rows)) {
+        lhmPresent_ = true;
+        available_ |= NP_SRC_LHM;
+        lhmNextTryMs_ = nowMs + 1000;
+        float tCpu = -273.0f, tRt = -1.0f, tTen = -1.0f;
+        for (auto& r : rows) {
+            if (r.strs.empty() || r.nums.empty()) continue;
+            std::wstring n = r.strs[0].second;
+            std::transform(n.begin(), n.end(), n.begin(), ::towlower);
+            double v = r.nums[0].second;
+            if (tCpu < -200.0f && (n.find(L"cpu package") != std::wstring::npos ||
+                                   n.find(L"core (tctl") != std::wstring::npos)) {
+                tCpu = (float)v;
+            } else if (tTen < 0.0f && n.find(L"tensor") != std::wstring::npos) {
+                tTen = (float)v;
+            } else if (tRt < 0.0f && n.find(L"rt core") != std::wstring::npos) {
+                tRt = (float)v;
+            }
+        }
+        cachedLhmCpuTemp_ = tCpu;
+        cachedLhmRt_ = tRt;
+        cachedLhmTensor_ = tTen;
+        UpdateSourceUsed(NP_SRC_LHM, true, tCpu > -200.0f || tRt >= 0.0f || tTen >= 0.0f,
+                         "WMI CPU 温度 / 硬件传感器");
+    } else {
+        lhmPresent_ = false;
+        available_ &= ~NP_SRC_LHM;
+        cachedLhmCpuTemp_ = -273.0f;
+        cachedLhmRt_ = -1.0f;
+        cachedLhmTensor_ = -1.0f;
+        lhmNextTryMs_ = nowMs + 30000;
+        UpdateSourceUsed(NP_SRC_LHM, false, false, "未检测到 WMI root\\LibreHardwareMonitor");
+    }
 }
 
 std::string SensorHub::Describe() const {
@@ -619,6 +701,7 @@ std::string SensorHub::Describe() const {
     mark(NP_SRC_NVAPI, "NVAPI");
     mark(NP_SRC_ADL, "ADL");
     mark(NP_SRC_HWINFO, "HWiNFO");
+    mark(NP_SRC_LHM, "LHM");
     mark(NP_SRC_PDH, "PDH");
     mark(NP_SRC_WMI, "WMI");
     if (s.empty()) s = "无";
@@ -701,7 +784,7 @@ void SensorHub::PollCpu(NPSensors& out) {
             uint64_t du = u - lastUser_;
             uint64_t total = dk + du;
             if (total > 0) {
-                double busy = double(total - di) / double(total) * 100.0;
+                double busy = (di < total) ? (double(total - di) / double(total) * 100.0) : 0.0;
                 busy = std::clamp(busy, 0.0, 100.0);
                 // ★ 1 秒级平滑（2026-10-11，用户反馈"蜘蛛侠能波动到 50%、看着乱跳"）。
                 //
@@ -781,10 +864,18 @@ void SensorHub::PollCpu(NPSensors& out) {
     //   MaxStarCounter 取「最忙的那个核」，也是任务管理器/各家工具的惯例。
     out.cpuClock = 0.0f;
     {
+        if (pdhNominalMHz_ <= 0.0) {
+            double nom = 0.0;
+            if (pdh_.MaxStarCounter(L"\\Processor Information(*)\\Processor Frequency", L"", L"", &nom) &&
+                nom > 100.0 && nom < 8000.0) {
+                pdhNominalMHz_ = nom;
+            }
+        }
+        double nominalMHz = (pdhNominalMHz_ > 100.0) ? pdhNominalMHz_
+                                                    : ((cpuBaseMHz_ > 100.0) ? cpuBaseMHz_ : 2300.0);
         double pct = 0;
         if (pdh_.MaxStarCounter(L"\\Processor Information(*)\\% Processor Performance", L"", L"", &pct) && pct > 1.0) {
-            const double kNominalMHz = 2300.0;   // TODO: 改为启动时从 PDH 读一次
-            double mhz2 = kNominalMHz * pct / 100.0;
+            double mhz2 = nominalMHz * pct / 100.0;
             if (mhz2 > 100.0 && mhz2 < 8000.0) {   // 夹紧：超过 8GHz 一律视为读错
                 out.cpuClock = (float)mhz2;
                 cpuFreqFromNt_ = false;
@@ -803,31 +894,34 @@ void SensorHub::PollCpu(NPSensors& out) {
         if (hwinfo_.Find(nullptr, L"CPU Package", &t) ||
             hwinfo_.Find(L"CPU", L"Package", &t) ||
             hwinfo_.FindAny(L"CPU (Tctl", &t) ||
-            hwinfo_.FindAny(L"CPU Package", &t))
+            hwinfo_.FindAny(L"CPU Package", &t)) {
             out.cpuTemp = (float)t;
+            out.sources |= NP_SRC_HWINFO;
+        }
     }
+    uint64_t wmiNow = GetTickCount64();
     if (out.cpuTemp < -200.0f && comInited_) {
-        std::vector<WmiRow> rows;
-        if (WmiRows(L"root\\LibreHardwareMonitor", L"SELECT Name,Value FROM Sensor",
-                    {L"Value"}, {L"Name"}, rows)) {
-            for (auto& r : rows) {
-                if (r.strs.empty() || r.nums.empty()) continue;
-                std::wstring n = r.strs[0].second;
-                std::transform(n.begin(), n.end(), n.begin(), ::towlower);
-                if (n.find(L"cpu package") != std::wstring::npos ||
-                    n.find(L"core (tctl") != std::wstring::npos) {
-                    out.cpuTemp = (float)r.nums[0].second;
-                    available_ |= NP_SRC_LHM;
-                    break;
-                }
-            }
+        EnsureLhmPolled(wmiNow);
+        if (cachedLhmCpuTemp_ > -200.0f) {
+            out.cpuTemp = cachedLhmCpuTemp_;
+            out.sources |= NP_SRC_LHM;
         }
     }
     if (out.cpuTemp < -200.0f && comInited_) {
-        double tk = 0;
-        if (WmiScalar(L"root\\WMI", L"SELECT CurrentTemperature FROM MSAcpi_ThermalZoneTemperature",
-                      L"CurrentTemperature", &tk) && tk > 1000) {
-            out.cpuTemp = (float)(tk / 10.0 - 273.15);
+        if (wmiNow >= acpiNextTryMs_) {
+            double tk = 0;
+            if (WmiScalar(L"root\\WMI", L"SELECT CurrentTemperature FROM MSAcpi_ThermalZoneTemperature",
+                          L"CurrentTemperature", &tk) && tk > 1000.0 && tk < 5000.0) {
+                cachedAcpiTemp_ = (float)(tk / 10.0 - 273.15);
+                acpiNextTryMs_ = wmiNow + 1000;
+            } else {
+                cachedAcpiTemp_ = -273.0f;
+                acpiNextTryMs_ = wmiNow + 30000;
+            }
+        }
+        if (cachedAcpiTemp_ > -200.0f) {
+            out.cpuTemp = cachedAcpiTemp_;
+            out.sources |= NP_SRC_WMI;
         }
     }
     // 功耗：**EMI 优先**，HWiNFO 回退。
@@ -839,19 +933,28 @@ void SensorHub::PollCpu(NPSensors& out) {
     //   * 单位实测推断为**毫瓦**（读数 12922 对应 12.9W），故 /1000
     double mw = 0;
     if (pdh_.MaxStarCounter(L"\\Energy Meter(*)\\Power", L"PKG", L"", &mw) && mw > 0) {
-        // ★ EMA 平滑（用户要求）：RAPL 是能量累加器，功耗本质是瞬时的，会抖。
-        //   平滑后与其它监视器（多为 1 秒平均）更接近。
-        //   alpha=0.25，poll 默认 500ms -> 等效时间常数约 2 秒。
-        //   **只平滑显示值**，采样本身不变。
+        // 按真实间隔 dt 做指数平滑（tau = 1000ms），避免不同 pollMs 节拍下响应漂移
         float inst = (float)(mw / 1000.0);
-        static float sPowerEma = 0.0f;
-        sPowerEma = (sPowerEma <= 0.0f) ? inst : (0.25f * inst + 0.75f * sPowerEma);
-        out.cpuPower = sPowerEma;
+        uint64_t pnow = GetTickCount64();
+        double dt = (lastCpuPowerMs_ && pnow > lastCpuPowerMs_)
+                        ? (double)(pnow - lastCpuPowerMs_)
+                        : 0.0;
+        if (cpuPowerEma_ <= 0.0f || dt <= 0.0 || dt >= 10000.0) {
+            cpuPowerEma_ = inst;
+        } else {
+            double alpha = 1.0 - std::exp(-dt / 1000.0);
+            cpuPowerEma_ += (float)(alpha * (inst - cpuPowerEma_));
+        }
+        lastCpuPowerMs_ = pnow;
+        out.cpuPower = cpuPowerEma_;
+        out.sources |= NP_SRC_PDH;
     } else {
         double p = 0;
         if (hwinfo_.loaded && (hwinfo_.Find(L"CPU", L"Package Power", &p) ||
-                               hwinfo_.FindAny(L"CPU Package Power", &p)))
+                               hwinfo_.FindAny(L"CPU Package Power", &p))) {
             out.cpuPower = (float)p;
+            out.sources |= NP_SRC_HWINFO;
+        }
     }
 }
 
@@ -875,88 +978,101 @@ void SensorHub::PollRam(NPSensors& out) {
 
 // ================================================================== NVIDIA
 void SensorHub::PollGpuNvidia(NPSensors& out) {
-    if (!nvml_.loaded) return;
+    if (!nvml_.loaded && !nvapi_.loaded) return;
+    encUtil_ = -1.0f;
+    decUtil_ = -1.0f;
 
-    unsigned int count = 0;
-    if (nvml_.DeviceGetCount && nvml_.DeviceGetCount(&count) != 0) return;
-    if (count == 0) return;
+    if (nvml_.loaded) {
+        unsigned int count = 0;
+        if (nvml_.DeviceGetCount && nvml_.DeviceGetCount(&count) == 0 && count > 0) {
+            // 每 32 次轮询重新挑一次「正在干活的那张卡」；平时沿用上次结果，减少开销
+            if (nvmlIndex_ < 0 || (pollCount_ % 32) == 0 || nvmlIndex_ >= (int)count) {
+                int best = 0;
+                unsigned int bestUtil = 0;
+                for (unsigned int i = 0; i < count; ++i) {
+                    nvmlDevice_t dev = nullptr;
+                    if (nvml_.DeviceGetHandleByIndex(i, &dev) != 0 || !dev) continue;
+                    nvmlUtilization_t u{};
+                    if (nvml_.DeviceGetUtilizationRates(dev, &u) == 0 && u.gpu > bestUtil) {
+                        bestUtil = u.gpu;
+                        best = (int)i;
+                    }
+                }
+                nvmlIndex_ = best;
+            }
 
-    // 每 32 次轮询重新挑一次「正在干活的那张卡」；平时沿用上次结果，减少开销
-    if (nvmlIndex_ < 0 || (pollCount_ % 32) == 0 || nvmlIndex_ >= (int)count) {
-        int best = 0;
-        unsigned int bestUtil = 0;
-        for (unsigned int i = 0; i < count; ++i) {
             nvmlDevice_t dev = nullptr;
-            if (nvml_.DeviceGetHandleByIndex(i, &dev) != 0 || !dev) continue;
-            nvmlUtilization_t u{};
-            if (nvml_.DeviceGetUtilizationRates(dev, &u) == 0 && u.gpu > bestUtil) {
-                bestUtil = u.gpu;
-                best = (int)i;
+            if (nvml_.DeviceGetHandleByIndex((unsigned int)nvmlIndex_, &dev) == 0 && dev) {
+                out.gpuVendor = 1;
+                char name[NP_NAME_LEN]{};
+                if (nvml_.DeviceGetName(dev, name, NP_NAME_LEN) == 0 && name[0])
+                    NPCopyStr(out.gpuName, NP_NAME_LEN, name);
+
+                nvmlUtilization_t util{};
+                if (nvml_.DeviceGetUtilizationRates(dev, &util) == 0) {
+                    out.gpuUsage = (float)util.gpu;
+                    out.sources |= NP_SRC_NVML;
+                }
+
+                nvmlMemory_t mem{};
+                if (nvml_.DeviceGetMemoryInfo(dev, &mem) == 0) {
+                    out.vramTotalGB = (float)(mem.total / (1024.0 * 1024.0 * 1024.0));
+                    out.vramUsedGB = (float)(mem.used / (1024.0 * 1024.0 * 1024.0));
+                    out.vramPct = mem.total ? (float)((double)mem.used / (double)mem.total * 100.0) : 0;
+                    out.sources |= NP_SRC_NVML;
+                }
+
+                unsigned int v = 0;
+                if (nvml_.DeviceGetTemperature && nvml_.DeviceGetTemperature(dev, NVML_TEMPERATURE_GPU, &v) == 0) {
+                    out.gpuTemp = (float)v;
+                    out.sources |= NP_SRC_NVML;
+                }
+                if (nvml_.DeviceGetPowerUsage && nvml_.DeviceGetPowerUsage(dev, &v) == 0)
+                    out.gpuPower = (float)(v / 1000.0);
+                if (nvml_.DeviceGetEnforcedPowerLimit && nvml_.DeviceGetEnforcedPowerLimit(dev, &v) == 0)
+                    out.gpuPowerLimit = (float)(v / 1000.0);
+                if (nvml_.DeviceGetFanSpeed && nvml_.DeviceGetFanSpeed(dev, &v) == 0)
+                    out.gpuFanPct = (float)v;
+                if (nvml_.DeviceGetClockInfo) {
+                    if (nvml_.DeviceGetClockInfo(dev, NVML_CLOCK_GRAPHICS, &v) == 0) out.gpuClock = (float)v;
+                    if (nvml_.DeviceGetClockInfo(dev, NVML_CLOCK_MEM, &v) == 0) out.memClock = (float)v;
+                }
+                if (nvml_.DeviceGetTemperatureThreshold) {
+                    if (nvml_.DeviceGetTemperatureThreshold(dev, NVML_TEMPERATURE_THRESHOLD_GPU_MAX, &v) == 0)
+                        maxGpuTemp_ = (float)v;
+                }
+                if (nvml_.DeviceGetEncoderUtilization) {
+                    unsigned int su = 0, sa = 0;
+                    if (nvml_.DeviceGetEncoderUtilization(dev, &su, &sa) == 0) encUtil_ = (float)su;
+                }
+                if (nvml_.DeviceGetDecoderUtilization) {
+                    unsigned int su = 0, sa = 0;
+                    if (nvml_.DeviceGetDecoderUtilization(dev, &su, &sa) == 0) decUtil_ = (float)su;
+                }
             }
         }
-        nvmlIndex_ = best;
     }
 
-    nvmlDevice_t dev = nullptr;
-    if (nvml_.DeviceGetHandleByIndex((unsigned int)nvmlIndex_, &dev) != 0 || !dev) return;
-
-    char name[NP_NAME_LEN]{};
-    if (nvml_.DeviceGetName(dev, name, NP_NAME_LEN) == 0 && name[0])
-        NPCopyStr(out.gpuName, NP_NAME_LEN, name);
-
-    nvmlUtilization_t util{};
-    if (nvml_.DeviceGetUtilizationRates(dev, &util) == 0) {
-        out.gpuUsage = (float)util.gpu;
-        out.sources |= NP_SRC_NVML;
-    }
-
-    nvmlMemory_t mem{};
-    if (nvml_.DeviceGetMemoryInfo(dev, &mem) == 0) {
-        out.vramTotalGB = (float)(mem.total / (1024.0 * 1024.0 * 1024.0));
-        out.vramUsedGB = (float)(mem.used / (1024.0 * 1024.0 * 1024.0));
-        out.vramPct = mem.total ? (float)((double)mem.used / (double)mem.total * 100.0) : 0;
-    }
-
-    unsigned int v = 0;
-    if (nvml_.DeviceGetTemperature && nvml_.DeviceGetTemperature(dev, NVML_TEMPERATURE_GPU, &v) == 0)
-        out.gpuTemp = (float)v;
-    if (nvml_.DeviceGetPowerUsage && nvml_.DeviceGetPowerUsage(dev, &v) == 0)
-        out.gpuPower = (float)(v / 1000.0);
-    if (nvml_.DeviceGetEnforcedPowerLimit && nvml_.DeviceGetEnforcedPowerLimit(dev, &v) == 0)
-        out.gpuPowerLimit = (float)(v / 1000.0);
-    if (nvml_.DeviceGetFanSpeed && nvml_.DeviceGetFanSpeed(dev, &v) == 0)
-        out.gpuFanPct = (float)v;
-    if (nvml_.DeviceGetClockInfo) {
-        if (nvml_.DeviceGetClockInfo(dev, NVML_CLOCK_GRAPHICS, &v) == 0) out.gpuClock = (float)v;
-        if (nvml_.DeviceGetClockInfo(dev, NVML_CLOCK_MEM, &v) == 0) out.memClock = (float)v;
-    }
-    if (nvml_.DeviceGetTemperatureThreshold) {
-        if (nvml_.DeviceGetTemperatureThreshold(dev, NVML_TEMPERATURE_THRESHOLD_GPU_MAX, &v) == 0)
-            maxGpuTemp_ = (float)v;
-    }
-    if (nvml_.DeviceGetEncoderUtilization) {
-        unsigned int su = 0, sa = 0;
-        if (nvml_.DeviceGetEncoderUtilization(dev, &su, &sa) == 0) encUtil_ = (float)su;
-    }
-    if (nvml_.DeviceGetDecoderUtilization) {
-        unsigned int su = 0, sa = 0;
-        if (nvml_.DeviceGetDecoderUtilization(dev, &su, &sa) == 0) decUtil_ = (float)su;
-    }
-
-    // ---- NVAPI 利用率域（NVML 没有显存控制器/视频引擎/总线占用）
+    // ---- NVAPI 利用率域与回退通道（温度/频率/风扇）
     if (nvapi_.loaded && nvapi_.gpuCount > 0) {
-        NvPhysicalGpuHandle g = nvapi_.gpus[std::min<int>(nvmlIndex_, (int)nvapi_.gpuCount - 1)];
+        int idx = (nvmlIndex_ >= 0) ? std::min<int>(nvmlIndex_, (int)nvapi_.gpuCount - 1) : 0;
+        NvPhysicalGpuHandle g = nvapi_.gpus[idx];
         if (g) {
+            out.gpuVendor = 1;
             if (out.gpuName[0] == 0 && nvapi_.GPU_GetFullName) {
                 char nm[NVAPI_SHORT_STRING_MAX]{};
-                if (nvapi_.GPU_GetFullName(g, nm) == 0)
+                if (nvapi_.GPU_GetFullName(g, nm) == 0) {
                     NPCopyStr(out.gpuName, NP_NAME_LEN, nm);
+                    out.sources |= NP_SRC_NVAPI;
+                }
             }
             if (out.gpuTemp < -200.0f && nvapi_.GPU_GetThermalSettings) {
                 NV_GPU_THERMAL_SETTINGS_V2 th{};
                 th.version = NV_GPU_THERMAL_SETTINGS_VER_2;
-                if (nvapi_.GPU_GetThermalSettings(g, 0, &th) == 0 && th.count > 0)
+                if (nvapi_.GPU_GetThermalSettings(g, 0, &th) == 0 && th.count > 0) {
                     out.gpuTemp = (float)th.sensor[0].currentTemp;
+                    out.sources |= NP_SRC_NVAPI;
+                }
             }
             if (nvapi_.GPU_GetDynamicPstatesInfoEx) {
                 NV_GPU_DYNAMIC_PSTATES_INFO_EX ps{};
@@ -964,7 +1080,7 @@ void SensorHub::PollGpuNvidia(NPSensors& out) {
                 if (nvapi_.GPU_GetDynamicPstatesInfoEx(g, &ps) == 0) {
                     auto dom = [&](int i) -> float {
                         if (i >= NVAPI_MAX_GPU_UTILIZATIONS) return -1.0f;
-                        if (!ps.utilization[i].bIsPresent) return -1.0f;
+                        if (!(ps.utilization[i].presentFlags & 1u)) return -1.0f;
                         float p = (float)ps.utilization[i].percentage;
                         return (p >= 0.0f && p <= 100.0f) ? p : -1.0f;
                     };
@@ -987,15 +1103,13 @@ void SensorHub::PollGpuNvidia(NPSensors& out) {
             }
             if (out.gpuFanPct < 0 && nvapi_.GPU_GetTachReading) {
                 NvU32 rpm = 0;
-                if (nvapi_.GPU_GetTachReading(g, &rpm) == 0 && rpm > 0) out.gpuFanRpm = (float)rpm;
+                if (nvapi_.GPU_GetTachReading(g, &rpm) == 0 && rpm > 0) {
+                    out.gpuFanRpm = (float)rpm;
+                    out.sources |= NP_SRC_NVAPI;
+                }
             }
 
             // ---- 频率回退：NVAPI 直读（NvAPI_GPU_GetAllClockFrequencies 0xDCB616C3）
-            //
-            // 为什么需要：GPU 频率的主来源是 NVML，而 README 里如实写了
-            // 「换机器 / 换驱动，传感器很可能读不到数据」。NVAPI 是另一条独立通路，
-            // 走的是同一个驱动但**不依赖 NVML 那套库**，能补上这个弱点。
-            // gpuClock / memClock 默认 -1，所以 <= 0 就表示"还没读到"。
             if (out.gpuClock <= 0.0f || out.memClock <= 0.0f) {
                 double cMhz = 0, mMhz = 0;
                 if (NvapiReadGpuClocks(nvapi_, g, &cMhz, &mMhz)) {
@@ -1006,11 +1120,17 @@ void SensorHub::PollGpuNvidia(NPSensors& out) {
             }
         }
     }
+
+    // NVAPI 未提供视频域时回退使用 NVML 编解码占用率的最大值
+    if (out.domVid < 0.0f && (encUtil_ >= 0.0f || decUtil_ >= 0.0f)) {
+        out.domVid = std::max(encUtil_, decUtil_);
+    }
 }
 
 // ================================================================== AMD
 void SensorHub::PollGpuAmd(NPSensors& out) {
     if (!adl_.loaded || adl_.adapterCount <= 0) return;
+    out.gpuVendor = 2;
 
     // 挑一个活动量最高的适配器
     if (adl_.activeIndex < 0 || (pollCount_ % 32) == 0) {
@@ -1042,15 +1162,7 @@ void SensorHub::PollGpuAmd(NPSensors& out) {
 
 // ================================================================== 通用兜底
 void SensorHub::PollGpuGeneric(NPSensors& out) {
-    pdh_.Collect();
-
     if (out.gpuUsage < 0) {
-        // ★ 原来是对 `\GPU Engine(*)` 的**全部实例求和**（所有进程、所有引擎类型）。
-        //   每个实例各自是 0~100% 的占用率，几十上百个实例加起来必然几百，
-        //   被 clamp 到 100 —— 于是没有 NVML/ADL 的机器上「GPU 占用率」恒等于 100%，
-        //   一个永远不动的假数。正确口径是「最忙的那个引擎」（任务管理器同样如此）。
-        //   另外必须走带 `*` 的**动态**实例计数器：AddWildcard 展开的实例在
-        //   AddCounter 那一刻就冻结了，之后再启动的游戏引擎它看不到。
         double best = 0;
         if (pdh_.MaxStarCounter(L"\\GPU Engine(*)\\Utilization Percentage", L"", L"", &best)) {
             out.gpuUsage = (float)std::clamp(best, 0.0, 100.0);
@@ -1059,75 +1171,106 @@ void SensorHub::PollGpuGeneric(NPSensors& out) {
     }
     if (out.vramUsedGB < 0) {
         double bytes = 0;
-        if (pdh_.SumWhere(L"GPU Adapter Memory", L"", &bytes) && bytes > 0) {
+        if (pdh_.MaxStarCounter(L"\\GPU Adapter Memory(*)\\Dedicated Usage", L"", L"", &bytes) && bytes > 0) {
             out.vramUsedGB = (float)(bytes / (1024.0 * 1024.0 * 1024.0));
             if (out.vramTotalGB > 0)
                 out.vramPct = std::clamp(out.vramUsedGB / out.vramTotalGB * 100.0f, 0.0f, 100.0f);
+            out.sources |= NP_SRC_PDH;
         }
     }
 }
 
 void SensorHub::PollHwinfoExtras(NPSensors& out) {
     if (!hwinfo_.loaded) return;
-    if (!hwinfo_.Refresh()) return;
     double v = 0;
     if (out.gpuHotspot < -200.0f && (hwinfo_.Find(L"GPU", L"Hot Spot", &v) ||
-                                     hwinfo_.FindAny(L"GPU Hot Spot", &v)))
+                                     hwinfo_.FindAny(L"GPU Hot Spot", &v))) {
         out.gpuHotspot = (float)v;
+        out.sources |= NP_SRC_HWINFO;
+    }
     if (out.gpuMemTemp < -200.0f && (hwinfo_.Find(L"GPU", L"Memory Junction", &v) ||
-                                     hwinfo_.FindAny(L"Memory Junction", &v)))
+                                     hwinfo_.FindAny(L"Memory Junction", &v))) {
         out.gpuMemTemp = (float)v;
-    if (out.gpuPower < 0 && (hwinfo_.Find(L"GPU", L"Power", &v) || hwinfo_.FindAny(L"GPU Power", &v)))
+        out.sources |= NP_SRC_HWINFO;
+    }
+    if (out.gpuPower < 0 && (hwinfo_.Find(L"GPU", L"Power", &v) || hwinfo_.FindAny(L"GPU Power", &v))) {
         out.gpuPower = (float)v;
-    if (out.gpuFanPct < 0 && hwinfo_.FindAny(L"GPU Fan", &v)) out.gpuFanPct = (float)v;
-    if (out.vramUsedGB < 0 && hwinfo_.FindAny(L"GPU Memory Used", &v))
+        out.sources |= NP_SRC_HWINFO;
+    }
+    if (out.gpuFanPct < 0 && hwinfo_.FindAny(L"GPU Fan", &v)) {
+        out.gpuFanPct = (float)v;
+        out.sources |= NP_SRC_HWINFO;
+    }
+    if (out.vramUsedGB < 0 && hwinfo_.FindAny(L"GPU Memory Used", &v)) {
         out.vramUsedGB = (float)(v / 1024.0);  // MB -> GB
+        out.sources |= NP_SRC_HWINFO;
+    }
 }
 
 void SensorHub::ProbeRtTensorHardware(NPSensors& out) {
-    // 硬件级 RT / Tensor 占用：目前公开接口在 GeForce 上没有，
-    // 这里保留三个探测点，将来厂商开放即可自动生效：
-    //   1) HWiNFO / LHM 里若出现 "Tensor"/"RT Core" 读数
-    //   2) NVAPI 未公开利用率域（已在 PollGpuNvidia 中读出到 domExt）
-    //   3) 预留的 DCGM 探测（数据中心卡）
     double v = 0;
     if (hwinfo_.loaded) {
-        if (hwinfo_.FindAny(L"Tensor", &v)) { out.hwTensorPct = (float)v; out.hwRtTensorSrc |= NP_SRC_HWINFO; }
-        if (hwinfo_.FindAny(L"RT Core", &v)) { out.hwRtPct = (float)v; out.hwRtTensorSrc |= NP_SRC_HWINFO; }
+        if (hwinfo_.FindAny(L"Tensor", &v)) {
+            out.hwTensorPct = (float)v;
+            out.hwRtTensorSrc |= NP_SRC_HWINFO;
+            out.sources |= NP_SRC_HWINFO;
+        }
+        if (hwinfo_.FindAny(L"RT Core", &v)) {
+            out.hwRtPct = (float)v;
+            out.hwRtTensorSrc |= NP_SRC_HWINFO;
+            out.sources |= NP_SRC_HWINFO;
+        }
     }
     if (comInited_ && (out.hwRtPct < 0 || out.hwTensorPct < 0)) {
-        std::vector<WmiRow> rows;
-        if (WmiRows(L"root\\LibreHardwareMonitor", L"SELECT Name,Value FROM Sensor", {L"Value"},
-                    {L"Name"}, rows)) {
-            for (auto& r : rows) {
-                if (r.strs.empty() || r.nums.empty()) continue;
-                std::wstring n = r.strs[0].second;
-                std::transform(n.begin(), n.end(), n.begin(), ::towlower);
-                if (n.find(L"tensor") != std::wstring::npos) {
-                    out.hwTensorPct = (float)r.nums[0].second;
-                    out.hwRtTensorSrc |= NP_SRC_LHM;
-                } else if (n.find(L"rt core") != std::wstring::npos) {
-                    out.hwRtPct = (float)r.nums[0].second;
-                    out.hwRtTensorSrc |= NP_SRC_LHM;
-                }
-            }
+        EnsureLhmPolled(GetTickCount64());
+        if (out.hwTensorPct < 0 && cachedLhmTensor_ >= 0.0f) {
+            out.hwTensorPct = cachedLhmTensor_;
+            out.hwRtTensorSrc |= NP_SRC_LHM;
+            out.sources |= NP_SRC_LHM;
+        }
+        if (out.hwRtPct < 0 && cachedLhmRt_ >= 0.0f) {
+            out.hwRtPct = cachedLhmRt_;
+            out.hwRtTensorSrc |= NP_SRC_LHM;
+            out.sources |= NP_SRC_LHM;
         }
     }
 }
 
 // ================================================================== 主轮询
 void SensorHub::Poll(NPSensors& out) {
-    (void)0;
     NPClearSensors(&out);
     out.valid = 1;
-    out.tickMs = GetTickCount64();
+    uint64_t nowMs = GetTickCount64();
+    out.tickMs = nowMs;
     ++pollCount_;
+
+    // 统一在每轮 Poll 开头刷新一次 PDH 与 HWiNFO（避免同轮重复采样破坏速率计数器）
+    if (pdh_.Collect()) lastPdhCollectMs_ = nowMs;
+    if (!hwinfo_.loaded && nowMs >= hwinfoNextTryMs_) {
+        hwinfoNextTryMs_ = nowMs + 10000;
+        if (hwinfo_.Open()) {
+            available_ |= NP_SRC_HWINFO;
+            hwinfoFailStreak_ = 0;
+            UpdateSourceUsed(NP_SRC_HWINFO, true, true, "温度/功耗/热点/主板传感器");
+        }
+    } else if (hwinfo_.loaded) {
+        if (hwinfo_.Refresh()) {
+            hwinfoFailStreak_ = 0;
+            available_ |= NP_SRC_HWINFO;
+        } else if (++hwinfoFailStreak_ >= 5) {
+            hwinfo_.Close();
+            hwinfoFailStreak_ = 0;
+            available_ &= ~NP_SRC_HWINFO;
+            hwinfoNextTryMs_ = nowMs + 10000;
+            UpdateSourceUsed(NP_SRC_HWINFO, false, false, "共享内存已断开，自动重连中");
+        }
+    }
 
     PollCpu(out);
     PollRam(out);
 
-    bool nvidia = (out.gpuVendor == 1) || nvml_.loaded;
-    bool amd = (out.gpuVendor == 2) || adl_.loaded;
+    bool nvidia = (out.gpuVendor == 1) || ((out.gpuVendor != 2) && (nvml_.loaded || (nvapi_.loaded && nvapi_.gpuCount > 0)));
+    bool amd = !nvidia && ((out.gpuVendor == 2) || adl_.loaded);
 
     if (nvidia) PollGpuNvidia(out);
     else if (amd) PollGpuAmd(out);
@@ -1136,19 +1279,31 @@ void SensorHub::Poll(NPSensors& out) {
     PollHwinfoExtras(out);
     ProbeRtTensorHardware(out);
 
+    uint32_t activeSrc = out.sources;
+    UpdateSourceUsed(NP_SRC_NVML, nvml_.loaded, (activeSrc & NP_SRC_NVML) != 0);
+    UpdateSourceUsed(NP_SRC_NVAPI, nvapi_.loaded, (activeSrc & NP_SRC_NVAPI) != 0);
+    UpdateSourceUsed(NP_SRC_ADL, adl_.loaded, (activeSrc & NP_SRC_ADL) != 0);
+    UpdateSourceUsed(NP_SRC_HWINFO, hwinfo_.loaded, (activeSrc & NP_SRC_HWINFO) != 0);
+    UpdateSourceUsed(NP_SRC_LHM, lhmPresent_, (activeSrc & NP_SRC_LHM) != 0);
+    UpdateSourceUsed(NP_SRC_PDH, pdh_.Count() > 0, (activeSrc & NP_SRC_PDH) != 0 || out.cpuClock > 0.0f);
+    UpdateSourceUsed(NP_SRC_WMI, comInited_, (activeSrc & NP_SRC_WMI) != 0);
+
     // 数据源文字说明
     std::string gpuSrc;
-    if (out.sources & NP_SRC_NVML) gpuSrc = "NVML";
-    else if (out.sources & NP_SRC_ADL) gpuSrc = "ADL";
-    else if (out.sources & NP_SRC_PDH) gpuSrc = "PDH";
-    else if (out.sources & NP_SRC_HWINFO) gpuSrc = "HWiNFO";
+    if (activeSrc & NP_SRC_NVML) gpuSrc = "NVML";
+    else if (activeSrc & NP_SRC_ADL) gpuSrc = "ADL";
+    else if (activeSrc & NP_SRC_NVAPI) gpuSrc = "NVAPI";
+    else if (activeSrc & NP_SRC_PDH) gpuSrc = "PDH";
+    else if (activeSrc & NP_SRC_HWINFO) gpuSrc = "HWiNFO";
 
     std::string txt = "GPU:" + (gpuSrc.empty() ? std::string("无") : gpuSrc);
     txt += " | CPU:系统计时器";
-    if (out.cpuTemp > -200.0f) txt += " | 温度:HWiNFO/WMI";
+    if (activeSrc & NP_SRC_HWINFO) txt += " | HWiNFO";
+    else if (activeSrc & NP_SRC_LHM) txt += " | LHM";
+    else if (activeSrc & NP_SRC_WMI) txt += " | ACPI";
     if (nvapi_.loaded) txt += " | 域:NVAPI";
     if (nvapiExtSeen_) txt += " | 扩展域:有";
-    out.sources = available_ | out.sources;
+    out.sources = available_ | activeSrc;
     NPCopyStr(out.sourceText, NP_NAME_LEN, txt.c_str());
 }
 

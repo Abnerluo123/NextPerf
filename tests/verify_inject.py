@@ -54,6 +54,59 @@ u32.GetWindowThreadProcessId.argtypes = [wt.HWND, ctypes.POINTER(wt.DWORD)]
 u32.PostMessageW.argtypes = [wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM]
 
 
+class NPConfig(ctypes.Structure):
+    """必须和 src/common/np_common.h 的 NPConfig 逐字段对齐。"""
+    _fields_ = [
+        ("magic", ctypes.c_uint32), ("version", ctypes.c_uint32), ("size", ctypes.c_uint32),
+        ("counters", ctypes.c_uint64),
+        ("bgColor", ctypes.c_uint32), ("textColor", ctypes.c_uint32),
+        ("accentColor", ctypes.c_uint32), ("warnColor", ctypes.c_uint32),
+        ("scale", ctypes.c_float), ("opacity", ctypes.c_float),
+        ("bgOpacity", ctypes.c_float), ("textOpacity", ctypes.c_float),
+        ("offsetX", ctypes.c_int32), ("offsetY", ctypes.c_int32),
+        ("fontHeight", ctypes.c_uint32),
+        ("graphHeight", ctypes.c_uint32), ("overlayMode", ctypes.c_uint32),
+        ("fpsCap", ctypes.c_uint32), ("pollMs", ctypes.c_uint32),
+        ("updateHz", ctypes.c_uint32), ("deepEngineHook", ctypes.c_uint32),
+        ("vtableProbe", ctypes.c_uint32), ("quit", ctypes.c_uint32),
+        ("simulate", ctypes.c_uint32), ("autoInject", ctypes.c_uint32),
+        ("pauseHook", ctypes.c_uint32), ("learnedAutoHook", ctypes.c_uint32),
+        ("detachPid", ctypes.c_uint32),
+        ("reserved", ctypes.c_uint32 * 4),
+    ]
+
+
+class NPSensors(ctypes.Structure):
+    """必须和 src/common/np_common.h 的 NPSensors 逐字段对齐。"""
+    _fields_ = [
+        ("magic", ctypes.c_uint32), ("version", ctypes.c_uint32),
+        ("tickMs", ctypes.c_uint64),
+        ("valid", ctypes.c_uint32),
+        ("cpuUsage", ctypes.c_float), ("cpuTemp", ctypes.c_float),
+        ("cpuPower", ctypes.c_float), ("cpuClock", ctypes.c_float),
+        ("cpuCores", ctypes.c_uint32), ("cpuThreads", ctypes.c_uint32),
+        ("ramUsedGB", ctypes.c_float), ("ramTotalGB", ctypes.c_float), ("ramPct", ctypes.c_float),
+        ("gpuName", ctypes.c_char * NP_NAME_LEN),
+        ("gpuVendor", ctypes.c_uint32),
+        ("gpuUsage", ctypes.c_float), ("gpuTemp", ctypes.c_float),
+        ("gpuHotspot", ctypes.c_float), ("gpuMemTemp", ctypes.c_float),
+        ("gpuPower", ctypes.c_float), ("gpuPowerLimit", ctypes.c_float),
+        ("gpuClock", ctypes.c_float), ("memClock", ctypes.c_float),
+        ("gpuFanPct", ctypes.c_float), ("gpuFanRpm", ctypes.c_float),
+        ("vramUsedGB", ctypes.c_float), ("vramTotalGB", ctypes.c_float), ("vramPct", ctypes.c_float),
+        ("domGpu", ctypes.c_float), ("domFb", ctypes.c_float),
+        ("domVid", ctypes.c_float), ("domBus", ctypes.c_float),
+        ("domExt", ctypes.c_float * 4),
+        ("domExtPresent", ctypes.c_uint32),
+        ("hwRtPct", ctypes.c_float), ("hwTensorPct", ctypes.c_float),
+        ("hwRtTensorSrc", ctypes.c_uint32),
+        ("gpuBusyMs", ctypes.c_float), ("engCompute", ctypes.c_float), ("engOfa", ctypes.c_float),
+        ("screenW", ctypes.c_uint32), ("screenH", ctypes.c_uint32), ("refreshHz", ctypes.c_uint32),
+        ("sources", ctypes.c_uint32),
+        ("sourceText", ctypes.c_char * NP_NAME_LEN),
+    ]
+
+
 class NPTelemetry(ctypes.Structure):
     """必须和 src/common/np_common.h 的 NPTelemetry 逐字段对齐。"""
     _fields_ = [

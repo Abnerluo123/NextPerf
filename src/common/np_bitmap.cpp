@@ -16,7 +16,7 @@ float RasterScale() { return gRasterScale; }
 
 bool GfxInit() {
     if (gD2D) return true;
-    if (FAILED(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, &gD2D))) return false;
+    if (FAILED(D2D1CreateFactory(D2D1_FACTORY_TYPE_MULTI_THREADED, &gD2D))) return false;
     if (FAILED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory),
                                    reinterpret_cast<IUnknown**>(&gDW)))) {
         gD2D->Release();

@@ -76,7 +76,8 @@ AI 超分模块是否加载、渲染分辨率与输出分辨率的缩放比 —�
 
 - **遥测按 PID 分块**（映射名里带 pid，见 `OpenIpc()`）：同时注入两个游戏时，共用一个名字会互相覆盖。
 - `Cfg()` / `Sens()` 返回**值拷贝**，并且先 `NPDefaultConfig` / `NPClearSensors` 再覆盖 ——
-  这样主程序还没起来 / magic 不对时，调用方永远拿到一份安全的默认值，不会读到野数据（`Cfg()` / `Sens()` 的实现）。
+  并且额外校验 `gCfg->size == sizeof(NPConfig)` / `gSens->version == sizeof(NPSensors)`；
+  这样主程序还没起来、布局不匹配或 magic 不对时，调用方永远拿到一份安全的默认值，不会读到野数据（`Cfg()` / `Sens()` 的实现）。
 - `NPTelemetry::version` 写的是 `sizeof(NPTelemetry)` 而不是版本号，
   读方对一下大小就能立刻发现结构体布局错位（`NPTelemetry::version` 的赋值处；`NPSensors::version` 同理）。
 
@@ -413,24 +414,20 @@ PatchSwapChainVtable → gSwapVtCount>0 → PresentHooked()=true → 后续探�
 
 ---
 
-## 11. `ResizeBuffers`：**当前未挂钩**（明确记录为缺口）
+## 11. `ResizeBuffers` / `ResizeBuffers1` 与 Vulkan IAT 挂钩
 
-- 全仓搜索确认：`src/hook/` 下 `ResizeBuffers` **只出现在注释里**
-  （散落在 `np_draw.cpp`、`np_draw.h`、`np_hook.cpp` 的注释里），
-  **没有任何一处对它做 vtable 补丁**。
-- 也就是说：交换链重建（全屏转换 / `ResizeBuffers` / 分辨率切换）我们**收不到通知**，
-  只能靠副作用间接感知：
-  - D3D12 侧：`Overlay12::Record` 里发现「后台缓冲对象变了、8 个 RTV 槽用满」→ 换堆 +
-    `settle_ = 30` 静默 30 帧；
-  - D3D11 侧：每帧按 `GetCurrentBackBufferIndex()` 取当前后台缓冲 + 每帧新建 RTV（`PresentCommon`）；
-  - 全局统计：`gOv12.HeapSwaps()` 记录换堆次数。
-- 背景（为什么这些副作用是必要的）：**应用调用 `ResizeBuffers` / 切换独占全屏之前，
-  必须释放所有对后台缓冲的引用**。我们长期握着引用就会让那次调用失败
-  （`DXGI_ERROR_INVALID_CALL`），而不少游戏不检查返回值 —— 直接闪退。
-  用户实测完全吻合：**不绘制叠加层不闪退，一绘制就闪退**（见 `Overlay11::Draw` 里对 RTV 的处理）。
-- 若要新增 `ResizeBuffers` 钩子（下标属于 `IDXGISwapChain` 的另一格，**未确认**具体值，
-  必须按 §4.1 的方式用 `tests/vt_check.py` 核对后再动），需要同步考虑：
-  在回调里主动释放 D3D11 RTV / D3D12 描述符槽，并让 D3D12 侧进入 settle 状态。
+### 11.1 DXGI `ResizeBuffers`（槽位 13）与 `ResizeBuffers1`（槽位 39）
+
+- `PatchSwapChainVtable()` 现已正式挂钩 `IDXGISwapChain::ResizeBuffers`（槽位 13，`NpResizeBuffers`），并通过 `QueryInterface(IID_IDXGISwapChain3)` 守卫后再补 `IDXGISwapChain3::ResizeBuffers1`（槽位 39，`NpResizeBuffers1`）；`tests/vt_check.py` 已把两者纳入头文件校验。
+- 调用原函数前经 `BeforeSwapchainResize()` 同步清理资源引用：
+  - D3D11：`gOv11.OnResizeBuffers()` 释放 `rtv_` / `rtvSrc_`，避免持有失效后台缓冲引发 `DXGI_ERROR_INVALID_CALL` 或闪烁；
+  - D3D12：`gOv12.OnResizeBuffers()` 排空 pending fence 资源、轮转退役 `rtvHeap_`、清空 `rtvSlotsN_`/`lastBbW_`/`lastBbH_`/`lastBbFormat_`/`bbByIdx_`，递增 `rtvHeapSwaps_` 并置 `settle_ = 30` 静默帧，彻底消除独占全屏/分辨率切换瞬间的闪屏与驱动崩点。
+- `RestoreAllHooks()` 幂等恢复两条槽位；`ProbeSwapChainVtable()` 探测窗同步改为 `WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE`、`WS_POPUP | WS_DISABLED` 并置于 `(-32000, -32000)`，消除探测窗一闪而过的干扰。
+
+### 11.2 非侵入式 Vulkan 帧遥测（IAT 挂钩）
+
+- 为在不创建额外 VkDevice / 不破坏游戏呈现链的前提下采集 Vulkan 帧率与 Low 帧，Worker 在探测到宿主使用 Vulkan 时（排除 D3D12 decoy vulkan 误判后）调用 `InstallVulkan()` -> `PatchModuleVkIat()` 修改已加载模块导入表中的 `vkQueuePresentKHR`、`vkCreateSwapchainKHR`、`vkGetDeviceProcAddr`、`vkGetInstanceProcAddr`（并由 `RestoreAllHooks()` 还原）。
+- `NpVkQueuePresentKHR` 记录真呈现间隔并写入 `NP_API_VULKAN` 遥测（由 `gVkPresentSeen` 原子标记防止心跳线程误覆盖），桌面端主循环在 `NP_HOOK_OVERLAY == 0` 时保留桌面分层 HUD 自动叠加。
 
 ---
 
@@ -768,7 +765,7 @@ D3D 已加载但 Present 未挂上 →「看 NextPerfHook.log」；其余 →「
 
 ### 16.2 涉及代码
 
-- 计算：`UpdateTelemetryCommon` 里的 `lowWin` 换算（`lowWindowed` / `lowPercentileFps` 的调用点）
+- 计算：`UpdateTelemetryCommon` 里的 `n1s` 换算（`lowPercentileFps(99.0f/99.9f, n1s)`）与 `NPConfigGetEtwRelay`（优先用主程序经 `NPConfig.reserved[]` 中继的 ETW 1s/3s 百分位）
 - 实现：`np::FrameStats::lowPercentileFps(pct, window)` → `percentileMs`
 - 对照日志：`low compare`（`UpdateTelemetryCommon` 的诊断块）
 
@@ -794,8 +791,8 @@ D3D 已加载但 Present 未挂上 →「看 NextPerfHook.log」；其余 →「
 - **窗口平均口径（口径 4）** 曾经是默认：用户实机日志（RE8 锁 60）显示
   严格（最差 1% 单帧）= 53.8，与驱动 59 差 5；窗口平均 = 57.1，明显更贴近驱动。
   原因是游戏内 overlay 与驱动面板显示的本来就是窗口平均后的 FPS。
-  现在**面板固定用 PresentMon 口径**，`np::FrameStats::lowWindowed` 仍保留在 `np_stats.h` 供对照，
-  但**钩子层的主路径就是 `lowWindowed`**（`np_hook.cpp` 里的 `lowWindowed(1.0/0.1, 1000ms, look)` 调用），`lowPercentileFps` 只在窗口数不足 4 个时兜底。⚠ 这句话原本写反了（写成「钩子层不再调用 lowWindowed」），已按代码更正。
+  现在**面板固定用 PresentMon 滑动窗口百分位口径**：钩子侧调用 `gStats.lowPercentileFps(99.0f/99.9f, n1s)`（线性插值 + 倒数指标排名反转），管理员启用 ETW 时再由主程序通过 `NPConfig.reserved[]` 中继 1s(P99) / 3s(P99.9) 百分位并优先采用。`np::FrameStats::lowWindowed` **已退休**，只留在 `np_stats.h` 供对照。
+  此外，`PresentCommon` 向 `gHist` 推送曲线历史（`NPHistoryPush`）时参数顺序已对齐为 `(fps, fpsAvg, fpsLow1, fpsLow01, ss.cpuUsage, ss.gpuUsage, frameMsAvg, cpuFrameMsAvg, gpuSeries, cpuBusyAvg, cpuWaitAvg)`；`setjmp(gJmp)` 异常恢复分支同步重置 `gDbgInPresent`、`gNpCountingOverlayDraws`，并在持有 `gD12Lock` 时置位 `gD12Broken` 后解锁。
 - `p99Ms` / `p999Ms` 同时给出，走**全缓冲区**（默认窗口 = `kCap`）。
 
 ---
@@ -930,6 +927,11 @@ wantOverlay = !paused && cfg.overlayMode != 2 && (gDev11 || gDev12)
   现改为**常驻上传缓冲环**：`Overlay12::uploadRing_`（4 个，`uploadRingSize_` 记尺寸、
   `uploadRingFence_` 确认 GPU 用完才复用；一个都挑不到就**跳过这一帧的面板更新**，
   纹理里保留上一版内容）。顺带省掉约 **18MB/s** 的分配抖动。
+- **`OnBackBuffer()` 立即感知交换链重建 + 8 槽 SRV 描述符环 + 4MB 预分配上传缓冲**（`Overlay12::OnBackBuffer` / `Record`）：
+  除 8 槽耗尽外，`OnBackBuffer()` 在 `BeginList()` 之前检测后台缓冲尺寸/格式变化或同 `bbIdx` 下的资源指针替换，
+  一旦发生立即新建并替换 RTV 堆（旧堆 `Retire` 延迟释放）、置 `settle_ = 30` 跳过重建首帧绘制；
+  同时 `srvHeap_` 扩容为 8 槽环并在重建面板纹理时递增 `srvSlot_`，`uploadRing_` 预留至少 4MB 容量避免缩放翻倍时在重建期重建 UPLOAD 资源，
+  彻底消除 `sim_stress --api=dx12` 连续切换窗口/分辨率时的 `nvwgf2umx.dll+0x330124` 崩溃。
 - **RTV 描述符「换堆」而不是覆盖槽位**（`Overlay12::Record`）★：
   - 每种后台缓冲占**各自**一个槽（`rtvSlots_[8]`）。原来只有一个槽、每帧按当前缓冲重写 ——
     上一帧的命令列表可能还在执行，而 **GPU 是执行时（不是录制时）才去读描述符堆的**，
@@ -951,9 +953,9 @@ wantOverlay = !paused && cfg.overlayMode != 2 && (gDev11 || gDev12)
 - 上传：行距必须按 `D3D12_TEXTURE_DATA_PITCH_ALIGNMENT`(256) 对齐。
 - 绘制：`OMSetRenderTargets` + 视口 + **裁剪矩形**把全屏三角形限制到面板区域，
   前后各一次屏障（`bbBefore` ↔ `RENDER_TARGET`），面板纹理末尾转回 `COPY_DEST` 供下一帧上传。
-- `Release` 里**必须重置 `psoFormat_ = UNKNOWN`**（`Overlay12::Release`）：不重置的话，
-  若本对象在同一进程里被重新 `Init`，`EnsurePso` 会因为 `psoFormat_` 恰好相等而认为旧 PSO 还能用
-  （其实已经 `Release` 了）。同时这里也补上了原来漏掉的 `vsBlob_`/`psBlob_`。
+- **先准备后台缓冲 RTV 槽位再更新纹理与上传**（`Overlay12::Record`）：若在分配/换堆 RTV 描述符时失败直接返回 `false`，就不会在失败前提前将 `tex_` 转成 `PIXEL_SHADER_RESOURCE`（避免后续重试处于错误资源状态）。同时仅在 `CreateCommittedResource` 成功后才更新 `texW_` / `texH_`。
+- `Release` 里**必须重置状态字段**（`Overlay12::Release`）：除重置 `psoFormat_ = UNKNOWN` 与释放 `vsBlob_`/`psBlob_` 外，同步复位 `rtvHeapSwaps_`、`settle_`、`drawSkips_`、`texW_`、`texH_`、`fenceValue_`、`srvHeapSize_`、`srvSlot_`、`lastBbW_`、`lastBbH_`、`lastBbFormat_` 与 `bbByIdx_`，避免同进程重新 `Init` 后残留旧计数。
+- `PresentCommon` 在 `sc->GetBuffer()` 期间用线程局部 `gPresentTempBb` 记录临时 `bb`，并在 `setjmp(gJmp)` 异常恢复分支释放在途后台缓冲引用，防止异常跳出泄漏 swapchain refcount。
 - **`Overlay12::Record` 必须由调用方用 `BeginList`/`EndList` 包起来**（见 `PresentCommon`），
   屏障与绘制录进的是**我们自己的**命令列表，再 `EndList(gQueue12)` 提到游戏队列。
 
@@ -1118,22 +1120,21 @@ FreeLibraryAndExitThread(gSelf, 0)   // 6. 从宿主进程卸载自己并结束�
 `DLL_PROCESS_DETACH` 是**唯一**保证「在代码被卸载前执行」的位置，所以必须在这里还。
 `RestoreAllHooks` 是幂等的：`SelfUnloadNow` 已经还过一遍也没关系。
 
-然后是 `gReady = false`（停掉 worker 循环）、等 worker 线程结束
-（**自卸载路径下 detach 发生在 worker 线程自己身上，不能等自己**）、
-`DeleteCriticalSection(&gCs)`。
+然后是 `gReady = false`（停掉 worker 循环）：若 `DLL_PROCESS_DETACH` 由进程终止触发（`lpReserved != nullptr`，即 `processTerminating = true`），
+则在 OS Loader Lock 下直接返回，**跳过 `RestoreAllHooks()`、`WaitForSingleObject(gWorker, 500)` 与 `DeleteCriticalSection(&gCs)`**，避免进程退出期因系统强杀工作线程而死锁。
+正常动态卸载（`lpReserved == nullptr`）时再完整执行还原、等 worker 线程结束
+（**自卸载路径下 detach 发生在 worker 线程自己身上，不能等自己**）并 `DeleteCriticalSection(&gCs)`。
 
 ### 21.7 卸载后仍然残留的东西（明确记录）
 
 | 残留物 | 为什么留着 | 影响 |
 | --- | --- | --- |
 | 窗口类 `NextPerfProbeWnd` | 注册在**宿主 exe 模块**上（`ProbeSwapChainVtable` 里的窗口类注册），exe 永不卸载，无法也不该注销 | 只是一个类名，用宿主模块句柄，不会变成野类 |
-| `nvapi64.dll`（`ReflexReader::dll_`） | 只在实现文件里 `LoadLibrary`，没有对应的 `FreeLibrary`（`ReflexReader::Init`） | 进程退出时自然回收；**未确认**是否有意为之 |
-| `gReflexDev`（D3D 设备） | 注释明确写「AddRef 后长期持有，**不释放**」（`gReflexDev` 的声明注释） | `SelfUnloadNow` 的释放清单里确实没有它 |
+| `nvapi64.dll`（`ReflexReader::dll_`）、`gReflexDev`、`gInfoQueue12` | ✅ **已在 `SelfUnloadNow()` 释放** | `SelfUnloadNow()` 依次释放 `gInfoQueue12`（并清零全局跟踪状态）、释放 `gReflexDev`（置 `gReflexTried=false`）并调用 `gReflex.Shutdown()` 执行 `FreeLibrary` |
 | `gCs` | `InitializeCriticalSection` / `DeleteCriticalSection` 成对，但**全文件没有任何 `EnterCriticalSection`** | 当前是死代码（`gCs` 只在声明、`NpHookAttach` 的 `InitializeCriticalSection`、`NpHookDetach` 的 `DeleteCriticalSection` 三处出现） |
 | `gCpuStartQpc` | `NpECL` 里写，**没有任何读点** | 死变量，原为「本帧 CPU 起点」 |
 
-> 若将来要把这些都清干净，注意 `gReflexDev` 一旦 `Release` 就必须同时让
-> `gReflexTried`/`ReflexReader` 状态可重置，否则「重新 Init」路径会拿到悬空设备指针。
+> 若卸载后同进程再次加载，因 `gReflexDev`/`gReflexTried` 与 `gInfoQueue12`/`gInfoQueueTried` 均已复位，不会遗留悬空设备或 InfoQueue 指针。
 
 ---
 
@@ -1286,13 +1287,13 @@ FreeLibraryAndExitThread(gSelf, 0)   // 6. 从宿主进程卸载自己并结束�
 
 | 缺口 | 现状 | 备注 |
 | --- | --- | --- |
-| 没有 `ResizeBuffers` 钩子 | 只能靠 D3D12 换堆 / D3D11 每帧新建 RTV 间接应对 | 见 §11；补上能显著减少「全屏后闪烁」类问题 |
-| `gCs` 死代码、`gCpuStartQpc` 只写不读、`drawSkips_` 只声明不计数 | 未确认是否有意保留 | 清理时注意 `gCs` 的 `DeleteCriticalSection` 也一起去掉 |
-| `gDbgInPresent` | ⚠ **本条已过期**：历史上只声明不赋值（`SEH ctx:` 的 `inPresent=` 恒为 0），但 `PresentCommon` 现在**会**在入口置 1、出口置 0（`// 镜像给崩溃快照`），所以崩溃日志里的 `inPresent=1` 是真信息 —— 2026-10-11 用户那次 D3D12 崩溃就是靠它判定「崩在原始 Present 里」的 | 保留这条是因为它演示了「诊断字段只打确定存在的量」这个原则；但**当前状态是已生效** |
-| `NPConfig::reserved` 只有 **4** 个元素，而 `NPDefaultConfig` 却在 `for (i = 0; i < 8; ++i)` 里写 | `NPConfig::reserved` 的定义 vs `NPDefaultConfig` 里的循环 —— **越界写 16 字节** | 写入的是**主程序进程**里的栈结构，不跨进程；修的时候把循环改成 4，或把 `reserved` 扩到 8（后者会改 `sizeof`，必须同验三个进程的 `version` 自检） |
+| ~~没有 `ResizeBuffers` 钩子~~ | ✅ **已补全**：已挂钩 `ResizeBuffers` / `ResizeBuffers1` 并联动 `OnResizeBuffers()`（前置等待 `Overlay12::fence()` 完成） | `vt_check.py` 已纳入核对 |
+| `BeforeSwapchainResize` / `Overlay11` 状态污染 / DXGI TYPELESS & 裁剪 / D3D12 命令列表重入 | ✅ **已修复**：`BeforeSwapchainResize` 加锁等待围栏最多 200ms；`Overlay11::Draw` 完整保存/还原 IA/VS/PS/RS/OM 状态；`Overlay12::Record` 归一化 `*_TYPELESS` 并裁剪 Scissor；命令列表钩子增加 `gUnloading` 与 `calledOrig` 防二次提交 | 已通过 `sim_stress.py`（DX11/DX12 各 12 次 swapchain 重建，0 崩）与 `verify_ground_truth.py` |
+| 重入与 Vulkan IAT 卸载安全 | ✅ **已修复**：新增 `PatchSafe` 在写入 vtable 前先检查 `PointsIntoOurDll`；`NpVkQueuePresentKHR` 对齐 3s `0.1% Low` / `p99Ms` / `p999Ms` / `gpuFrameMs` / ETW 中继与 `graph*`；`NpVkGetDeviceProcAddr`/`NpVkGetInstanceProcAddr` 分发钩子后置 `gVkProcAddrHandedOut`，卸载时转直通驻留；`InstallVulkan` 限频 5 次×2s；`SELFCHECK unloadClean` 增加 `vkIat=0` 断言 | 避免跨进程二次加载自递归与 Vulkan 悬空指针 |
+| `NpPresent` / `UpdateTelemetryCommon` `0.1% Low` 窗口与 `pauseHook` 门控 | ✅ **已修复**：`0.1% Low` 使用 3 秒窗口（`n3s`）；`cfg.overlayMode == 3` 时跳过游戏内叠加；`pauseHook` 门控 `gStats`、`gReflex`、`NPHistoryPush` 与 GPU 时间戳而保持函数尾状态机收尾；`Overlay11` 初始化或首帧绘制置 `NP_HOOK_OVERLAY` | — |
 | `InModule()` 已无人使用 | 有意保留为教训备忘（函数自身的注释） | **不要「顺手删掉」**，注释说明它就是文档 |
-| `lowWindowed` 是钩子层**主路径**（`np_hook.cpp` 里的 `lowWindowed` 调用），`lowPercentileFps` 只兜底 | 都在 `np_stats.h` | ⚠ 本行曾经写反（"不再被钩子层调用"），已更正 |
-| `gReflexDev` / `nvapi64.dll` 卸载时不释放 | 见 §21.7 | 若释放，必须同时让 Reflex 状态可重置 |
+| `lowPercentileFps` 是钩子层**主路径**（`UpdateTelemetryCommon` 的百分位口径），`lowWindowed` 已退休仅作对照 | 都在 `np_stats.h` | 已与代码口径对齐 |
+| `gReflexDev` / `nvapi64.dll` / `gInfoQueue12` 卸载释放 | ✅ 已在 `SelfUnloadNow()` 释放并复位重试标记 | — |
 | `gVpW/gVpH` 是 32 位标量竞态（注释认可「影响可忽略」） | `gVpW` / `gVpH` | 若要严谨可换成 `std::atomic<uint32_t>` |
 
 ---
@@ -1302,7 +1303,9 @@ FreeLibraryAndExitThread(gSelf, 0)   // 6. 从宿主进程卸载自己并结束�
 | 接口 | 成员 | 下标 | 补丁函数 | 原函数全局 |
 | --- | --- | --- | --- | --- |
 | `IDXGISwapChain` | `Present` | 8 | `NpPresent` | `gSwapVts[i].origPresent` |
+| `IDXGISwapChain` | `ResizeBuffers` | 13 | `NpResizeBuffers` | `gSwapVts[i].origResizeBuffers` |
 | `IDXGISwapChain1` | `Present1` | 22 | `NpPresent1` | `gSwapVts[i].origPresent1` |
+| `IDXGISwapChain3` | `ResizeBuffers1` | 39 | `NpResizeBuffers1` | `gSwapVts[i].origResizeBuffers1` |
 | `IDXGIFactory` | `CreateSwapChain` | 10 | `NpCreateSwapChain` | `gOrigCreateSC` |
 | `IDXGIFactory2` | `CreateSwapChainForHwnd` | 15 | `NpCreateSwapChainHwnd` | `gOrigCreateSCHwnd` |
 | `IDXGIFactory2` | `CreateSwapChainForComposition` | 24 | `NpCreateSwapChainComp` | `gOrigCreateSCComp` |
@@ -1325,8 +1328,8 @@ FreeLibraryAndExitThread(gSelf, 0)   // 6. 从宿主进程卸载自己并结束�
 | --- | --- | --- |
 | `TS_SLOTS` | 64 | 查询堆槽位数（`np_hook.cpp`） |
 | `TS_BATCH_BASE` / `TS_BATCH_PAIRS` | 0 / 16 | 槽 0..31：逐批夹取 —— **当前已不使用**（§12.5） |
-| `TS_RT_BASE` / `TS_RT_PAIRS` | 32 / 8 | 槽 32..47：`DispatchRays` 每对夹一次 |
-| `TS_AI_START` / `TS_AI_END` | 48 / 49 | AI/后处理 compute 区间 |
+| `TS_RT_BASE` / `TS_RT_PAIRS` | 32 / 8 | 槽 32..47：`DispatchRays` 与 `BuildRaytracingAccelerationStructure` 成对夹取（共用 `gRtDispatches`） |
+| `TS_AI_BASE` / `TS_AI_PAIRS` | 48 / 8 | 槽 48..63：`Dispatch` 成对夹取（按 `gAiDispatches` 写入，避免单帧覆盖清零，安全部分 `ResolveQueryData`） |
 | `NP_ALLOC_RING` | 32 | 命令分配器环（`np_hook.cpp`） |
 | `gPending[4]` | 4 | readback 延迟收割槽（`np_hook.cpp`） |
 | `gTs11[3]` | 3 | D3D11 三缓冲轮转（`np_hook.cpp`） |

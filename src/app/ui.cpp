@@ -1,463 +1,1652 @@
-// 主界面：自绘深色 UI（黑白配色、无高亮描边、无 Logo）
-//
-// 布局全部按 DPI 缩放后一次性算好，列表滚动通过 VisibleRect 折算，
-// 不会再出现控件互相压叠的情况。
+// 主界面：Apple / macOS Dark 统一风格性能控制台（紧凑布局 · Direct2D + DirectWrite）
+// 与 Apple Metal Performance HUD 共享同一中性深色层级与系统语义色，结构紧凑零死区。
 
 #include "np_app.h"
 
 #include <commdlg.h>
+#include <d2d1.h>
+#include <dwrite.h>
 #include <shellapi.h>
 #include <windowsx.h>
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <string>
 #include <vector>
 
 #include "common/np_bitmap.h"
 #include "common/np_build.h"
+#include "etw/np_etw.h"
 
 namespace npa {
 
-// ---------------------------------------------------------------- 主题（黑白）
-static const COLORREF kBack = RGB(0x0D, 0x0F, 0x12);
-static const COLORREF kPanel = RGB(0x15, 0x18, 0x1D);
-static const COLORREF kPanel2 = RGB(0x1E, 0x22, 0x28);
-static const COLORREF kBorder = RGB(0x2B, 0x30, 0x37);
-static const COLORREF kText = RGB(0xF2, 0xF4, 0xF6);
-static const COLORREF kDim = RGB(0x8A, 0x91, 0x99);
+namespace {
 
-static const int kWinW = 1000;
-// 730 = 原来的 690 + 38：「自动注入 3D 窗口」那一行是后加的，
-// 当时忘了同步加高窗口，结果把「退出监视」等按钮挤到窗口外面去了（用户实测）。
-// 730 = 692 + 38：为「实验性自动注入」那一行腾出的高度。
-// ⚠ 上次加行忘了同步加高，把按钮挤出了窗口 —— 加行必须同时改这里。
-static const int kWinH = 730;
-// 计数器列表高度。只在这里定义一次 —— 原来 Layout() 和 WM_PAINT 里各写了一遍
-// S(452)，改一处漏一处就会让列表和游戏区对不上。
-// 400 是给「游戏进程」下面两行按钮腾出来的（状态栏固定在 S(658)，不能压）。
-static const int kListH = 400;
+// ---------------------------------------------------------------- 紧凑窗口几何与 Apple Dark 调色板
+constexpr int kWinW = 900;
+constexpr int kWinH = 580;
+constexpr float kHeaderH = 44.0f;
+constexpr float kSideW = 166.0f;
+constexpr float kStatusH = 26.0f;
 
-static float gS = 1.0f;                       // UI 缩放（DPI / 96）
-static int S(int v) { return (int)(v * gS + 0.5f); }
+// Tab 0「注入前台游戏」精确逻辑坐标（同步至 tests/verify_frontinject.py）
+constexpr float kFrontInjectX = 754.0f;
+constexpr float kFrontInjectY = 168.0f;
+constexpr float kFrontInjectW = 116.0f;
+constexpr float kFrontInjectH = 28.0f;
 
-// ---------------------------------------------------------------- 计数器定义（分组）
+constexpr uint32_t kColBg        = 0x141416;   // Window Canvas
+constexpr uint32_t kColSidebar   = 0x19191B;   // Header & Sidebar Chrome
+constexpr uint32_t kColSurface   = 0x1C1C1E;   // Recessed List / Segmented Well
+constexpr uint32_t kColCard      = 0x222225;   // Grouped Settings Card
+constexpr uint32_t kColCardAlt   = 0x2B2B2F;   // Secondary Button / Track
+constexpr uint32_t kColHover     = 0x333338;   // Hover & Active Pill
+constexpr uint32_t kColBorder    = 0x2E2E32;   // 1px Apple Hairline Divider
+constexpr uint32_t kColBorderHi  = 0x44444A;   // Elevated Hairline
+constexpr uint32_t kColText      = 0xF5F5F7;   // Primary Label
+constexpr uint32_t kColMuted     = 0x98989D;   // Secondary Label
+constexpr uint32_t kColDim       = 0x636366;   // Tertiary Label
+constexpr uint32_t kColBlue      = 0x0A84FF;   // Apple System Blue (Primary / Pre)
+constexpr uint32_t kColBlueHi    = 0x2997FF;   // Apple Blue Light (Hover / Curve)
+constexpr uint32_t kColGreen     = 0x30D158;   // Apple System Green (Live / GPU)
+constexpr uint32_t kColOrange    = 0xFF9F0A;   // Apple System Orange (Warn)
+constexpr uint32_t kColRed       = 0xFF453A;   // Apple System Red (Alert / Stop)
+
+inline D2D1_COLOR_F C(uint32_t rgb, float a = 1.0f) {
+    return D2D1::ColorF(((rgb >> 16) & 0xFF) / 255.0f,
+                        ((rgb >> 8) & 0xFF) / 255.0f,
+                        (rgb & 0xFF) / 255.0f, a);
+}
+
+struct RectF {
+    float x = 0, y = 0, w = 0, h = 0;
+    bool contains(float px, float py) const {
+        return px >= x && px < x + w && py >= y && py < y + h;
+    }
+    D2D1_RECT_F d2d() const { return D2D1::RectF(x, y, x + w, y + h); }
+};
+
+// ---------------------------------------------------------------- Direct2D 画布
+class UiCanvas {
+public:
+    bool InitFormats() {
+        if (!npb::Factory() && !npb::GfxInit()) return false;
+        IDWriteFactory* dw = npb::DWrite();
+        if (!dw) return false;
+        if (fmtBrand_) return true;
+
+        auto mk = [&](const wchar_t* const* faces, int fn, float sz, DWRITE_FONT_WEIGHT wt,
+                      IDWriteTextFormat** out, bool trim = true) {
+            for (int i = 0; i < fn; ++i) {
+                IDWriteTextFormat* tf = nullptr;
+                if (SUCCEEDED(dw->CreateTextFormat(faces[i], nullptr, wt,
+                                                   DWRITE_FONT_STYLE_NORMAL,
+                                                   DWRITE_FONT_STRETCH_NORMAL, sz, L"zh-CN", &tf)) &&
+                    tf) {
+                    tf->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+                    tf->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+                    if (trim) {
+                        IDWriteInlineObject* sign = nullptr;
+                        if (SUCCEEDED(dw->CreateEllipsisTrimmingSign(tf, &sign)) && sign) {
+                            DWRITE_TRIMMING tr{};
+                            tr.granularity = DWRITE_TRIMMING_GRANULARITY_CHARACTER;
+                            tf->SetTrimming(&tr, sign);
+                            sign->Release();
+                        }
+                    }
+                    *out = tf;
+                    return true;
+                }
+                if (tf) tf->Release();
+            }
+            return false;
+        };
+
+        static const wchar_t* kUiFaces[] = {L"Segoe UI Variable Text", L"Microsoft YaHei UI",
+                                            L"Microsoft YaHei"};
+        static const wchar_t* kMonoFaces[] = {L"Cascadia Mono", L"Consolas", L"Courier New"};
+
+        bool ok = mk(kUiFaces, 3, 14.5f, DWRITE_FONT_WEIGHT_SEMI_BOLD, &fmtBrand_) &&
+                  mk(kUiFaces, 3, 13.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD, &fmtTitle_) &&
+                  mk(kUiFaces, 3, 12.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD, &fmtHead_) &&
+                  mk(kUiFaces, 3, 11.5f, DWRITE_FONT_WEIGHT_NORMAL, &fmtBody_) &&
+                  mk(kUiFaces, 3, 11.0f, DWRITE_FONT_WEIGHT_NORMAL, &fmtSmall_) &&
+                  mk(kUiFaces, 3, 10.0f, DWRITE_FONT_WEIGHT_NORMAL, &fmtMicro_) &&
+                  mk(kMonoFaces, 3, 20.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD, &fmtMonoBig_) &&
+                  mk(kMonoFaces, 3, 11.5f, DWRITE_FONT_WEIGHT_NORMAL, &fmtMono_) &&
+                  mk(kMonoFaces, 3, 10.0f, DWRITE_FONT_WEIGHT_NORMAL, &fmtMonoSm_);
+        if (!ok) ReleaseFormats();
+        return ok;
+    }
+
+    void ReleaseFormats() {
+        auto rel = [](auto*& p) {
+            if (p) { p->Release(); p = nullptr; }
+        };
+        rel(fmtBrand_);
+        rel(fmtTitle_);
+        rel(fmtHead_);
+        rel(fmtBody_);
+        rel(fmtSmall_);
+        rel(fmtMicro_);
+        rel(fmtMonoBig_);
+        rel(fmtMono_);
+        rel(fmtMonoSm_);
+    }
+
+    void ReleaseTarget() {
+        if (br_) { br_->Release(); br_ = nullptr; }
+        if (rt_) { rt_->Release(); rt_ = nullptr; }
+        if (hdc_) {
+            if (old_) SelectObject(hdc_, old_);
+            DeleteDC(hdc_);
+            hdc_ = nullptr;
+            old_ = nullptr;
+        }
+        if (dib_) { DeleteObject(dib_); dib_ = nullptr; }
+        w_ = h_ = 0;
+    }
+
+    void Shutdown() {
+        ReleaseTarget();
+        ReleaseFormats();
+    }
+
+    bool Ensure(int pxW, int pxH) {
+        if (pxW <= 0 || pxH <= 0) return false;
+        if (!InitFormats()) return false;
+        if (rt_ && br_ && hdc_ && w_ == pxW && h_ == pxH) return true;
+
+        ReleaseTarget();
+
+        BITMAPINFO bi{};
+        bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        bi.bmiHeader.biWidth = pxW;
+        bi.bmiHeader.biHeight = -pxH;
+        bi.bmiHeader.biPlanes = 1;
+        bi.bmiHeader.biBitCount = 32;
+        bi.bmiHeader.biCompression = BI_RGB;
+
+        HDC scr = GetDC(nullptr);
+        hdc_ = CreateCompatibleDC(scr);
+        void* bits = nullptr;
+        dib_ = CreateDIBSection(scr, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+        if (scr) ReleaseDC(nullptr, scr);
+        if (!hdc_ || !dib_) {
+            ReleaseTarget();
+            return false;
+        }
+        old_ = SelectObject(hdc_, dib_);
+
+        auto props = D2D1::RenderTargetProperties(
+            D2D1_RENDER_TARGET_TYPE_DEFAULT,
+            D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE),
+            96.0f, 96.0f);
+        if (FAILED(npb::Factory()->CreateDCRenderTarget(&props, &rt_)) || !rt_) {
+            ReleaseTarget();
+            return false;
+        }
+        RECT rc{0, 0, pxW, pxH};
+        if (FAILED(rt_->BindDC(hdc_, &rc))) {
+            ReleaseTarget();
+            return false;
+        }
+        rt_->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+        if (FAILED(rt_->CreateSolidColorBrush(C(kColText), &br_)) || !br_) {
+            ReleaseTarget();
+            return false;
+        }
+        w_ = pxW;
+        h_ = pxH;
+        return true;
+    }
+
+    ID2D1DCRenderTarget* rt() const { return rt_; }
+    ID2D1SolidColorBrush* br(uint32_t rgb, float a = 1.0f) {
+        br_->SetColor(C(rgb, a));
+        return br_;
+    }
+
+    void FillR(float x, float y, float w, float h, uint32_t rgb, float a = 1.0f) {
+        if (w <= 0 || h <= 0) return;
+        rt_->FillRectangle(D2D1::RectF(x, y, x + w, y + h), br(rgb, a));
+    }
+
+    void FillRR(float x, float y, float w, float h, float r, uint32_t rgb, float a = 1.0f) {
+        if (w <= 0 || h <= 0) return;
+        rt_->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(x, y, x + w, y + h), r, r),
+                                  br(rgb, a));
+    }
+
+    void DrawRR(float x, float y, float w, float h, float r, uint32_t rgb, float a = 1.0f,
+                float stroke = 1.0f) {
+        if (w <= 0 || h <= 0) return;
+        rt_->DrawRoundedRectangle(
+            D2D1::RoundedRect(D2D1::RectF(x + 0.5f, y + 0.5f, x + w - 0.5f, y + h - 0.5f), r, r),
+            br(rgb, a), stroke);
+    }
+
+    void Card(float x, float y, float w, float h, float r = 9.0f,
+              uint32_t fill = kColCard, uint32_t border = kColBorder) {
+        FillRR(x, y, w, h, r, fill);
+        DrawRR(x, y, w, h, r, border, 1.0f, 1.0f);
+    }
+
+    void Text(IDWriteTextFormat* f, const std::wstring& s, float x, float y, float w, float h,
+              uint32_t rgb, DWRITE_TEXT_ALIGNMENT align = DWRITE_TEXT_ALIGNMENT_LEADING,
+              float a = 1.0f) {
+        if (!f || w <= 0 || h <= 0 || s.empty()) return;
+        f->SetTextAlignment(align);
+        rt_->DrawText(s.c_str(), (UINT32)s.size(), f, D2D1::RectF(x, y, x + w, y + h), br(rgb, a),
+                      D2D1_DRAW_TEXT_OPTIONS_CLIP);
+    }
+
+    HDC hdc() const { return hdc_; }
+
+    IDWriteTextFormat* fmtBrand_   = nullptr;
+    IDWriteTextFormat* fmtTitle_   = nullptr;
+    IDWriteTextFormat* fmtHead_    = nullptr;
+    IDWriteTextFormat* fmtBody_    = nullptr;
+    IDWriteTextFormat* fmtSmall_   = nullptr;
+    IDWriteTextFormat* fmtMicro_   = nullptr;
+    IDWriteTextFormat* fmtMonoBig_ = nullptr;
+    IDWriteTextFormat* fmtMono_    = nullptr;
+    IDWriteTextFormat* fmtMonoSm_  = nullptr;
+
+private:
+    HDC                  hdc_ = nullptr;
+    HBITMAP              dib_ = nullptr;
+    HGDIOBJ              old_ = nullptr;
+    int                  w_ = 0, h_ = 0;
+    ID2D1DCRenderTarget* rt_ = nullptr;
+    ID2D1SolidColorBrush* br_ = nullptr;
+};
+
+// ---------------------------------------------------------------- 计数器定义（37 位全覆盖）
 struct CounterDef {
-    uint64_t bit;
+    uint64_t       bit;
     const wchar_t* name;
+    const wchar_t* tag;
 };
 struct CounterGroup {
-    const wchar_t* name;
+    const wchar_t*    name;
     const CounterDef* items;
-    int n;
+    int               n;
 };
 
 static const CounterDef kGFramerate[] = {
-    {NP_C_FPS, L"FPS"},
-    {NP_C_FRAMETIME, L"帧生成时间"},
-    {NP_C_LOW1, L"1% Low"},
-    {NP_C_LOW01, L"0.1% Low"},
+    {NP_C_FPS,       L"实时帧率 FPS",          L"核心"},
+    {NP_C_FRAMETIME, L"帧生成间隔 Pre",        L"核心"},
+    {NP_C_LOW1,      L"1% Low 帧率",           L"扩展"},
+    {NP_C_LOW01,     L"0.1% Low 帧率",         L"扩展"},
 };
 static const CounterDef kGCpu[] = {
-    {NP_C_CPU_USAGE, L"CPU 占用率"},
-    {NP_C_CPU_TEMP, L"CPU 温度"},
-    {NP_C_CPU_CLOCK, L"CPU 频率"},
-    {NP_C_CPU_POWER, L"CPU 功耗"},
-    {NP_C_CPU_FRAME, L"CPU 帧时间"},
-    {NP_C_CPU_BUSY, L"CPU Busy（高级）"},
-    {NP_C_CPU_WAIT, L"CPU Wait（高级）"},
+    {NP_C_CPU_USAGE, L"CPU 总占用率",          L"%"},
+    {NP_C_CPU_TEMP,  L"CPU 封装温度",          L"°C"},
+    {NP_C_CPU_CLOCK, L"CPU 核心有效频率",      L"MHz"},
+    {NP_C_CPU_POWER, L"CPU 封装功耗",          L"W"},
+    {NP_C_CPU_FRAME, L"CPU 帧耗时",            L"ms"},
+    {NP_C_CPU_BUSY,  L"CPU Busy 活跃阶段",     L"高级"},
+    {NP_C_CPU_WAIT,  L"CPU Wait 阻塞等待",     L"高级"},
 };
 static const CounterDef kGGpu[] = {
-    {NP_C_GPU_NAME, L"显卡型号"},
-    {NP_C_GPU_USAGE, L"GPU 占用率"},
-    {NP_C_GPU_TEMP, L"GPU 温度"},
-    {NP_C_GPU_HOTSPOT, L"GPU 热点 / 显存结温"},
-    {NP_C_GPU_POWER, L"GPU 功耗"},
-    {NP_C_GPU_CLOCK, L"核心 / 显存频率"},
-    {NP_C_FAN, L"风扇转速"},
-    {NP_C_GPU_FRAME, L"GPU 帧时间"    },
-    {NP_C_VRAM, L"显存占用"},
-    {NP_C_GPU_FB, L"显存带宽占用"},
-    {NP_C_GPU_VID, L"视频引擎占用"},
-    {NP_C_GPU_BUS, L"PCIe 总线占用"},
-    {NP_C_RT, L"RT Core 负载"},
-    {NP_C_TENSOR, L"Tensor / AI 负载"},
-    {NP_C_AI_MODULES, L"AI 模块识别"},
-    {NP_C_RESOLUTION, L"渲染 / 输出分辨率"},
+    {NP_C_GPU_NAME,    L"顶部显卡型号与代号",   L"顶栏"},
+    {NP_C_GPU_USAGE,   L"GPU 核心占用率",       L"%"},
+    {NP_C_GPU_TEMP,    L"GPU 核心温度",         L"°C"},
+    {NP_C_GPU_HOTSPOT, L"GPU 热点 / 显存结温",  L"°C"},
+    {NP_C_GPU_POWER,   L"GPU 整卡功耗",         L"W"},
+    {NP_C_GPU_CLOCK,   L"核心 / 显存频率",      L"MHz"},
+    {NP_C_FAN,         L"显卡风扇转速",         L"RPM"},
+    {NP_C_GPU_FRAME,   L"GPU 执行耗时",         L"核心"},
+    {NP_C_VRAM,        L"显存已用 [VRAM]",      L"核心"},
+    {NP_C_GPU_FB,      L"显存控制器带宽",       L"%"},
+    {NP_C_GPU_VID,     L"视频编解码引擎",       L"%"},
+    {NP_C_GPU_BUS,     L"PCIe 总线占用",        L"%"},
+    {NP_C_RT,          L"RT Core 光追负载",     L"DXR"},
+    {NP_C_TENSOR,      L"Tensor / AI 负载",     L"AI"},
+    {NP_C_AI_MODULES,  L"AI 超分 / 帧生成识别", L"模块"},
+    {NP_C_RESOLUTION,  L"顶部渲染分辨率 [WxH]", L"顶栏"},
 };
 static const CounterDef kGSystem[] = {
-    {NP_C_RAM, L"内存占用"},
-    {NP_C_API, L"图形 API 与模式"},
-    {NP_C_DRAWS, L"Draw / Dispatch"},
-    {NP_C_SENSOR_SRC, L"传感器数据源"},
+    {NP_C_RAM,        L"系统内存 Mem",         L"核心"},
+    {NP_C_API,        L"图形 API 标识",        L"扩展"},
+    {NP_C_DRAWS,      L"Draw / Dispatch 计数", L"D3D12"},
+    {NP_C_SENSOR_SRC, L"当前活跃传感器源",     L"诊断"},
+    {NP_C_BOTTLENECK, L"实时性能瓶颈诊断",     L"分析"},
+    {NP_C_CLOCK_TIME, L"系统实时时钟",         L"时钟"},
 };
 static const CounterDef kGChart[] = {
-    {NP_C_GRAPH, L"FPS / 帧时间小图"},
-    {NP_C_CHART_FPS, L"Low 帧小图（1% / 0.1%）"},
-    {NP_C_CHART_LATENCY, L"帧延迟小图（CPU / GPU）"},
+    {NP_C_GRAPH,         L"Metal 双通道示波器", L"主图"},
+    {NP_C_CHART_USAGE,   L"扩展 CPU/GPU 小图",  L"附加"},
+    {NP_C_CHART_FPS,     L"扩展 Low 帧率小图",  L"附加"},
+    {NP_C_CHART_LATENCY, L"扩展延迟拆分小图",   L"附加"},
 };
+
 static const CounterGroup kGroups[] = {
-    {L"帧率与延迟", kGFramerate, (int)(sizeof(kGFramerate) / sizeof(kGFramerate[0]))},
-    {L"CPU", kGCpu, (int)(sizeof(kGCpu) / sizeof(kGCpu[0]))},
-    {L"GPU", kGGpu, (int)(sizeof(kGGpu) / sizeof(kGGpu[0]))},
-    {L"系统", kGSystem, (int)(sizeof(kGSystem) / sizeof(kGSystem[0]))},
-    {L"实时图表", kGChart, (int)(sizeof(kGChart) / sizeof(kGChart[0]))},
+    {L"帧率与核心",     kGFramerate, (int)(sizeof(kGFramerate) / sizeof(kGFramerate[0]))},
+    {L"CPU 处理器",     kGCpu,       (int)(sizeof(kGCpu) / sizeof(kGCpu[0]))},
+    {L"GPU 图形与硬件", kGGpu,       (int)(sizeof(kGGpu) / sizeof(kGGpu[0]))},
+    {L"系统与引擎诊断", kGSystem,    (int)(sizeof(kGSystem) / sizeof(kGSystem[0]))},
+    {L"波形图表开关",   kGChart,     (int)(sizeof(kGChart) / sizeof(kGChart[0]))},
 };
-static const int kGroupN = (int)(sizeof(kGroups) / sizeof(kGroups[0]));
-static int gTotalRows = 0;   // 计数器列表总行数（含组标题）
+constexpr int kGroupN = (int)(sizeof(kGroups) / sizeof(kGroups[0]));
+bool gGrpOpen[kGroupN] = {true, true, true, true, true};
 
-// ---------------------------------------------------------------- 控件
-enum WType { W_CHECK, W_GROUP, W_BUTTON, W_SLIDER_F, W_SLIDER_I, W_CYCLE, W_GAMEROW };
-enum Act {
-    A_NONE = 0, A_START, A_STOP, A_SAVE, A_DEFAULT, A_ADDGAME, A_REMGAME, A_INJECTFRONT,
-    A_FORGET,      // v1.6：清空「学习来的」可信名单
-    A_ELEVATE, A_LOGDIR, A_QUIT
+// ---------------------------------------------------------------- 命中模型与动作
+enum HitKind {
+    H_NONE = 0,
+    H_NAV_TAB,
+    H_ACTION,
+    H_GAME_ROW,
+    H_GAME_INJ,
+    H_GAME_REM,
+    H_PRESET,
+    H_GROUP_HDR,
+    H_COUNTER,
+    H_LAYOUT_MODE,
+    H_THEME,
+    H_CORNER,
+    H_OPT_BIT,
+    H_SLIDER,
+    H_SYS_CYCLE,
+    H_SYS_TOGGLE,
 };
 
-struct Widget {
-    WType type;
-    int x = 0, y = 0, w = 0, h = 0;
-    std::wstring text;
+enum ActionId {
+    ACT_NONE = 0,
+    ACT_TOGGLE_MON,
+    ACT_TOGGLE_OV,
+    ACT_BENCH,
+    ACT_SAVE,
+    ACT_MINIMIZE,
+    ACT_CLOSE,
+    ACT_FORGET_LEARNED,
+    ACT_ADD_GAME,
+    ACT_SCAN_GAMES,
+    ACT_INJECT_FRONT,
+    ACT_COPY_DIAG,
+    ACT_RESET_HIST,
+    ACT_OPEN_LOGDIR,
+    ACT_OPEN_CSVDIR,
+    ACT_ELEVATE,
+    ACT_QUIT,
+};
+
+struct HitItem {
+    HitKind  kind = H_NONE;
+    RectF    rc{};
+    int      arg = 0;
     uint64_t bit = 0;
-    float* pFloat = nullptr;
-    float fmin = 0, fmax = 1;
-    int* pInt = nullptr;
-    int imin = 0, imax = 100;
-    int* pCycle = nullptr;
-    std::vector<std::wstring> opts;
-    std::vector<int> vals;
-    int action = A_NONE;
-    int index = -1;
-    bool hover = false;
+    int      sliderIdx = -1;
 };
 
-static std::vector<Widget> gW;
-static HWND gMain = nullptr;
-static HINSTANCE gInst = nullptr;
-static int gSelGame = -1;
-static int gDragging = -1;
+struct SliderSpec {
+    const wchar_t* label;
+    bool           isFloat;
+    float          fmin, fmax;
+    int            imin, imax;
+};
 
-// 计数器列表滚动
-static int gScroll = 0;
-static int gListTop = 0;
-static int gRowH = 0;
-static int gVisibleRows = 18;
+static const SliderSpec kSliders[7] = {
+    {L"面板缩放",   true,  0.60f, 2.00f, 0, 0},
+    {L"字体大小",   false, 0, 0, 10, 26},
+    {L"波形高度",   false, 0, 0, 30, 120},
+    {L"背景不透明", true,  0.00f, 1.00f, 0, 0},
+    {L"文字不透明", true,  0.20f, 1.00f, 0, 0},
+    {L"水平边距",   false, 0, 0, 0, 400},
+    {L"垂直边距",   false, 0, 0, 0, 400},
+};
 
-static npb::PanelBitmap gPrevBmp;
-static np::PanelRenderer gPrevPanel;
-static np::PanelData gPrevData;
-static bool gPrevOk = false;
+struct CounterVisualRow {
+    bool              isGroup = false;
+    int               groupIdx = 0;
+    const CounterDef* cols[2] = {nullptr, nullptr};
+};
 
-static HFONT gFontTitle = nullptr, gFontHead = nullptr, gFontBody = nullptr, gFontSmall = nullptr;
+// 全局 UI 状态
+static HWND               gMain = nullptr;
+static HINSTANCE          gInst = nullptr;
+static float              gS = 1.0f;
+static UiCanvas           gCanvas;
+static np::PanelRenderer  gPreviewPanel;
+static int                gActiveTab = 0;
+static int                gGameScroll = 0;
+static int                gSelGame = -1;
+static int                gCounterScroll = 0;
+static int                gCounterTotalRows = 0;
+static int                gHoverIdx = -1;
+static int                gDraggingSlider = -1;
+static RectF              gSliderTrack[7]{};
+static bool               gTrackingLeave = false;
+static std::vector<HitItem> gHits;
+static std::vector<CounterVisualRow> gCounterRows;
 
-static void ReleaseFonts() {
-    if (gFontTitle) { DeleteObject(gFontTitle); gFontTitle = nullptr; }
-    if (gFontHead) { DeleteObject(gFontHead); gFontHead = nullptr; }
-    if (gFontBody) { DeleteObject(gFontBody); gFontBody = nullptr; }
-    if (gFontSmall) { DeleteObject(gFontSmall); gFontSmall = nullptr; }
+static float CurrentClientScale(HWND h) {
+    RECT cr{};
+    if (h && GetClientRect(h, &cr) && cr.right > 0)
+        return (float)cr.right / (float)kWinW;
+    return gS > 0.0f ? gS : 1.0f;
 }
 
-static void MakeFonts() {
-    ReleaseFonts();
-    // 灰阶抗锯齿：深底上不会出现 ClearType 的彩色边缘
-    auto mk = [&](int px, int weight) {
-        return CreateFontW(-px, 0, 0, 0, weight, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
-                           OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
-                           DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei UI");
-    };
-    gFontTitle = mk(S(19), FW_SEMIBOLD);
-    gFontHead = mk(S(14), FW_SEMIBOLD);
-    gFontBody = mk(S(13), FW_NORMAL);
-    gFontSmall = mk(S(11), FW_NORMAL);
+static int S(int v) { return (int)(v * gS + 0.5f); }
+
+static void ApplyDarkFrame(HWND h) {
+    HMODULE dwm = LoadLibraryW(L"dwmapi.dll");
+    if (!dwm) return;
+    using PFnAttr = HRESULT(WINAPI*)(HWND, DWORD, const void*, DWORD);
+    using PFnExtend = HRESULT(WINAPI*)(HWND, const void*);
+    auto setAttr = reinterpret_cast<PFnAttr>(GetProcAddress(dwm, "DwmSetWindowAttribute"));
+    auto extend = reinterpret_cast<PFnExtend>(GetProcAddress(dwm, "DwmExtendFrameIntoClientArea"));
+    if (setAttr) {
+        BOOL dark = TRUE;
+        setAttr(h, 20, &dark, sizeof(dark));       // DWMWA_USE_IMMERSIVE_DARK_MODE
+        DWORD corner = 2;                          // DWMWCP_ROUND
+        setAttr(h, 33, &corner, sizeof(corner));   // DWMWA_WINDOW_CORNER_PREFERENCE
+        COLORREF border = RGB(0x2E, 0x2E, 0x32);
+        setAttr(h, 34, &border, sizeof(border));   // DWMWA_BORDER_COLOR
+        COLORREF cap = RGB(0x14, 0x14, 0x16);
+        setAttr(h, 35, &cap, sizeof(cap));         // DWMWA_CAPTION_COLOR
+    }
+    if (extend) {
+        struct {
+            int left, right, top, bottom;
+        } m{0, 0, 1, 0};
+        extend(h, &m);
+    }
+    FreeLibrary(dwm);
 }
 
-// ---------------------------------------------------------------- 绘制助手
-static void FillR(HDC hdc, int x, int y, int w, int h, COLORREF c, int r) {
-    HBRUSH b = CreateSolidBrush(c);
-    HGDIOBJ old = SelectObject(hdc, b);
-    HPEN pen = CreatePen(PS_SOLID, 1, c);
-    HGDIOBJ oldPen = SelectObject(hdc, pen);
-    RoundRect(hdc, x, y, x + w, y + h, r, r);
-    SelectObject(hdc, oldPen);
-    DeleteObject(pen);
-    SelectObject(hdc, old);
-    DeleteObject(b);
-}
-static void StrokeR(HDC hdc, int x, int y, int w, int h, COLORREF c, int r) {
-    HBRUSH b = reinterpret_cast<HBRUSH>(GetStockObject(NULL_BRUSH));
-    HGDIOBJ old = SelectObject(hdc, b);
-    HPEN pen = CreatePen(PS_SOLID, 1, c);
-    HGDIOBJ oldPen = SelectObject(hdc, pen);
-    RoundRect(hdc, x, y, x + w, y + h, r, r);
-    SelectObject(hdc, oldPen);
-    DeleteObject(pen);
-    SelectObject(hdc, old);
-}
-static void Txt(HDC hdc, HFONT f, const wchar_t* s, int x, int y, int w, int h, COLORREF c,
-                UINT fmt = DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS) {
-    HFONT old = reinterpret_cast<HFONT>(SelectObject(hdc, f));
-    SetBkMode(hdc, TRANSPARENT);
-    SetTextColor(hdc, c);
-    RECT rc{x, y, x + w, y + h};
-    DrawTextW(hdc, s, -1, &rc, fmt);
-    SelectObject(hdc, old);
+static void RebuildCounterRows() {
+    gCounterRows.clear();
+    for (int gi = 0; gi < kGroupN; ++gi) {
+        CounterVisualRow hdr{};
+        hdr.isGroup = true;
+        hdr.groupIdx = gi;
+        gCounterRows.push_back(hdr);
+        if (!gGrpOpen[gi]) continue;
+        for (int i = 0; i < kGroups[gi].n; i += 2) {
+            CounterVisualRow row{};
+            row.isGroup = false;
+            row.groupIdx = gi;
+            row.cols[0] = &kGroups[gi].items[i];
+            if (i + 1 < kGroups[gi].n) row.cols[1] = &kGroups[gi].items[i + 1];
+            gCounterRows.push_back(row);
+        }
+    }
+    gCounterTotalRows = (int)gCounterRows.size();
+    constexpr int kVisRows = 11;
+    int maxSc = std::max(0, gCounterTotalRows - kVisRows);
+    gCounterScroll = std::clamp(gCounterScroll, 0, maxSc);
 }
 
-// ---------------------------------------------------------------- 布局
-static void Add(int type, int x, int y, int w, int h, const wchar_t* text) {
-    Widget wd;
-    wd.type = (WType)type;
-    wd.x = x; wd.y = y; wd.w = w; wd.h = h;
-    wd.text = text;
+static int CountEnabledCounters() {
+    uint64_t c = gApp.cfg.counters & NP_PRESET_FULL;
+    int n = 0;
+    while (c) {
+        c &= (c - 1);
+        ++n;
+    }
+    return n;
+}
 
-    // ★ 重叠检测：两个可交互控件画在同一个位置时，点击只会命中最先注册的那个，
-    //   表现就是「某个开关点了没反应」—— 用户实测撞过一次
-    //   （「自动注入 3D 窗口」被放在「传感器轮询」的同一个矩形上）。
-    //   这里主动查出来并记日志，别让它再靠用户发现。
-    for (const auto& o : gW) {
-        // 只对**同类型**控件报警：游戏列表行里，行容器与它内部的按钮天然是包含关系
-        // （父子的 y 相差十几像素、高度还不同），那不是 bug。真正会吃掉点击的是
-        // 「两个同类型的开关叠在同一块矩形上」—— 用户实测撞到的就是这个。
-        if (o.type != wd.type) continue;
-        const int ix = (x > o.x) ? x : o.x;
-        const int iy = (y > o.y) ? y : o.y;
-        const int ax = (x + w < o.x + o.w) ? x + w : o.x + o.w;
-        const int ay = (y + h < o.y + o.h) ? y + h : o.y + o.h;
-        if (ax > ix && ay > iy) {
-            AppLog("UI 重叠警告：新控件「%ls」(%d,%d %dx%d) 与已有控件 (%d,%d %dx%d) 相交 "
-                   "-> 点击会被先注册的那个吃掉",
-                   text ? text : L"(无文字)", x, y, w, h, o.x, o.y, o.w, o.h);
+static void UpdateSliderValue(int idx, float mx) {
+    if (idx < 0 || idx >= 7) return;
+    const RectF& tr = gSliderTrack[idx];
+    if (tr.w <= 1.0f) return;
+    float t = std::clamp((mx - tr.x) / tr.w, 0.0f, 1.0f);
+    const SliderSpec& sp = kSliders[idx];
+    NPConfig& c = gApp.cfg;
+    switch (idx) {
+        case 0: c.scale = sp.fmin + (sp.fmax - sp.fmin) * t; break;
+        case 1: c.fontHeight = (uint32_t)(sp.imin + (int)((sp.imax - sp.imin) * t + 0.5f)); break;
+        case 2: c.graphHeight = (uint32_t)(sp.imin + (int)((sp.imax - sp.imin) * t + 0.5f)); break;
+        case 3: c.bgOpacity = sp.fmin + (sp.fmax - sp.fmin) * t; break;
+        case 4: c.textOpacity = sp.fmin + (sp.fmax - sp.fmin) * t; break;
+        case 5: c.offsetX = sp.imin + (int)((sp.imax - sp.imin) * t + 0.5f); break;
+        case 6: c.offsetY = sp.imin + (int)((sp.imax - sp.imin) * t + 0.5f); break;
+        default: break;
+    }
+    AppPublish();
+}
+
+static float GetSliderRatio(int idx, std::wstring* valOut) {
+    const SliderSpec& sp = kSliders[idx];
+    const NPConfig& c = gApp.cfg;
+    wchar_t buf[32]{};
+    float ratio = 0.0f;
+    switch (idx) {
+        case 0:
+            ratio = (c.scale - sp.fmin) / (sp.fmax - sp.fmin);
+            swprintf(buf, 32, L"%.2fx", (double)c.scale);
+            break;
+        case 1:
+            ratio = (float)((int)c.fontHeight - sp.imin) / (float)(sp.imax - sp.imin);
+            swprintf(buf, 32, L"%upx", c.fontHeight);
+            break;
+        case 2:
+            ratio = (float)((int)c.graphHeight - sp.imin) / (float)(sp.imax - sp.imin);
+            swprintf(buf, 32, L"%upx", c.graphHeight);
+            break;
+        case 3:
+            ratio = (c.bgOpacity - sp.fmin) / (sp.fmax - sp.fmin);
+            swprintf(buf, 32, L"%.0f%%", (double)c.bgOpacity * 100.0);
+            break;
+        case 4:
+            ratio = (c.textOpacity - sp.fmin) / (sp.fmax - sp.fmin);
+            swprintf(buf, 32, L"%.0f%%", (double)c.textOpacity * 100.0);
+            break;
+        case 5:
+            ratio = (float)(c.offsetX - sp.imin) / (float)(sp.imax - sp.imin);
+            swprintf(buf, 32, L"%dpx", c.offsetX);
+            break;
+        case 6:
+            ratio = (float)(c.offsetY - sp.imin) / (float)(sp.imax - sp.imin);
+            swprintf(buf, 32, L"%dpx", c.offsetY);
+            break;
+        default: break;
+    }
+    if (valOut) *valOut = buf;
+    return std::clamp(ratio, 0.0f, 1.0f);
+}
+
+static std::wstring ShortExeName(const GameEntry& g) {
+    const std::wstring& src = g.path.empty() ? g.name : g.path;
+    size_t sl = src.find_last_of(L"\\/");
+    return (sl == std::wstring::npos) ? src : src.substr(sl + 1);
+}
+
+static std::wstring TrimGpuName(const char* raw) {
+    if (!raw || !raw[0]) return L"未检测到 GPU";
+    std::string s(raw);
+    const char* prefixes[] = {"NVIDIA GeForce ", "NVIDIA ", "AMD Radeon(TM) ", "AMD Radeon ",
+                              "Intel(R) Arc(TM) ", "Intel(R) ", "Intel "};
+    for (const char* p : prefixes) {
+        size_t len = strlen(p);
+        if (s.compare(0, len, p) == 0) {
+            s.erase(0, len);
             break;
         }
     }
-    gW.push_back(wd);
+    if (s.size() > 16) {
+        const char* suf = " GPU";
+        size_t sl = strlen(suf);
+        if (s.size() > sl && s.compare(s.size() - sl, sl, suf) == 0) s.erase(s.size() - sl);
+    }
+    return np::Utf8ToWide(s);
 }
 
-static void Layout() {
-    gW.clear();
+// ---------------------------------------------------------------- macOS 原生风格组件绘制
+static void DrawAppleSwitch(UiCanvas& cv, float sx, float sy, bool on, bool hovered) {
+    float sw = 32.0f, sh = 18.0f;
+    uint32_t track = on ? (hovered ? kColBlueHi : kColBlue) : (hovered ? 0x45454Bu : 0x38383Du);
+    cv.FillRR(sx, sy, sw, sh, 9.0f, track);
+    if (!on) cv.DrawRR(sx, sy, sw, sh, 9.0f, kColBorderHi, 0.6f);
+    float kx = on ? (sx + 23.0f) : (sx + 9.0f);
+    cv.rt()->FillEllipse(D2D1::Ellipse(D2D1::Point2F(kx, sy + 9.0f), 6.2f, 6.2f),
+                         cv.br(0xFFFFFFu));
+}
 
-    const int LX = S(20), LW = S(460);
-    const int RX = S(500), RW = S(480);
+static void DrawQuietBtn(UiCanvas& cv, const HitItem& item, const std::wstring& txt,
+                         bool hovered, bool primary = false, uint32_t fgOverride = 0) {
+    if (primary) {
+        cv.FillRR(item.rc.x, item.rc.y, item.rc.w, item.rc.h, 7.0f,
+                  hovered ? kColBlueHi : kColBlue);
+        cv.Text(cv.fmtSmall_, txt, item.rc.x + 6.0f, item.rc.y, item.rc.w - 12.0f, item.rc.h,
+                0xFFFFFFu, DWRITE_TEXT_ALIGNMENT_CENTER);
+        return;
+    }
+    uint32_t bg = hovered ? kColHover : kColCardAlt;
+    uint32_t fg = fgOverride ? fgOverride : kColText;
+    cv.FillRR(item.rc.x, item.rc.y, item.rc.w, item.rc.h, 7.0f, bg);
+    cv.DrawRR(item.rc.x, item.rc.y, item.rc.w, item.rc.h, 7.0f,
+              hovered ? kColBorderHi : kColBorder);
+    cv.Text(cv.fmtSmall_, txt, item.rc.x + 6.0f, item.rc.y, item.rc.w - 12.0f, item.rc.h, fg,
+            DWRITE_TEXT_ALIGNMENT_CENTER);
+}
 
-    // ---------- 左：计数器（分组、可滚动） ----------
-    gListTop = S(42);
-    gRowH = S(24);
-    const int listH = S(kListH);
-    gVisibleRows = std::max(1, listH / gRowH);
-    int rowOrd = 0;
-    for (int g = 0; g < kGroupN; ++g) {
-        Widget hd;
-        hd.type = W_GROUP;
-        hd.x = LX;
-        hd.y = gListTop + rowOrd * gRowH;   // 逻辑坐标，绘制时经 VisibleRect 折算
-        hd.w = LW;
-        hd.h = gRowH;
-        hd.text = kGroups[g].name;
-        hd.index = rowOrd++;
-        gW.push_back(hd);
-        for (int i = 0; i < kGroups[g].n; ++i) {
-            Widget wd;
-            wd.type = W_CHECK;
-            wd.x = LX;
-            wd.y = gListTop + rowOrd * gRowH;
-            wd.w = LW;
-            wd.h = gRowH;
-            wd.bit = kGroups[g].items[i].bit;
-            wd.text = kGroups[g].items[i].name;
-            wd.index = rowOrd++;
-            gW.push_back(wd);
+static void DrawNavIcon(UiCanvas& cv, int tab, float x, float y, uint32_t col) {
+    auto* br = cv.br(col);
+    switch (tab) {
+        case 0:
+            cv.DrawRR(x, y + 1.0f, 13.0f, 11.0f, 2.5f, col, 0.9f, 1.3f);
+            cv.rt()->DrawLine(D2D1::Point2F(x + 2.0f, y + 8.0f), D2D1::Point2F(x + 5.0f, y + 4.5f), br, 1.3f);
+            cv.rt()->DrawLine(D2D1::Point2F(x + 5.0f, y + 4.5f), D2D1::Point2F(x + 8.0f, y + 8.5f), br, 1.3f);
+            cv.rt()->DrawLine(D2D1::Point2F(x + 8.0f, y + 8.5f), D2D1::Point2F(x + 11.0f, y + 4.0f), br, 1.3f);
+            break;
+        case 1:
+            cv.DrawRR(x, y + 1.5f, 13.0f, 10.0f, 2.5f, col, 0.9f, 1.3f);
+            cv.FillRR(x + 6.0f, y + 3.5f, 5.0f, 4.5f, 1.2f, col, 0.85f);
+            break;
+        case 2:
+            for (int i = 0; i < 3; ++i) {
+                float ly = y + 2.5f + i * 4.0f;
+                cv.rt()->FillEllipse(D2D1::Ellipse(D2D1::Point2F(x + 1.5f, ly), 1.3f, 1.3f), br);
+                cv.rt()->DrawLine(D2D1::Point2F(x + 4.5f, ly), D2D1::Point2F(x + 12.5f, ly), br, 1.3f);
+            }
+            break;
+        default:
+            for (int i = 0; i < 3; ++i) {
+                float ly = y + 2.5f + i * 4.0f;
+                float kx = (i == 1) ? (x + 8.5f) : (x + 4.0f);
+                cv.rt()->DrawLine(D2D1::Point2F(x + 0.5f, ly), D2D1::Point2F(x + 12.5f, ly), br, 1.2f);
+                cv.rt()->FillEllipse(D2D1::Ellipse(D2D1::Point2F(kx, ly), 2.0f, 2.0f), br);
+            }
+            break;
+    }
+}
+
+static void DrawHeaderAndSidebar(UiCanvas& cv, const std::vector<GameEntry>& gamesSnap) {
+    cv.FillR(0, 0, kWinW, kHeaderH, kColSidebar);
+    cv.FillR(0, kHeaderH, kSideW, kWinH - kHeaderH - kStatusH, kColSidebar);
+    cv.FillR(0, kWinH - kStatusH, kWinW, kStatusH, kColSidebar);
+    cv.FillR(0, kHeaderH - 1.0f, kWinW, 1.0f, kColBorder);
+    cv.FillR(kSideW - 1.0f, kHeaderH, 1.0f, kWinH - kHeaderH - kStatusH, kColBorder);
+    cv.FillR(0, kWinH - kStatusH, kWinW, 1.0f, kColBorder);
+
+    // 品牌徽标
+    cv.FillRR(14.0f, 11.0f, 22.0f, 22.0f, 6.0f, kColCardAlt);
+    cv.DrawRR(14.0f, 11.0f, 22.0f, 22.0f, 6.0f, kColBorderHi);
+    cv.rt()->DrawLine(D2D1::Point2F(18.0f, 25.0f), D2D1::Point2F(23.0f, 18.0f), cv.br(kColBlueHi), 1.5f);
+    cv.rt()->DrawLine(D2D1::Point2F(23.0f, 18.0f), D2D1::Point2F(27.0f, 24.0f), cv.br(kColBlueHi), 1.5f);
+    cv.rt()->DrawLine(D2D1::Point2F(27.0f, 24.0f), D2D1::Point2F(32.0f, 16.0f), cv.br(kColGreen), 1.5f);
+    cv.Text(cv.fmtBrand_, L"NextPerf", 42.0f, 6.0f, 100.0f, 32.0f, kColText);
+
+    // 顶部右侧克制工具控件
+    struct HBtn { float x, w; int act; };
+    const HBtn hbtns[] = {
+        {496.0f, 86.0f, ACT_TOGGLE_MON},
+        {590.0f, 86.0f, ACT_TOGGLE_OV},
+        {684.0f, 92.0f, ACT_BENCH},
+        {816.0f, 30.0f, ACT_MINIMIZE},
+        {854.0f, 30.0f, ACT_CLOSE},
+    };
+    for (const auto& b : hbtns) {
+        HitItem it{H_ACTION, {b.x, 8.0f, b.w, 28.0f}, b.act, 0, -1};
+        int idx = (int)gHits.size();
+        gHits.push_back(it);
+        bool hov = (gHoverIdx == idx);
+        if (b.act == ACT_TOGGLE_MON) {
+            cv.FillRR(b.x, 8.0f, b.w, 28.0f, 7.0f, hov ? kColHover : kColCard);
+            cv.DrawRR(b.x, 8.0f, b.w, 28.0f, 7.0f, kColBorder);
+            cv.rt()->FillEllipse(D2D1::Ellipse(D2D1::Point2F(b.x + 14.0f, 22.0f), 3.2f, 3.2f),
+                                 cv.br(gApp.monitoring ? kColGreen : kColOrange));
+            cv.Text(cv.fmtSmall_, gApp.monitoring ? L"监控中" : L"已暂停",
+                    b.x + 22.0f, 8.0f, b.w - 28.0f, 28.0f, kColText);
+        } else if (b.act == ACT_TOGGLE_OV) {
+            bool ovOn = AppOverlayVisible();
+            cv.FillRR(b.x, 8.0f, b.w, 28.0f, 7.0f, hov ? kColHover : kColCard);
+            cv.DrawRR(b.x, 8.0f, b.w, 28.0f, 7.0f, kColBorder);
+            cv.rt()->FillEllipse(D2D1::Ellipse(D2D1::Point2F(b.x + 13.0f, 22.0f), 3.2f, 3.2f),
+                                 cv.br(ovOn ? kColBlueHi : kColDim));
+            cv.Text(cv.fmtSmall_, ovOn ? L"HUD 显示" : L"HUD 隐藏",
+                    b.x + 21.0f, 8.0f, b.w - 26.0f, 28.0f, ovOn ? kColText : kColMuted);
+        } else if (b.act == ACT_BENCH) {
+            bool rec = BenchmarkActive();
+            cv.FillRR(b.x, 8.0f, b.w, 28.0f, 7.0f,
+                      rec ? kColRed : (hov ? kColHover : kColCard), rec ? 0.18f : 1.0f);
+            cv.DrawRR(b.x, 8.0f, b.w, 28.0f, 7.0f, rec ? kColRed : kColBorder,
+                      rec ? 0.7f : 1.0f);
+            cv.Text(cv.fmtSmall_, rec ? L"■ 停止录制" : L"录制基准",
+                    b.x + 6.0f, 8.0f, b.w - 12.0f, 28.0f, rec ? kColRed : kColText,
+                    DWRITE_TEXT_ALIGNMENT_CENTER);
+        } else if (b.act == ACT_MINIMIZE) {
+            cv.FillRR(b.x, 8.0f, b.w, 28.0f, 6.0f, hov ? kColHover : kColSidebar);
+            cv.rt()->DrawLine(D2D1::Point2F(b.x + 9.0f, 22.0f),
+                              D2D1::Point2F(b.x + 21.0f, 22.0f),
+                              cv.br(hov ? kColText : kColMuted), 1.4f);
+        } else if (b.act == ACT_CLOSE) {
+            cv.FillRR(b.x, 8.0f, b.w, 28.0f, 6.0f, hov ? 0xC9342Du : kColSidebar);
+            float cx = b.x + b.w * 0.5f, cy = 22.0f;
+            auto* bClose = cv.br(hov ? 0xFFFFFFu : kColMuted);
+            cv.rt()->DrawLine(D2D1::Point2F(cx - 4.0f, cy - 4.0f),
+                              D2D1::Point2F(cx + 4.0f, cy + 4.0f), bClose, 1.4f);
+            cv.rt()->DrawLine(D2D1::Point2F(cx + 4.0f, cy - 4.0f),
+                              D2D1::Point2F(cx - 4.0f, cy + 4.0f), bClose, 1.4f);
         }
     }
-    gTotalRows = rowOrd;
-    int maxScroll = std::max(0, gTotalRows - gVisibleRows);
-    gScroll = std::clamp(gScroll, 0, maxScroll);
 
-    // ---------- 左：游戏列表 ----------
-    const int gameTop = gListTop + listH + S(16);
-    for (int i = 0; i < 3; ++i) {
-        Add(W_GAMEROW, LX, gameTop + i * S(32), LW, S(28), L"");
-        gW.back().index = i;
+    // 侧边导航栏 (166px 紧凑侧栏)
+    const wchar_t* tabLabels[4] = {
+        L"概览与游戏",
+        L"HUD 外观",
+        L"监控指标",
+        L"系统与诊断",
+    };
+    for (int t = 0; t < 4; ++t) {
+        float ty = 58.0f + t * 36.0f;
+        HitItem it{H_NAV_TAB, {10.0f, ty, 146.0f, 32.0f}, t, 0, -1};
+        int idx = (int)gHits.size();
+        gHits.push_back(it);
+        bool act = (gActiveTab == t);
+        bool hov = (gHoverIdx == idx);
+        if (act) cv.FillRR(10.0f, ty, 146.0f, 32.0f, 7.0f, kColHover);
+        else if (hov) cv.FillRR(10.0f, ty, 146.0f, 32.0f, 7.0f, kColCard);
+        DrawNavIcon(cv, t, 20.0f, ty + 9.5f, act ? kColBlueHi : kColMuted);
+        cv.Text(act ? cv.fmtHead_ : cv.fmtBody_, tabLabels[t], 40.0f, ty, 108.0f, 32.0f,
+                act ? kColText : kColMuted);
     }
-    int by = gameTop + 3 * S(32) + S(10);
-    Add(W_BUTTON, LX, by, S(140), S(32), L"添加游戏 exe");
-    gW.back().action = A_ADDGAME;
-    Add(W_BUTTON, LX + S(150), by, S(110), S(32), L"移除选中");
-    gW.back().action = A_REMGAME;
-    Add(W_BUTTON, LX + S(270), by, S(190), S(32), L"注入到上一个游戏");
-    gW.back().action = A_INJECTFRONT;
-    // 第二行：注入失败十有八九是权限不够，给一个一键提权的入口；
-    // 再给一个**界面内的退出按钮** —— 托盘图标万一没注册上，这是唯一的出路。
-    int by2 = by + S(38);
-    Add(W_BUTTON, LX, by2, S(190), S(32), L"以管理员身份重启");
-    gW.back().action = A_ELEVATE;
-    Add(W_BUTTON, LX + S(200), by2, S(140), S(32), L"打开日志文件夹");
-    gW.back().action = A_LOGDIR;
-    Add(W_BUTTON, LX + S(350), by2, S(110), S(32), L"退出程序");
-    gW.back().action = A_QUIT;
 
-    // ---------- 右：外观 ----------
-    int ry = S(288);
-    auto sliderF = [&](const wchar_t* t, float* p, float a, float b) {
-        Widget wd;
-        wd.type = W_SLIDER_F; wd.x = RX; wd.y = ry; wd.w = RW; wd.h = S(30);
-        wd.text = t; wd.pFloat = p; wd.fmin = a; wd.fmax = b;
-        gW.push_back(wd);
-        ry += S(30);
-    };
-    auto sliderI = [&](const wchar_t* t, int* p, int a, int b) {
-        Widget wd;
-        wd.type = W_SLIDER_I; wd.x = RX; wd.y = ry; wd.w = RW; wd.h = S(30);
-        wd.text = t; wd.pInt = p; wd.imin = a; wd.imax = b;
-        gW.push_back(wd);
-        ry += S(30);
-    };
-    sliderF(L"缩放", &gApp.cfg.scale, 0.75f, 2.0f);
-    sliderF(L"背景不透明度", &gApp.cfg.bgOpacity, 0.05f, 1.0f);
-    sliderF(L"字体不透明度", &gApp.cfg.textOpacity, 0.10f, 1.0f);
-    sliderI(L"字号", (int*)&gApp.cfg.fontHeight, 10, 24);
-    sliderI(L"图表高度", (int*)&gApp.cfg.graphHeight, 30, 140);
-    sliderI(L"水平偏移", (int*)&gApp.cfg.offsetX, 0, 400);
-    sliderI(L"垂直偏移", (int*)&gApp.cfg.offsetY, 0, 400);
+    // 侧栏底部紧凑硬件卡 (x=10, y=366, w=146, h=140)
+    const NPSensors& s = gApp.sensors;
+    cv.Card(10.0f, 366.0f, 146.0f, 140.0f, 8.0f, kColCard, kColBorder);
+    cv.Text(cv.fmtHead_, TrimGpuName(s.gpuName), 18.0f, 374.0f, 130.0f, 18.0f, kColText);
 
-    // ---------- 右：行为 ----------
-    ry += S(36);   // 与上方滑杆区留出标题空间
-    auto cycle = [&](const wchar_t* t, int* p, std::vector<std::wstring> opts,
-                     std::vector<int> vals, int x, int y2, int w) {
-        Widget wd;
-        wd.type = W_CYCLE; wd.x = x; wd.y = y2; wd.w = w; wd.h = S(30);
-        wd.text = t; wd.pCycle = p; wd.opts = std::move(opts); wd.vals = std::move(vals);
-        gW.push_back(wd);
-    };
-    int half = RW / 2 - S(4);
-    cycle(L"叠加模式", (int*)&gApp.cfg.overlayMode,
-          {L"自动", L"强制游戏内", L"强制桌面叠加"}, {0, 1, 2}, RX, ry, half);
-    cycle(L"叠加刷新率", (int*)&gApp.cfg.updateHz, {L"60 Hz", L"30 Hz", L"20 Hz", L"10 Hz"},
-          {60, 30, 20, 10}, RX + RW / 2 + S(4), ry, half);
-    ry += S(38);
-    cycle(L"传感器轮询", (int*)&gApp.cfg.pollMs, {L"200 ms", L"350 ms", L"500 ms", L"1000 ms"},
-          {200, 350, 500, 1000}, RX, ry, half);
-    cycle(L"深度引擎钩子", (int*)&gApp.cfg.deepEngineHook, {L"开启", L"关闭"}, {1, 0},
-          RX + RW / 2 + S(4), ry, half);
-    // Low 帧只用 Intel PresentMon 的权威口径（1 秒滑动窗口 + P1）。
-    // 不提供「窗口时间」等可调项 —— 用户要求用权威方法、不让用户改窗口时间。
-    ry += S(38);
-    cycle(L"模拟数据（预览）", (int*)&gApp.cfg.simulate, {L"关闭", L"开启"}, {0, 1}, RX, ry, half);
-    // 游戏已经在跑时，Present 只能靠自己造一条临时交换链去挂（见 ProbeSwapChainVtable）。
-    // 个别游戏对注入期创建设备敏感，留个开关能关掉。
-    cycle(L"注入探测交换链", (int*)&gApp.cfg.vtableProbe, {L"开启", L"关闭"}, {1, 0},
-          RX + RW / 2 + S(4), ry, half);
+    wchar_t buf[128]{};
+    swprintf(buf, 128, L"CPU %3.0f%% %4.0fM", (double)std::max(0.0f, s.cpuUsage),
+             (double)std::max(0.0f, s.cpuClock));
+    cv.Text(cv.fmtMonoSm_, buf, 18.0f, 398.0f, 130.0f, 16.0f, kColMuted);
 
-    // ★ v1.6「假自动」可信名单：**实验性、默认关闭**。
-    //   开启后，凡是「注入验证通过并学习过」的 exe，一启动就自动注入。
-    //   学习有验证（Present 挂上 + 认出 D3D + 帧在流动），但仍是实验性功能，
-    //   所以默认关。**手动添加的游戏不受此开关影响，一直自动注入。**
-    ry += S(38);
-    cycle(L"实验性自动注入", (int*)&gApp.cfg.learnedAutoHook, {L"关闭", L"开启"}, {0, 1},
-          RX, ry, half);
+    swprintf(buf, 128, L"GPU %3.0f%%  %3.0f°C", (double)std::max(0.0f, s.gpuUsage),
+             (double)std::max(0.0f, s.gpuTemp));
+    cv.Text(cv.fmtMonoSm_, buf, 18.0f, 416.0f, 130.0f, 16.0f, kColMuted);
+
+    swprintf(buf, 128, L"显存 %4.1f/%.1fG", (double)std::max(0.0f, s.vramUsedGB),
+             (double)std::max(0.0f, s.vramTotalGB));
+    cv.Text(cv.fmtMonoSm_, buf, 18.0f, 434.0f, 130.0f, 16.0f, kColMuted);
+
+    swprintf(buf, 128, L"内存 %4.1f/%.1fG", (double)std::max(0.0f, s.ramUsedGB),
+             (double)std::max(0.0f, s.ramTotalGB));
+    cv.Text(cv.fmtMonoSm_, buf, 18.0f, 452.0f, 130.0f, 16.0f, kColMuted);
+
+    cv.FillR(18.0f, 474.0f, 130.0f, 1.0f, kColBorder);
+    bool embedOk = HookEmbedInfo(nullptr, nullptr);
+    cv.rt()->FillEllipse(D2D1::Ellipse(D2D1::Point2F(22.0f, 489.0f), 3.0f, 3.0f),
+                         cv.br(embedOk ? kColGreen : kColOrange));
+    swprintf(buf, 128, L"%ls · %ls", embedOk ? L"单文件便携" : L"外置DLL",
+             gApp.isAdmin ? L"管理员" : L"标准");
+    cv.Text(cv.fmtMicro_, buf, 30.0f, 480.0f, 120.0f, 18.0f, kColMuted);
+
+    // 侧栏底部保存配置
     {
-        std::wstring lab = L"清空学习名单";
-        int learnedN = 0;
-        for (auto& g : gApp.games) if (g.learned) ++learnedN;
-        if (learnedN) lab += L"（" + std::to_wstring(learnedN) + L"）";
-        Add(W_BUTTON, RX + RW / 2 + S(4), ry, half, S(30), lab.c_str());
-        gW.back().action = A_FORGET;
+        HitItem saveHit{H_ACTION, {10.0f, 514.0f, 146.0f, 28.0f}, ACT_SAVE, 0, -1};
+        int sIdx = (int)gHits.size();
+        gHits.push_back(saveHit);
+        DrawQuietBtn(cv, saveHit, L"保存当前配置", gHoverIdx == sIdx);
     }
 
-    // 「自动注入 3D 窗口」开关**已移除**。
-    // 靠窗口特征猜「是不是游戏」不可靠（窗口化游戏与普通窗口属性无区别；
-    // 商店应用的前台是壳窗口；枚举目标模块会打不开 UWP 甚至把游戏搞崩），
-    // 实测曾把用户的梯子/微信/NextPerf 自己当成游戏注入。
-    // 自动钩子请用**「添加游戏 exe」**：添加一次，之后该进程启动就自动注入。
-
-    // ---------- 右：按钮 ----------
-    ry += S(46);
-    Add(W_BUTTON, RX, ry, S(106), S(32), L"开始监控");
-    gW.back().action = A_START;
-    Add(W_BUTTON, RX + S(114), ry, S(106), S(32), L"停止监控");
-    gW.back().action = A_STOP;
-    Add(W_BUTTON, RX + S(228), ry, S(106), S(32), L"保存配置");
-    gW.back().action = A_SAVE;
-    Add(W_BUTTON, RX + S(342), ry, S(130), S(32), L"恢复默认");
-    gW.back().action = A_DEFAULT;
+    // 底部极简状态栏
+    uint32_t dotCol = kColDim;
+    if (gApp.noticeLevel && !gApp.notice.empty()) dotCol = kColRed;
+    else if (gApp.monitoring && gApp.telemetryLive) dotCol = kColGreen;
+    else if (gApp.monitoring) dotCol = kColBlueHi;
+    else dotCol = kColOrange;
+    cv.rt()->FillEllipse(D2D1::Ellipse(D2D1::Point2F(16.0f, kWinH - kStatusH * 0.5f), 3.2f, 3.2f),
+                         cv.br(dotCol));
+    std::wstring stText = np::Utf8ToWide(gApp.statusText);
+    cv.Text(cv.fmtSmall_, stText, 26.0f, kWinH - kStatusH, 620.0f, kStatusH,
+            (gApp.noticeLevel && !gApp.notice.empty()) ? kColRed : kColMuted);
+    cv.Text(cv.fmtMicro_, L"Build " + BuildStamp() + L" · Ctrl+Shift+O",
+            650.0f, kWinH - kStatusH, 236.0f, kStatusH, kColDim,
+            DWRITE_TEXT_ALIGNMENT_TRAILING);
 }
 
-// ---------------------------------------------------------------- 预览
-static void PrevDraw(ID2D1RenderTarget* rt, void* ud) {
-    np::PanelRenderer* r = reinterpret_cast<np::PanelRenderer*>(ud);
-    r->Render(rt, 0.0f, 0.0f, gPrevData, gApp.cfg);
-}
+static void DrawDualSparkline(UiCanvas& cv, float x, float y, float w, float h, bool live) {
+    const NPHistory& hs = gApp.hist;
+    if (hs.count < 2) return;
+    uint32_t take = std::min<uint32_t>(hs.count, 56);
+    uint32_t start = (hs.write + NP_HIST_CAP - take) % NP_HIST_CAP;
 
-static void RenderPreview() {
-    gPrevOk = false;
-    if (!npb::Factory() && !npb::GfxInit()) return;
-    if (!gPrevPanel.Init()) return;
-    np::BuildPanelData(gPrevData, gApp.cfg, gApp.sensors, gApp.telemetry, &gApp.hist);
-    float pw = 0, ph = 0;
-    gPrevPanel.Measure(gPrevData, gApp.cfg, &pw, &ph);
-    int w = (int)(pw + 3.0f), h = (int)(ph + 3.0f);
-    if (w < 8 || h < 8) return;
-    gPrevOk = gPrevBmp.Render(w, h, PrevDraw, &gPrevPanel);
-}
-
-// ---------------------------------------------------------------- 交互
-static bool VisibleRect(const Widget& wd, int ordinal, RECT* out) {
-    (void)ordinal;
-    if (wd.type == W_CHECK || wd.type == W_GROUP) {
-        int vi = wd.index - gScroll;
-        if (vi < 0 || vi >= gVisibleRows) return false;
-        out->left = wd.x;
-        out->top = gListTop + vi * gRowH;
-        out->right = wd.x + wd.w;
-        out->bottom = out->top + gRowH;
-        return true;
+    float vmax = 0.0f;
+    for (uint32_t i = 0; i < take; ++i) {
+        uint32_t idx = (start + i) % NP_HIST_CAP;
+        if (live) {
+            vmax = std::max(vmax, hs.latFrame[idx]);
+            vmax = std::max(vmax, hs.latGpu[idx]);
+        } else {
+            vmax = std::max(vmax, hs.usageCpu[idx]);
+            vmax = std::max(vmax, hs.usageGpu[idx]);
+        }
     }
-    out->left = wd.x;
-    out->top = wd.y;
-    out->right = wd.x + wd.w;
-    out->bottom = wd.y + wd.h;
-    return true;
-}
+    vmax = live ? std::max(8.0f, vmax * 1.15f) : std::clamp(vmax * 1.40f, 25.0f, 100.0f);
 
-static Widget* Hit(int mx, int my) {
-    for (size_t i = 0; i < gW.size(); ++i) {
-        Widget& wd = gW[i];
-        if (wd.type == W_GROUP) continue;   // 组标题不可点
-        RECT rc{};
-        if (!VisibleRect(wd, (int)i, &rc)) continue;
-        if (mx >= rc.left && mx < rc.right && my >= rc.top && my < rc.bottom) return &wd;
+    auto* gridBr = cv.br(0xFFFFFFu, 0.10f);
+    for (int i = 0; i <= 4; ++i) {
+        float gx = x + w * (float)i / 4.0f;
+        cv.rt()->DrawLine(D2D1::Point2F(gx, y), D2D1::Point2F(gx, y + h), gridBr, 1.0f);
     }
-    return nullptr;
+    cv.rt()->DrawLine(D2D1::Point2F(x, y + h), D2D1::Point2F(x + w, y + h), cv.br(0xFFFFFFu, 0.25f),
+                      1.0f);
+
+    auto plot = [&](const float* arr, uint32_t col) {
+        auto* br = cv.br(col, 0.95f);
+        float px0 = 0.0f, py0 = 0.0f;
+        for (uint32_t i = 0; i < take; ++i) {
+            float v = arr[(start + i) % NP_HIST_CAP];
+            float px = x + w * ((float)i / (float)(take - 1));
+            float py = y + h * (1.0f - std::clamp(v / vmax, 0.0f, 1.0f));
+            if (i > 0) cv.rt()->DrawLine(D2D1::Point2F(px0, py0), D2D1::Point2F(px, py), br, 1.35f);
+            px0 = px;
+            py0 = py;
+        }
+    };
+    if (live) {
+        plot(hs.latFrame, kColBlueHi);
+        plot(hs.latGpu, kColGreen);
+    } else {
+        plot(hs.usageCpu, kColBlueHi);
+        plot(hs.usageGpu, kColGreen);
+    }
 }
 
-static void DoAction(int action) {
-    switch (action) {
-        case A_START:
-            gApp.monitoring = true;
-            OverlaySetVisible(true);
-            InjectorScanNow();
-            gApp.statusText = "监控已启动";
-            break;
-        case A_STOP:
-            gApp.monitoring = false;
-            OverlaySetVisible(false);
-            gApp.statusText = "监控已停止";
-            break;
-        case A_SAVE:
-            SettingsSave();
-            gApp.statusText = "配置已保存";
-            break;
-        case A_DEFAULT:
-            NPDefaultConfig(&gApp.cfg);
-            gApp.statusText = "已恢复默认设置";
-            break;
-                case A_FORGET: {
-                    // 清空「学习来的」条目（手动添加的保留）。
-                    // ★ 走 ForgetLearned()：它会**先卸载这些游戏里的钩子再删条目** ——
-                    //   不卸载的话学习逻辑会立刻把它们学回来（用户实测的现象）。
-                    int n = ForgetLearned();
-                    SetNotice("已清空学习名单（" + std::to_string(n) + " 条，已卸载对应钩子）");
-                    break;
+static const wchar_t* ApiShortLabel(uint32_t api) {
+    switch (api) {
+        case NP_API_D3D12:  return L"D3D12";
+        case NP_API_D3D11:  return L"D3D11";
+        case NP_API_VULKAN: return L"Vulkan";
+        case NP_API_D3D9:   return L"D3D9";
+        case NP_API_OPENGL: return L"OpenGL";
+        default:            return L"Desktop";
+    }
+}
+
+static void DrawTabOverview(UiCanvas& cv, const std::vector<GameEntry>& gamesSnap) {
+    const NPSensors& s = gApp.sensors;
+    const NPTelemetry& t = gApp.telemetry;
+    bool live = (gApp.telemetryLive && t.attached) || gApp.cfg.simulate != 0;
+    wchar_t buf[128]{};
+
+    // 1) 顶部 4 列紧凑遥测卡 (x=178, y=56, w=708, h=92)
+    cv.Card(178.0f, 56.0f, 708.0f, 92.0f);
+    for (int i = 1; i <= 3; ++i) {
+        float vx = 178.0f + i * 177.0f;
+        cv.FillR(vx, 66.0f, 1.0f, 72.0f, kColBorder);
+    }
+
+    // Col 0: FPS / 波形
+    {
+        float x = 190.0f, y = 64.0f, w = 153.0f;
+        cv.Text(cv.fmtSmall_, L"实时帧率", x, y, 80.0f, 15.0f, kColMuted);
+        cv.Text(cv.fmtMonoSm_, gApp.cfg.simulate ? L"Sim" : ApiShortLabel(t.gfxApi),
+                x + 80.0f, y, w - 80.0f, 15.0f, live ? kColBlueHi : kColDim,
+                DWRITE_TEXT_ALIGNMENT_TRAILING);
+        if (live && t.fps > 0.1f) {
+            swprintf(buf, 128, L"%.1f", (double)t.fps);
+            cv.Text(cv.fmtMonoBig_, buf, x, y + 16.0f, 88.0f, 24.0f, kColText);
+            swprintf(buf, 128, L"Pre %.1f · 1%% %.0f",
+                     (double)(t.frameMsAvg > 0.05f ? t.frameMsAvg : t.frameMs),
+                     (double)t.fpsLow1);
+            cv.Text(cv.fmtMicro_, buf, x, y + 41.0f, w, 15.0f, kColMuted);
+        } else {
+            cv.Text(cv.fmtMonoBig_, L"--", x, y + 16.0f, 88.0f, 24.0f, kColDim);
+            cv.Text(cv.fmtMicro_, L"桌面 CPU / GPU 双波形", x, y + 41.0f, w, 15.0f, kColDim);
+        }
+        DrawDualSparkline(cv, x, y + 59.0f, w, 17.0f, live);
+    }
+
+    // Col 1: CPU
+    {
+        float x = 367.0f, y = 64.0f, w = 153.0f;
+        cv.rt()->FillEllipse(D2D1::Ellipse(D2D1::Point2F(x + 4.0f, y + 7.5f), 2.8f, 2.8f),
+                             cv.br(kColBlueHi));
+        cv.Text(cv.fmtSmall_, L"CPU 占用", x + 11.0f, y, 76.0f, 15.0f, kColMuted);
+        if (s.cpuClock > 10.0f) {
+            swprintf(buf, 128, L"%.0fM", (double)s.cpuClock);
+            cv.Text(cv.fmtMonoSm_, buf, x + 84.0f, y, w - 84.0f, 15.0f, kColMuted,
+                    DWRITE_TEXT_ALIGNMENT_TRAILING);
+        }
+        if (s.cpuUsage >= 0.0f) {
+            swprintf(buf, 128, L"%.1f%%", (double)s.cpuUsage);
+            cv.Text(cv.fmtMonoBig_, buf, x, y + 16.0f, w, 24.0f, kColText);
+            float pct = std::clamp(s.cpuUsage / 100.0f, 0.0f, 1.0f);
+            cv.FillRR(x, y + 46.0f, w, 4.0f, 2.0f, kColCardAlt);
+            cv.FillRR(x, y + 46.0f, std::max(4.0f, w * pct), 4.0f, 2.0f,
+                      s.cpuUsage >= 90.0f ? kColOrange : kColBlueHi);
+        } else {
+            cv.Text(cv.fmtMonoBig_, L"--", x, y + 16.0f, w, 24.0f, kColDim);
+        }
+        wchar_t tb[24] = L"--", pb[24] = L"--";
+        if (s.cpuTemp >= -200.0f) swprintf(tb, 24, L"%.0f°C", (double)s.cpuTemp);
+        if (s.cpuPower >= 0.0f) swprintf(pb, 24, L"%.0fW", (double)s.cpuPower);
+        swprintf(buf, 128, L"温度 %ls · 功耗 %ls", tb, pb);
+        cv.Text(cv.fmtMicro_, buf, x, y + 58.0f, w, 16.0f, kColMuted);
+    }
+
+    // Col 2: GPU
+    {
+        float x = 544.0f, y = 64.0f, w = 153.0f;
+        cv.rt()->FillEllipse(D2D1::Ellipse(D2D1::Point2F(x + 4.0f, y + 7.5f), 2.8f, 2.8f),
+                             cv.br(kColGreen));
+        cv.Text(cv.fmtSmall_, L"GPU 占用", x + 11.0f, y, 76.0f, 15.0f, kColMuted);
+        if (s.gpuClock > 10.0f) {
+            swprintf(buf, 128, L"%.0fM", (double)s.gpuClock);
+            cv.Text(cv.fmtMonoSm_, buf, x + 84.0f, y, w - 84.0f, 15.0f, kColMuted,
+                    DWRITE_TEXT_ALIGNMENT_TRAILING);
+        }
+        if (s.gpuUsage >= 0.0f) {
+            swprintf(buf, 128, L"%.1f%%", (double)s.gpuUsage);
+            cv.Text(cv.fmtMonoBig_, buf, x, y + 16.0f, w, 24.0f, kColText);
+            float pct = std::clamp(s.gpuUsage / 100.0f, 0.0f, 1.0f);
+            cv.FillRR(x, y + 46.0f, w, 4.0f, 2.0f, kColCardAlt);
+            cv.FillRR(x, y + 46.0f, std::max(4.0f, w * pct), 4.0f, 2.0f,
+                      s.gpuTemp >= 85.0f ? kColRed : kColGreen);
+        } else {
+            cv.Text(cv.fmtMonoBig_, L"--", x, y + 16.0f, w, 24.0f, kColDim);
+        }
+        wchar_t tb[24] = L"--", pb[24] = L"--";
+        if (s.gpuTemp >= -200.0f) swprintf(tb, 24, L"%.0f°C", (double)s.gpuTemp);
+        if (s.gpuPower >= 0.0f) swprintf(pb, 24, L"%.0fW", (double)s.gpuPower);
+        swprintf(buf, 128, L"温度 %ls · 功耗 %ls", tb, pb);
+        cv.Text(cv.fmtMicro_, buf, x, y + 58.0f, w, 16.0f, kColMuted);
+    }
+
+    // Col 3: 瓶颈与显存 / 基准
+    {
+        float x = 721.0f, y = 64.0f, w = 153.0f;
+        cv.Text(cv.fmtSmall_, L"瓶颈与显存", x, y, w, 15.0f, kColMuted);
+        std::wstring wb;
+        int bLvl = np::PL_NORMAL;
+        np::NPComputeBottleneck(s, t, &wb, &bLvl);
+        if (wb.empty()) wb = L"待机 / 均衡";
+        uint32_t bCol = (bLvl == np::PL_WARN) ? kColRed
+                      : (bLvl == np::PL_ACCENT ? kColOrange
+                      : (bLvl == np::PL_GPU ? kColGreen
+                      : (bLvl == np::PL_CPU ? kColBlueHi : kColMuted)));
+        cv.FillRR(x, y + 19.0f, w, 22.0f, 6.0f, kColSurface);
+        cv.rt()->FillEllipse(D2D1::Ellipse(D2D1::Point2F(x + 11.0f, y + 30.0f), 3.0f, 3.0f),
+                             cv.br(bCol));
+        cv.Text(cv.fmtSmall_, wb, x + 20.0f, y + 19.0f, w - 26.0f, 22.0f, kColText);
+
+        if (gApp.lastBench.valid) {
+            swprintf(buf, 128, L"均%.1f · 1%% %.1f", (double)gApp.lastBench.avgFps,
+                     (double)gApp.lastBench.low1Fps);
+            cv.Text(cv.fmtMonoSm_, buf, x, y + 46.0f, w, 15.0f, kColBlueHi);
+            swprintf(buf, 128, L"%.1f - %.1f FPS", (double)gApp.lastBench.minFps,
+                     (double)gApp.lastBench.maxFps);
+            cv.Text(cv.fmtMicro_, buf, x, y + 61.0f, w, 15.0f, kColMuted);
+        } else {
+            swprintf(buf, 128, L"显存 %.2f / %.1fG", (double)std::max(0.0f, s.vramUsedGB),
+                     (double)std::max(0.0f, s.vramTotalGB));
+            cv.Text(cv.fmtMonoSm_, buf, x, y + 46.0f, w, 15.0f, kColText);
+            cv.Text(cv.fmtMicro_, L"Ctrl+Shift+B 录制 CSV", x, y + 61.0f, w, 15.0f, kColDim);
+        }
+    }
+
+    // 2) 游戏库与注入 Grouped Card (x=178, y=158, w=708, h=384)
+    cv.Card(178.0f, 158.0f, 708.0f, 384.0f);
+    cv.Text(cv.fmtTitle_, L"游戏库与注入", 192.0f, 168.0f, 118.0f, 28.0f, kColText);
+    swprintf(buf, 128, L"%zu 款 · 64/32位", gamesSnap.size());
+    cv.Text(cv.fmtSmall_, buf, 294.0f, 168.0f, 120.0f, 28.0f, kColMuted);
+
+    struct ToolBtn { float x, w; int act; const wchar_t* label; bool primary; };
+    const ToolBtn tbtns[] = {
+        {506.0f,  64.0f, ACT_FORGET_LEARNED, L"清学习",     false},
+        {576.0f,  64.0f, ACT_ADD_GAME,       L"+ 添加",     false},
+        {646.0f, 100.0f, ACT_SCAN_GAMES,     L"扫描运行中", false},
+        {kFrontInjectX, kFrontInjectW, ACT_INJECT_FRONT, L"注入前台游戏", true},
+    };
+    for (const auto& b : tbtns) {
+        float by = b.primary ? kFrontInjectY : 168.0f;
+        float bh = b.primary ? kFrontInjectH : 28.0f;
+        HitItem it{H_ACTION, {b.x, by, b.w, bh}, b.act, 0, -1};
+        int idx = (int)gHits.size();
+        gHits.push_back(it);
+        DrawQuietBtn(cv, it, b.label, gHoverIdx == idx, b.primary);
+    }
+
+    // 紧凑 6 行可滚动列表井 (x=192, y=206, w=680, h=298)
+    constexpr int kVisGames = 6;
+    int maxGs = std::max(0, (int)gamesSnap.size() - kVisGames);
+    gGameScroll = std::clamp(gGameScroll, 0, maxGs);
+
+    cv.FillRR(192.0f, 206.0f, 680.0f, 298.0f, 8.0f, kColSurface);
+    cv.DrawRR(192.0f, 206.0f, 680.0f, 298.0f, 8.0f, kColBorder);
+
+    if (gamesSnap.empty()) {
+        cv.Text(cv.fmtBody_, L"列表为空 · 点击「扫描运行中」或「+ 添加」收录 3D 游戏",
+                210.0f, 206.0f, 644.0f, 298.0f, kColDim, DWRITE_TEXT_ALIGNMENT_CENTER);
+    } else {
+        for (int row = 0; row < kVisGames; ++row) {
+            int slot = gGameScroll + row;
+            if (slot >= (int)gamesSnap.size()) break;
+            const GameEntry& ge = gamesSnap[slot];
+            float rx = 193.0f, ry = 208.0f + row * 49.0f, rw = 670.0f, rh = 48.0f;
+
+            HitItem rHit{H_GAME_ROW, {rx, ry, rw - 160.0f, rh}, slot, 0, -1};
+            int rIdx = (int)gHits.size();
+            gHits.push_back(rHit);
+            bool sel = (gSelGame == slot);
+            bool hov = (gHoverIdx == rIdx);
+            if (sel || hov) {
+                cv.FillRR(rx + 4.0f, ry + 3.0f, rw - 8.0f, rh - 6.0f, 6.0f,
+                          sel ? kColHover : kColCardAlt, 0.75f);
+            }
+            if (row < kVisGames - 1 && slot + 1 < (int)gamesSnap.size()) {
+                cv.FillR(rx + 14.0f, ry + rh - 1.0f, rw - 28.0f, 1.0f, kColBorder);
+            }
+
+            uint32_t dotCol = kColDim;
+            wchar_t st[64] = L"未运行";
+            uint32_t stCol = kColDim;
+            if (ge.pid) {
+                bool mine = (gApp.telemetryPid == ge.pid);
+                bool stLive = t.attached && mine && gApp.telemetryLive;
+                if (stLive) {
+                    swprintf(st, 64, L"%ls · %.0f FPS", ApiShortLabel(t.gfxApi), (double)t.fps);
+                    dotCol = kColGreen;
+                    stCol = kColGreen;
+                } else if (ge.injected) {
+                    if (mine && t.gfxApi == NP_API_VULKAN) wcscpy_s(st, L"Vulkan · 桌面 HUD");
+                    else if (mine && t.gfxApi == NP_API_OPENGL) wcscpy_s(st, L"OpenGL · 无帧数据");
+                    else swprintf(st, 64, L"已注入 PID %lu", (unsigned long)ge.pid);
+                    dotCol = kColBlueHi;
+                    stCol = kColBlueHi;
+                } else {
+                    uint32_t rem = GameAutoInjectRemainingMs(ge);
+                    if (rem > 0) {
+                        swprintf(st, 64, L"%us 后自动注入", (unsigned)((rem + 999) / 1000));
+                        dotCol = kColOrange;
+                        stCol = kColOrange;
+                    } else {
+                        swprintf(st, 64, L"运行中 PID %lu", (unsigned long)ge.pid);
+                        dotCol = kColMuted;
+                        stCol = kColText;
+                    }
                 }
-        case A_ADDGAME: {
+            }
+            cv.rt()->FillEllipse(D2D1::Ellipse(D2D1::Point2F(rx + 18.0f, ry + rh * 0.5f),
+                                               3.2f, 3.2f),
+                                 cv.br(dotCol));
+
+            std::wstring exeShort = ShortExeName(ge);
+            cv.Text(cv.fmtMono_, exeShort, rx + 30.0f, ry, 200.0f, rh, kColText);
+            cv.Text(cv.fmtMicro_, ge.learned ? L"学习" : L"手动", rx + 236.0f, ry,
+                    48.0f, rh, kColDim);
+            cv.Text(cv.fmtSmall_, st, rx + 290.0f, ry, 206.0f, rh, stCol);
+
+            HitItem injHit{H_GAME_INJ, {rx + 506.0f, ry + 10.0f, 82.0f, 28.0f}, slot, 0, -1};
+            int injIdx = (int)gHits.size();
+            gHits.push_back(injHit);
+            bool injHov = (gHoverIdx == injIdx);
+            if (ge.injected) DrawQuietBtn(cv, injHit, L"卸载", injHov, false, kColOrange);
+            else if (ge.pid) DrawQuietBtn(cv, injHit, L"注入", injHov, true);
+            else cv.Text(cv.fmtMicro_, L"—", injHit.rc.x, injHit.rc.y, injHit.rc.w, injHit.rc.h,
+                         kColDim, DWRITE_TEXT_ALIGNMENT_CENTER);
+
+            HitItem remHit{H_GAME_REM, {rx + 596.0f, ry + 10.0f, 62.0f, 28.0f}, slot, 0, -1};
+            int remIdx = (int)gHits.size();
+            gHits.push_back(remHit);
+            DrawQuietBtn(cv, remHit, L"移除", gHoverIdx == remIdx, false, kColMuted);
+        }
+    }
+
+    if ((int)gamesSnap.size() > kVisGames) {
+        float trX = 865.0f, trY = 214.0f, trH = 282.0f;
+        cv.FillRR(trX, trY, 3.0f, trH, 1.5f, kColCardAlt);
+        float thH = std::max(24.0f, trH * (float)kVisGames / (float)gamesSnap.size());
+        float thY = trY + (trH - thH) * ((float)gGameScroll / (float)std::max(1, maxGs));
+        cv.FillRR(trX, thY, 3.0f, thH, 1.5f, kColBorderHi);
+    }
+
+    std::wstring fore = gApp.foreName.empty()
+                            ? L"尚未捕获游戏前台（切回游戏窗口后再点「注入前台游戏」）"
+                            : (L"最近前台：" + gApp.foreName + L" (PID " +
+                               std::to_wstring(gApp.forePid) + L")");
+    cv.Text(cv.fmtSmall_, fore, 192.0f, 512.0f, 470.0f, 24.0f, kColMuted);
+    cv.Text(cv.fmtMicro_,
+            IsAsyncJobRunning() ? L"后台任务执行中…" : L"滚轮翻页 · 延迟 10s 安全注入",
+            664.0f, 512.0f, 208.0f, 24.0f, IsAsyncJobRunning() ? kColOrange : kColDim,
+            DWRITE_TEXT_ALIGNMENT_TRAILING);
+}
+
+static void DrawTabAppearance(UiCanvas& cv) {
+    const NPConfig& cfg = gApp.cfg;
+
+    // 左栏 (x=178, w=398, y=56..542)
+    // 1) 排版形态与材质风格卡 (y=56, h=124)
+    cv.Card(178.0f, 56.0f, 398.0f, 124.0f);
+    cv.Text(cv.fmtHead_, L"排版形态", 192.0f, 64.0f, 96.0f, 28.0f, kColText);
+
+    cv.FillRR(306.0f, 64.0f, 256.0f, 28.0f, 7.0f, kColSurface);
+    cv.DrawRR(306.0f, 64.0f, 256.0f, 28.0f, 7.0f, kColBorder);
+    bool horiz = NPConfigHorizontal(cfg);
+    for (int m = 0; m < 2; ++m) {
+        float bx = 309.0f + m * 125.0f;
+        HitItem hi{H_LAYOUT_MODE, {bx, 67.0f, 125.0f, 22.0f}, m, 0, -1};
+        int idx = (int)gHits.size();
+        gHits.push_back(hi);
+        bool act = ((m == 1) == horiz);
+        bool hov = (gHoverIdx == idx);
+        if (act) {
+            cv.FillRR(bx, 67.0f, 125.0f, 22.0f, 5.0f, kColHover);
+            cv.DrawRR(bx, 67.0f, 125.0f, 22.0f, 5.0f, kColBorderHi);
+        } else if (hov) {
+            cv.FillRR(bx, 67.0f, 125.0f, 22.0f, 5.0f, kColCardAlt);
+        }
+        cv.Text(cv.fmtMicro_, m == 0 ? L"Metal 竖版" : L"极简横条", bx, 67.0f, 125.0f, 22.0f,
+                act ? kColText : kColMuted, DWRITE_TEXT_ALIGNMENT_CENTER);
+    }
+
+    cv.FillR(192.0f, 100.0f, 370.0f, 1.0f, kColBorder);
+    cv.Text(cv.fmtSmall_, L"HUD 材质与背景", 192.0f, 106.0f, 140.0f, 18.0f, kColMuted);
+    struct ThemeSpec { const wchar_t* name; uint32_t bg, bd; };
+    const ThemeSpec themes[4] = {
+        {L"Metal 黑",  0x060608u, 0x3A3A3Fu},
+        {L"液态暗灰",  0x1C1C20u, 0x525258u},
+        {L"浅雾透明",  0x111114u, 0x2C2C30u},
+        {L"极简纯字",  0x141416u, 0x636366u},
+    };
+    uint32_t curTheme = NPConfigTheme(cfg);
+    for (int t = 0; t < 4; ++t) {
+        float tx = 192.0f + t * 94.0f, ty = 130.0f, tw = 88.0f, th = 38.0f;
+        HitItem ti{H_THEME, {tx, ty, tw, th}, t, 0, -1};
+        int idx = (int)gHits.size();
+        gHits.push_back(ti);
+        bool act = ((uint32_t)t == curTheme);
+        bool hov = (gHoverIdx == idx);
+        cv.FillRR(tx, ty, tw, th, 7.0f, act ? kColHover : (hov ? kColCardAlt : kColSurface));
+        cv.DrawRR(tx, ty, tw, th, 7.0f, act ? kColBlue : kColBorder, 1.0f, act ? 1.5f : 1.0f);
+        cv.FillRR(tx + 7.0f, ty + 10.0f, 18.0f, 18.0f, 4.0f, themes[t].bg);
+        cv.DrawRR(tx + 7.0f, ty + 10.0f, 18.0f, 18.0f, 4.0f, themes[t].bd);
+        if (t == 3) {
+            cv.Text(cv.fmtMicro_, L"A", tx + 7.0f, ty + 10.0f, 18.0f, 18.0f, kColText,
+                    DWRITE_TEXT_ALIGNMENT_CENTER);
+        } else {
+            cv.FillRR(tx + 10.0f, ty + 14.0f, 12.0f, 2.0f, 1.0f, kColBlueHi);
+            cv.FillRR(tx + 10.0f, ty + 18.0f, 9.0f, 2.0f, 1.0f, kColGreen);
+            cv.FillRR(tx + 10.0f, ty + 22.0f, 11.0f, 2.0f, 1.0f, kColMuted);
+        }
+        cv.Text(cv.fmtMicro_, themes[t].name, tx + 29.0f, ty, tw - 32.0f, th,
+                act ? kColText : kColMuted);
+    }
+
+    // 2) 屏幕锚点 + 开关 (y=188, h=114)
+    cv.Card(178.0f, 188.0f, 398.0f, 114.0f);
+    cv.Text(cv.fmtSmall_, L"屏幕锚点", 192.0f, 190.0f, 100.0f, 36.0f, kColText);
+    cv.FillRR(306.0f, 195.0f, 256.0f, 26.0f, 6.0f, kColSurface);
+    cv.DrawRR(306.0f, 195.0f, 256.0f, 26.0f, 6.0f, kColBorder);
+    struct CornerOpt { int code; const wchar_t* lbl; };
+    const CornerOpt corners[4] = {
+        {1, L"左上"}, {0, L"右上"}, {3, L"左下"}, {2, L"右下"},
+    };
+    uint32_t curCorner = NPConfigCorner(cfg);
+    for (int i = 0; i < 4; ++i) {
+        float cx = 309.0f + i * 62.5f;
+        HitItem ci{H_CORNER, {cx, 198.0f, 62.5f, 20.0f}, corners[i].code, 0, -1};
+        int idx = (int)gHits.size();
+        gHits.push_back(ci);
+        bool act = ((uint32_t)corners[i].code == curCorner);
+        bool hov = (gHoverIdx == idx);
+        if (act) {
+            cv.FillRR(cx, 198.0f, 62.5f, 20.0f, 4.0f, kColHover);
+            cv.DrawRR(cx, 198.0f, 62.5f, 20.0f, 4.0f, kColBorderHi);
+        } else if (hov) {
+            cv.FillRR(cx, 198.0f, 62.5f, 20.0f, 4.0f, kColCardAlt);
+        }
+        cv.Text(cv.fmtMicro_, corners[i].lbl, cx, 198.0f, 62.5f, 20.0f,
+                act ? kColText : kColMuted, DWRITE_TEXT_ALIGNMENT_CENTER);
+    }
+
+    auto drawSettingSwitchRow = [&](float ry, const wchar_t* lbl, bool on, int arg) {
+        cv.FillR(192.0f, ry, 370.0f, 1.0f, kColBorder);
+        HitItem hit{H_OPT_BIT, {180.0f, ry + 1.0f, 394.0f, 36.0f}, arg, 0, -1};
+        int idx = (int)gHits.size();
+        gHits.push_back(hit);
+        bool hov = (gHoverIdx == idx);
+        if (hov) cv.FillRR(182.0f, ry + 2.0f, 390.0f, 33.0f, 6.0f, kColCardAlt, 0.45f);
+        cv.Text(cv.fmtSmall_, lbl, 192.0f, ry + 1.0f, 310.0f, 36.0f, kColText);
+        DrawAppleSwitch(cv, 528.0f, ry + 10.0f, on, hov);
+    };
+    drawSettingSwitchRow(226.0f, L"显示 2 行设备顶栏（显卡 · 分辨率 · Hz）",
+                         NPConfigShowHeader(cfg), 1);
+    drawSettingSwitchRow(264.0f, L"显示极值区间 [min max]", NPConfigShowRange(cfg), 0);
+
+    // 3) 7 项微调滑杆卡 (y=310, h=232)
+    cv.Card(178.0f, 310.0f, 398.0f, 232.0f);
+    for (int i = 0; i < 7; ++i) {
+        float sy = 318.0f + i * 31.0f;
+        HitItem si{H_SLIDER, {192.0f, sy, 370.0f, 27.0f}, i, 0, i};
+        int idx = (int)gHits.size();
+        gHits.push_back(si);
+
+        std::wstring valStr;
+        float ratio = GetSliderRatio(i, &valStr);
+        cv.Text(cv.fmtSmall_, kSliders[i].label, 192.0f, sy, 76.0f, 27.0f, kColText);
+
+        RectF tr{274.0f, sy + 11.5f, 232.0f, 4.0f};
+        gSliderTrack[i] = tr;
+        cv.FillRR(tr.x, tr.y, tr.w, tr.h, 2.0f, kColCardAlt);
+        cv.FillRR(tr.x, tr.y, std::max(4.0f, tr.w * ratio), tr.h, 2.0f, kColBlue);
+        float kx = tr.x + tr.w * ratio;
+        bool act = (gDraggingSlider == i || gHoverIdx == idx);
+        cv.rt()->FillEllipse(D2D1::Ellipse(D2D1::Point2F(kx, tr.y + 2.0f),
+                                           act ? 6.8f : 5.8f, act ? 6.8f : 5.8f),
+                             cv.br(0xFFFFFFu));
+        cv.rt()->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(kx, tr.y + 2.0f),
+                                           act ? 6.8f : 5.8f, act ? 6.8f : 5.8f),
+                             cv.br(0x000000u, 0.35f), 1.0f);
+
+        cv.Text(cv.fmtMonoSm_, valStr, 512.0f, sy, 50.0f, 27.0f, kColMuted,
+                DWRITE_TEXT_ALIGNMENT_TRAILING);
+    }
+
+    // 右栏：实时 HUD 1:1 紧凑预览 (x=586, y=56, w=300, h=486)
+    cv.Card(586.0f, 56.0f, 300.0f, 486.0f);
+    cv.Text(cv.fmtHead_, L"Metal HUD 实时预览", 598.0f, 62.0f, 160.0f, 22.0f, kColText);
+
+    NPTelemetry prevTel = gApp.telemetry;
+    NPSensors   prevSens = gApp.sensors;
+    NPHistory   prevHist = gApp.hist;
+    bool usingDemo = (!prevTel.attached && prevTel.fps < 1.0f);
+    if (usingDemo) {
+        prevTel.attached = 1;
+        prevTel.gfxApi = NP_API_D3D12;
+        prevTel.presentMode = NP_PM_BORDERLESS;
+        strcpy_s(prevTel.processName, "CyberDemo.exe");
+        prevTel.fps = 142.6f;
+        prevTel.fpsAvg = 138.4f;
+        prevTel.fpsLow1 = 116.2f;
+        prevTel.fpsLow01 = 98.4f;
+        prevTel.frameMs = 7.01f;
+        prevTel.frameMsAvg = 7.22f;
+        prevTel.cpuFrameMs = 4.30f;
+        prevTel.cpuFrameMsAvg = 4.45f;
+        prevTel.cpuBusyMs = 3.60f;
+        prevTel.cpuBusyAvg = 3.72f;
+        prevTel.cpuWaitMs = 0.70f;
+        prevTel.cpuWaitAvg = 0.73f;
+        prevTel.gpuFrameMs = 5.42f;
+        prevTel.rtLoad = 22.4f;
+        prevTel.rtGpuMs = 1.61f;
+        prevTel.tensorLoad = 11.8f;
+        prevTel.aiGpuMs = 0.85f;
+        prevTel.windowW = 2560;
+        prevTel.windowH = 1440;
+        prevTel.renderW = 2560;
+        prevTel.renderH = 1440;
+        prevTel.drawCalls = 1448;
+        prevTel.dispatches = 111;
+        if (prevSens.cpuUsage < 0.0f) prevSens.cpuUsage = 34.5f;
+        if (prevSens.cpuClock < 10.0f) prevSens.cpuClock = 5150.0f;
+        if (prevSens.cpuTemp < -200.0f) prevSens.cpuTemp = 64.0f;
+        if (prevSens.cpuPower < 0.0f) prevSens.cpuPower = 68.0f;
+        if (prevSens.gpuUsage < 0.0f) prevSens.gpuUsage = 92.0f;
+        if (prevSens.gpuTemp < -200.0f) prevSens.gpuTemp = 69.0f;
+        if (prevSens.gpuPower < 0.0f) prevSens.gpuPower = 245.0f;
+        if (prevSens.gpuClock < 10.0f) prevSens.gpuClock = 2640.0f;
+        if (prevSens.memClock < 10.0f) prevSens.memClock = 9001.0f;
+        if (prevSens.vramTotalGB <= 0.1f) { prevSens.vramUsedGB = 7.42f; prevSens.vramTotalGB = 16.0f; }
+        if (prevSens.ramTotalGB <= 0.1f) { prevSens.ramUsedGB = 13.84f; prevSens.ramTotalGB = 32.0f; }
+        prevHist = NPHistory{};
+    }
+    if (usingDemo || prevHist.count < 16) {
+        prevHist.sampleMs = 125;
+        for (int k = 0; k < 56; ++k) {
+            float p = (float)k * 0.34f;
+            float f = 136.0f + 16.0f * sinf(p) + 5.0f * cosf(p * 2.1f);
+            float ft = 1000.0f / f;
+            float gt = ft * (0.64f + 0.14f * cosf(p * 1.4f));
+            NPHistoryPush(&prevHist, f, 136.0f, 114.0f, 96.0f, 34.0f + 8.0f * sinf(p),
+                          88.0f + 7.0f * cosf(p), ft, ft * 0.55f, gt, ft * 0.45f, ft * 0.10f);
+        }
+    }
+
+    np::PanelData pd;
+    np::BuildPanelData(pd, cfg, prevSens, prevTel, &prevHist);
+    float pw = 0.0f, ph = 0.0f;
+    gPreviewPanel.Measure(pd, cfg, &pw, &ph);
+
+    wchar_t dimBuf[64]{};
+    swprintf(dimBuf, 64, L"%.0f×%.0f DIP", (double)pw, (double)ph);
+    cv.Text(cv.fmtMonoSm_, dimBuf, 744.0f, 62.0f, 130.0f, 22.0f, kColMuted,
+            DWRITE_TEXT_ALIGNMENT_TRAILING);
+
+    RectF vp{596.0f, 90.0f, 280.0f, 442.0f};
+    cv.FillRR(vp.x, vp.y, vp.w, vp.h, 8.0f, 0x0D0E10u);
+    cv.DrawRR(vp.x, vp.y, vp.w, vp.h, 8.0f, kColBorder);
+
+    ID2D1DCRenderTarget* rt = cv.rt();
+    rt->PushAxisAlignedClip(vp.d2d(), D2D1_ANTIALIAS_MODE_ALIASED);
+
+    cv.FillRR(vp.x + 14.0f, vp.y + 24.0f, vp.w - 28.0f, 160.0f, 10.0f, 0x1A1D22u, 0.55f);
+    cv.FillRR(vp.x + 22.0f, vp.y + 220.0f, 170.0f, 115.0f, 12.0f, 0x24262Bu, 0.45f);
+    cv.FillRR(vp.x + 125.0f, vp.y + 270.0f, 140.0f, 130.0f, 12.0f, 0x2A2925u, 0.40f);
+
+    if (pw > 1.0f && ph > 1.0f && gPreviewPanel.ok()) {
+        float fit = std::min({(vp.w - 16.0f) / pw, (vp.h - 16.0f) / ph, 1.0f});
+        float drawW = pw * fit, drawH = ph * fit;
+        float ox = vp.x + 8.0f, oy = vp.y + 8.0f;
+        if (!horiz) {
+            if (curCorner == 0 || curCorner == 2) ox = vp.x + vp.w - drawW - 8.0f;
+            if (curCorner == 2 || curCorner == 3) oy = vp.y + vp.h - drawH - 8.0f;
+        } else {
+            ox = vp.x + (vp.w - drawW) * 0.5f;
+            oy = (curCorner == 2 || curCorner == 3) ? (vp.y + vp.h - drawH - 8.0f)
+                                                    : (vp.y + 8.0f);
+        }
+
+        D2D1::Matrix3x2F prevXf{};
+        rt->GetTransform(&prevXf);
+        rt->SetTransform(D2D1::Matrix3x2F::Scale(fit, fit) *
+                         D2D1::Matrix3x2F::Translation(ox, oy) * prevXf);
+        gPreviewPanel.Render(rt, 0.0f, 0.0f, pd, cfg);
+        rt->SetTransform(prevXf);
+    }
+    rt->PopAxisAlignedClip();
+}
+
+static void DrawTabCounters(UiCanvas& cv) {
+    RebuildCounterRows();
+
+    // 1) 顶部 macOS 分段预设条 (x=178, y=56, w=708, h=48)
+    cv.Card(178.0f, 56.0f, 708.0f, 48.0f);
+    cv.Text(cv.fmtHead_, L"监控预设", 192.0f, 56.0f, 72.0f, 48.0f, kColText);
+    wchar_t cntBuf[64]{};
+    swprintf(cntBuf, 64, L"%d / 37", CountEnabledCounters());
+    cv.Text(cv.fmtMonoSm_, cntBuf, 260.0f, 56.0f, 64.0f, 48.0f, kColMuted);
+
+    cv.FillRR(344.0f, 65.0f, 428.0f, 30.0f, 7.0f, kColSurface);
+    cv.DrawRR(344.0f, 65.0f, 428.0f, 30.0f, 7.0f, kColBorder);
+
+    struct PBtn { float x, w; int presetId; const wchar_t* txt; uint64_t mask; };
+    const PBtn pbtns[] = {
+        {347.0f, 105.0f, 0, L"Metal 精简", NP_PRESET_MINIMAL},
+        {452.0f, 105.0f, 1, L"Metal 标准", NP_PRESET_STANDARD},
+        {557.0f, 105.0f, 2, L"深度调优",   NP_PRESET_TUNING},
+        {662.0f, 107.0f, 3, L"全部启用",   NP_PRESET_FULL},
+    };
+    for (const auto& b : pbtns) {
+        bool isAct = ((gApp.cfg.counters & NP_PRESET_FULL) == b.mask);
+        HitItem it{H_PRESET, {b.x, 68.0f, b.w, 24.0f}, b.presetId, b.mask, -1};
+        int idx = (int)gHits.size();
+        gHits.push_back(it);
+        bool hov = (gHoverIdx == idx);
+        if (isAct) {
+            cv.FillRR(b.x, 68.0f, b.w, 24.0f, 5.0f, kColHover);
+            cv.DrawRR(b.x, 68.0f, b.w, 24.0f, 5.0f, kColBorderHi);
+        } else if (hov) {
+            cv.FillRR(b.x, 68.0f, b.w, 24.0f, 5.0f, kColCardAlt);
+        }
+        cv.Text(cv.fmtSmall_, b.txt, b.x, 68.0f, b.w, 24.0f, isAct ? kColText : kColMuted,
+                DWRITE_TEXT_ALIGNMENT_CENTER);
+    }
+
+    HitItem defHit{H_PRESET, {780.0f, 66.0f, 94.0f, 28.0f}, 4, 0, -1};
+    int defIdx = (int)gHits.size();
+    gHits.push_back(defHit);
+    DrawQuietBtn(cv, defHit, L"恢复默认", gHoverIdx == defIdx);
+
+    // 2) 分组滑块开关列表 (x=178, y=112, w=708, h=430)
+    cv.Card(178.0f, 112.0f, 708.0f, 430.0f);
+    constexpr int kVisRows = 11;
+    const float topY = 122.0f, rowH = 37.0f;
+
+    for (int vi = 0; vi < kVisRows; ++vi) {
+        int ri = gCounterScroll + vi;
+        if (ri >= (int)gCounterRows.size()) break;
+        const CounterVisualRow& cr = gCounterRows[ri];
+        float ry = topY + vi * rowH;
+
+        if (cr.isGroup) {
+            HitItem gh{H_GROUP_HDR, {190.0f, ry + 2.0f, 674.0f, rowH - 4.0f}, cr.groupIdx, 0, -1};
+            int idx = (int)gHits.size();
+            gHits.push_back(gh);
+            bool hov = (gHoverIdx == idx);
+            bool open = gGrpOpen[cr.groupIdx];
+            cv.FillRR(190.0f, ry + 2.0f, 674.0f, rowH - 4.0f, 6.0f,
+                      hov ? kColHover : kColSurface);
+            wchar_t arrow[64]{};
+            swprintf(arrow, 64, L"%ls  %ls (%d)", open ? L"▾" : L"▸",
+                     kGroups[cr.groupIdx].name, kGroups[cr.groupIdx].n);
+            cv.Text(cv.fmtHead_, arrow, 202.0f, ry + 2.0f, 380.0f, rowH - 4.0f, kColText);
+            cv.Text(cv.fmtMicro_, open ? L"收起" : L"展开", 760.0f, ry + 2.0f, 92.0f,
+                    rowH - 4.0f, kColDim, DWRITE_TEXT_ALIGNMENT_TRAILING);
+        } else {
+            for (int c = 0; c < 2; ++c) {
+                const CounterDef* cd = cr.cols[c];
+                if (!cd) continue;
+                float bx = (c == 0) ? 190.0f : 532.0f;
+                float bw = 332.0f;
+                HitItem chHit{H_COUNTER, {bx, ry + 2.0f, bw, rowH - 4.0f}, 0, cd->bit, -1};
+                int idx = (int)gHits.size();
+                gHits.push_back(chHit);
+                bool hov = (gHoverIdx == idx);
+                bool on = (gApp.cfg.counters & cd->bit) != 0;
+
+                cv.FillRR(bx, ry + 2.0f, bw, rowH - 4.0f, 6.0f,
+                          hov ? kColHover : kColSurface, hov ? 0.9f : 0.65f);
+                cv.FillR(bx + 8.0f, ry + rowH - 1.0f, bw - 16.0f, 1.0f, kColBorder, 0.5f);
+
+                cv.Text(cv.fmtBody_, cd->name, bx + 12.0f, ry + 2.0f, 210.0f, rowH - 4.0f,
+                        on ? kColText : kColMuted);
+                cv.Text(cv.fmtMicro_, cd->tag, bx + 224.0f, ry + 2.0f, 54.0f, rowH - 4.0f, kColDim,
+                        DWRITE_TEXT_ALIGNMENT_TRAILING);
+                DrawAppleSwitch(cv, bx + bw - 42.0f, ry + (rowH - 18.0f) * 0.5f, on, hov);
+            }
+        }
+    }
+
+    if (gCounterTotalRows > kVisRows) {
+        int maxSc = std::max(1, gCounterTotalRows - kVisRows);
+        float trX = 872.0f, trY = 126.0f, trH = 400.0f;
+        cv.FillRR(trX, trY, 3.0f, trH, 1.5f, kColCardAlt);
+        float thH = std::max(26.0f, trH * (float)kVisRows / (float)gCounterTotalRows);
+        float thY = trY + (trH - thH) * ((float)gCounterScroll / (float)maxSc);
+        cv.FillRR(trX, thY, 3.0f, thH, 1.5f, kColBorderHi);
+    }
+}
+
+static void DrawTabSystem(UiCanvas& cv) {
+    // 左栏：运行与注入设置 (x=178, y=56, w=346, h=300)
+    cv.Card(178.0f, 56.0f, 346.0f, 300.0f);
+    cv.Text(cv.fmtTitle_, L"运行与注入设置", 192.0f, 62.0f, 200.0f, 22.0f, kColText);
+
+    struct CycRow { float y; const wchar_t* label; std::wstring val; int id; };
+    const wchar_t* ovNames[] = {L"智能自动", L"仅游戏内", L"仅桌面", L"全部隐藏"};
+    uint32_t ovIdx = std::min(gApp.cfg.overlayMode, 3u);
+    wchar_t pollStr[32]{}, hzStr[32]{};
+    swprintf(pollStr, 32, L"%u ms", gApp.cfg.pollMs ? gApp.cfg.pollMs : 500u);
+    swprintf(hzStr, 32, L"%u Hz", gApp.cfg.updateHz ? gApp.cfg.updateHz : 20u);
+
+    const CycRow cycs[3] = {
+        {90.0f,  L"叠加显示策略",   ovNames[ovIdx], 0},
+        {122.0f, L"传感器轮询间隔", pollStr, 1},
+        {154.0f, L"桌面 HUD 刷新率", hzStr, 2},
+    };
+    for (const auto& cr : cycs) {
+        HitItem hi{H_SYS_CYCLE, {192.0f, cr.y, 318.0f, 28.0f}, cr.id, 0, -1};
+        int idx = (int)gHits.size();
+        gHits.push_back(hi);
+        bool hov = (gHoverIdx == idx);
+        cv.FillRR(hi.rc.x, hi.rc.y, hi.rc.w, hi.rc.h, 6.0f, hov ? kColHover : kColSurface);
+        cv.DrawRR(hi.rc.x, hi.rc.y, hi.rc.w, hi.rc.h, 6.0f, hov ? kColBorderHi : kColBorder);
+        cv.Text(cv.fmtSmall_, cr.label, hi.rc.x + 10.0f, hi.rc.y, 170.0f, 28.0f, kColText);
+        cv.Text(cv.fmtSmall_, cr.val + L" ▾", hi.rc.x + 180.0f, hi.rc.y, 128.0f, 28.0f,
+                kColBlueHi, DWRITE_TEXT_ALIGNMENT_TRAILING);
+    }
+
+    struct SysBool { const wchar_t* label; bool val; int id; };
+    const SysBool bools[5] = {
+        {L"游戏库匹配启动后自动延迟注入", gApp.cfg.autoInject != 0, 0},
+        {L"允许对自动学习名单自动注入",   gApp.cfg.learnedAutoHook != 0, 1},
+        {L"D3D12 深度引擎钩子 (RT / AI)",  gApp.cfg.deepEngineHook != 0, 2},
+        {L"允许 VTable 临时探测兜底",      gApp.cfg.vtableProbe != 0, 3},
+        {L"离线模拟演示数据流",            gApp.cfg.simulate != 0, 4},
+    };
+    for (int i = 0; i < 5; ++i) {
+        float y = 190.0f + i * 32.0f;
+        if (i > 0) cv.FillR(192.0f, y, 318.0f, 1.0f, kColBorder);
+        HitItem hi{H_SYS_TOGGLE, {184.0f, y + 1.0f, 334.0f, 31.0f}, bools[i].id, 0, -1};
+        int idx = (int)gHits.size();
+        gHits.push_back(hi);
+        bool hov = (gHoverIdx == idx);
+        if (hov) cv.FillRR(186.0f, y + 2.0f, 330.0f, 28.0f, 6.0f, kColCardAlt, 0.5f);
+        cv.Text(cv.fmtSmall_, bools[i].label, 192.0f, y + 1.0f, 270.0f, 31.0f,
+                bools[i].val ? kColText : kColMuted);
+        DrawAppleSwitch(cv, 478.0f, y + 7.5f, bools[i].val, hov);
+    }
+
+    // 左下：诊断与工具 (x=178, y=364, w=346, h=178)
+    cv.Card(178.0f, 364.0f, 346.0f, 178.0f);
+    cv.Text(cv.fmtTitle_, L"诊断与维护工具", 192.0f, 372.0f, 180.0f, 22.0f, kColText);
+
+    struct ToolItem { int col, row, act; const wchar_t* label; uint32_t fg; bool dim; };
+    const ToolItem tools[6] = {
+        {0, 0, ACT_COPY_DIAG,   L"复制诊断报告", kColBlueHi, false},
+        {1, 0, ACT_RESET_HIST,  L"重置历史波形", kColText,   false},
+        {0, 1, ACT_OPEN_LOGDIR, L"打开日志目录", kColText,   false},
+        {1, 1, ACT_OPEN_CSVDIR, L"打开 CSV 目录", kColText,  false},
+        {0, 2, ACT_ELEVATE,     gApp.isAdmin ? L"已是管理员" : L"以管理员重启",
+         gApp.isAdmin ? kColDim : kColOrange, gApp.isAdmin},
+        {1, 2, ACT_QUIT,        L"完全退出程序", kColRed,    false},
+    };
+    for (const auto& t : tools) {
+        float bx = 192.0f + t.col * 163.0f, by = 402.0f + t.row * 42.0f;
+        HitItem hi{H_ACTION, {bx, by, 155.0f, 34.0f}, t.act, 0, -1};
+        int idx = (int)gHits.size();
+        gHits.push_back(hi);
+        bool hov = !t.dim && (gHoverIdx == idx);
+        DrawQuietBtn(cv, hi, t.label, hov, false, t.fg);
+    }
+
+    // 右栏上半：便携打包与传感器健康状态 (x=534, y=56, w=352, h=340)
+    cv.Card(534.0f, 56.0f, 352.0f, 340.0f);
+    cv.Text(cv.fmtTitle_, L"便携打包与传感器状态", 548.0f, 62.0f, 220.0f, 22.0f, kColText);
+
+    float sy = 90.0f;
+    {
+        size_t b64 = 0, b32 = 0;
+        bool embedOk = HookEmbedInfo(&b64, &b32);
+        wchar_t embNote[96]{};
+        swprintf(embNote, 96, L"64位 %.0fKB + 32位 %.0fKB", b64 / 1024.0, b32 / 1024.0);
+        cv.FillRR(546.0f, sy, 328.0f, 29.0f, 6.0f, kColSurface);
+        cv.rt()->FillEllipse(D2D1::Ellipse(D2D1::Point2F(557.0f, sy + 14.5f), 3.0f, 3.0f),
+                             cv.br(embedOk ? kColGreen : kColOrange));
+        cv.Text(cv.fmtSmall_, L"单文件便携载荷", 566.0f, sy, 108.0f, 29.0f, kColText);
+        cv.Text(cv.fmtMicro_, embedOk ? embNote : L"未检测到内嵌载荷", 674.0f, sy, 190.0f, 29.0f,
+                kColMuted, DWRITE_TEXT_ALIGNMENT_TRAILING);
+        sy += 33.0f;
+    }
+
+    {
+        bool etwOn = np::Etw().active();
+        cv.FillRR(546.0f, sy, 328.0f, 29.0f, 6.0f, kColSurface);
+        cv.rt()->FillEllipse(D2D1::Ellipse(D2D1::Point2F(557.0f, sy + 14.5f), 3.0f, 3.0f),
+                             cv.br(etwOn ? kColGreen : kColOrange));
+        cv.Text(cv.fmtSmall_, L"ETW 内核呈现", 566.0f, sy, 104.0f, 29.0f, kColText);
+        std::wstring diag = np::Utf8ToWide(etwOn ? np::Etw().diagText() : np::Etw().status());
+        cv.Text(cv.fmtMicro_, diag, 670.0f, sy, 194.0f, 29.0f, kColMuted,
+                DWRITE_TEXT_ALIGNMENT_TRAILING);
+        sy += 33.0f;
+    }
+
+    const auto& srcs = gApp.hub.sources();
+    for (size_t i = 0; i < srcs.size() && sy < 368.0f; ++i) {
+        const auto& src = srcs[i];
+        cv.FillRR(546.0f, sy, 328.0f, 29.0f, 6.0f, kColSurface);
+        uint32_t dotCol = src.used ? kColGreen : (src.present ? kColBlueHi : kColDim);
+        cv.rt()->FillEllipse(D2D1::Ellipse(D2D1::Point2F(557.0f, sy + 14.5f), 3.0f, 3.0f),
+                             cv.br(dotCol));
+        std::wstring sname = np::Utf8ToWide(src.name);
+        if (sname == L"LibreHardwareMonitor") sname = L"LHM (WMI)";
+        std::wstring snote = np::Utf8ToWide(src.note);
+        cv.Text(cv.fmtSmall_, sname, 566.0f, sy, 108.0f, 29.0f,
+                src.used || src.present ? kColText : kColDim);
+        cv.Text(cv.fmtMicro_, snote, 674.0f, sy, 190.0f, 29.0f, kColMuted,
+                DWRITE_TEXT_ALIGNMENT_TRAILING);
+        sy += 33.0f;
+    }
+
+    // 右栏下半：全局快捷键 (x=534, y=406, w=352, h=136)
+    cv.Card(534.0f, 406.0f, 352.0f, 136.0f);
+    cv.Text(cv.fmtHead_, L"全局快捷键", 548.0f, 412.0f, 160.0f, 20.0f, kColText);
+    struct HkRow { const wchar_t* keys; const wchar_t* desc; };
+    const HkRow hks[5] = {
+        {L"Ctrl + Shift + O", L"显隐全部 HUD 叠加层"},
+        {L"Ctrl + Shift + B", L"启停 CSV 基准录制"},
+        {L"Ctrl + Shift + P", L"暂停或恢复后台监控"},
+        {L"Ctrl + Shift + R", L"重置实时监控曲线"},
+        {L"Ctrl + Shift + L", L"切换 Metal 竖版 / 横条"},
+    };
+    for (int i = 0; i < 5; ++i) {
+        float hy = 435.0f + i * 20.0f;
+        cv.FillRR(546.0f, hy + 1.0f, 110.0f, 17.0f, 4.0f, kColCardAlt);
+        cv.DrawRR(546.0f, hy + 1.0f, 110.0f, 17.0f, 4.0f, kColBorder);
+        cv.Text(cv.fmtMonoSm_, hks[i].keys, 550.0f, hy, 102.0f, 19.0f, kColText,
+                DWRITE_TEXT_ALIGNMENT_CENTER);
+        cv.Text(cv.fmtMicro_, hks[i].desc, 664.0f, hy, 212.0f, 19.0f, kColMuted);
+    }
+}
+
+static void RenderAll(HWND hwnd, HDC paintDc) {
+    RECT cr{};
+    GetClientRect(hwnd, &cr);
+    int pxW = std::max(1, (int)(cr.right - cr.left));
+    int pxH = std::max(1, (int)(cr.bottom - cr.top));
+    float scale = (float)pxW / (float)kWinW;
+    if (scale <= 0.1f) scale = 1.0f;
+
+    if (!gCanvas.Ensure(pxW, pxH)) return;
+    gHits.clear();
+
+    std::vector<GameEntry> gamesSnap;
+    {
+        AppLock lk;
+        gamesSnap = gApp.games;
+    }
+
+    ID2D1DCRenderTarget* rt = gCanvas.rt();
+    rt->BeginDraw();
+    rt->SetTransform(D2D1::Matrix3x2F::Scale(scale, scale));
+    rt->Clear(C(kColBg));
+
+    DrawHeaderAndSidebar(gCanvas, gamesSnap);
+    if (gActiveTab == 0) DrawTabOverview(gCanvas, gamesSnap);
+    else if (gActiveTab == 1) DrawTabAppearance(gCanvas);
+    else if (gActiveTab == 2) DrawTabCounters(gCanvas);
+    else DrawTabSystem(gCanvas);
+
+    HRESULT hr = rt->EndDraw();
+    if (hr == D2DERR_RECREATE_TARGET) {
+        gCanvas.ReleaseTarget();
+        return;
+    }
+    BitBlt(paintDc, 0, 0, pxW, pxH, gCanvas.hdc(), 0, 0, SRCCOPY);
+}
+
+static int HitTestLogical(float lx, float ly) {
+    for (int i = (int)gHits.size() - 1; i >= 0; --i) {
+        if (gHits[i].rc.contains(lx, ly)) return i;
+    }
+    return -1;
+}
+
+static void DoAction(int act) {
+    switch (act) {
+        case ACT_TOGGLE_MON:
+            gApp.monitoring = !gApp.monitoring;
+            if (gApp.monitoring) {
+                InjectorScanNow();
+                SetNotice("监控已启动", 0, 3000);
+            } else {
+                OverlaySetVisible(false);
+                SetNotice("监控已暂停", 0, 3000);
+            }
+            AppPublish();
+            break;
+        case ACT_TOGGLE_OV:
+            AppSetOverlayOff(AppOverlayVisible());
+            break;
+        case ACT_BENCH:
+            BenchmarkToggle();
+            break;
+        case ACT_SAVE:
+            SettingsSave();
+            SetNotice("配置与游戏列表已保存", 0, 4000);
+            break;
+        case ACT_MINIMIZE:
+            if (gMain) ShowWindow(gMain, SW_MINIMIZE);
+            break;
+        case ACT_CLOSE:
+            if (gMain) PostMessageW(gMain, WM_CLOSE, 0, 0);
+            break;
+        case ACT_FORGET_LEARNED: {
+            int n = ForgetLearned();
+            gSelGame = -1;
+            SetNotice("已清空学习名单（" + std::to_string(n) + " 条，对应钩子已请求卸载）", 0,
+                      6000);
+            break;
+        }
+        case ACT_ADD_GAME: {
             wchar_t path[MAX_PATH]{};
             OPENFILENAMEW ofn{};
             ofn.lStructSize = sizeof(ofn);
@@ -470,213 +1659,203 @@ static void DoAction(int action) {
             if (GetOpenFileNameW(&ofn)) {
                 GameEntry ge;
                 ge.path = path;
-                // 同步填 name（小写 exe 名）—— InjectorScanNow 现在按 name 匹配，
-                // 这里不填的话手动添加的条目只能靠 path 回退，容易和自动学习
-                // 的条目产生不一致。
+                std::wstring p = path;
+                size_t sl = p.find_last_of(L"\\/");
+                std::wstring nm = (sl == std::wstring::npos) ? p : p.substr(sl + 1);
+                for (auto& c : nm) c = (wchar_t)towlower(c);
+                ge.name = nm;
                 {
-                    std::wstring p = path;
-                    size_t sl = p.find_last_of(L"\\/");
-                    std::wstring nm = (sl == std::wstring::npos) ? p : p.substr(sl + 1);
-                    for (auto& c : nm) c = (wchar_t)towlower(c);
-                    ge.name = nm;
-                }
-                {
-                    // ★ 加锁：守护线程每 800ms 就遍历一次 gApp.games，
-                    //   这里 push_back 触发扩容会让它的迭代器变成野指针（会崩）。
                     AppLock lk;
                     gApp.games.push_back(ge);
                 }
+                SettingsSave();
                 SetNotice("已添加游戏：" + np::WideToUtf8(path), 0, 6000);
                 AppLog("add game: %ls", path);
-                SettingsSave();
             }
             break;
         }
-        case A_REMGAME:
-            if (gSelGame >= 0 && gSelGame < (int)gApp.games.size()) {
-                // ★ 同样走 ForgetGameAt：先卸载钩子再删条目（含落盘）
-                ForgetGameAt(gSelGame);
-                gSelGame = -1;
-            }
+        case ACT_SCAN_GAMES:
+            RequestScanGamesAsync();
             break;
-        case A_QUIT:
-            AppLog("quit from UI button");
-            PostMessageW(gMain, WM_COMMAND, NP_TRAY_EXIT, 0);
+        case ACT_INJECT_FRONT:
+            RequestInjectFrontAsync();
             break;
-        case A_ELEVATE:
-            if (AdminRelaunch()) {
-                SetNotice("已发起提权重启，本进程即将退出", 0, 4000);
-                PostMessageW(gMain, WM_COMMAND, NP_TRAY_EXIT, 0);
-            }
+        case ACT_COPY_DIAG:
+            AppCopyDiagToClipboard();
             break;
-        case A_LOGDIR: {
+        case ACT_RESET_HIST:
+            AppResetHistory();
+            break;
+        case ACT_OPEN_LOGDIR: {
             std::wstring p = AppLogPath();
             size_t s = p.find_last_of(L'\\');
             if (s != std::wstring::npos) p = p.substr(0, s);
-            AppLog("open log dir: %ls", p.c_str());
             ShellExecuteW(nullptr, L"open", p.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
-            SetNotice("日志目录：" + np::WideToUtf8(p) + "\\NextPerf.log 与 NextPerfHook.log", 0, 12000);
+            SetNotice("已打开日志目录：" + np::WideToUtf8(p), 0, 6000);
             break;
         }
-        case A_INJECTFRONT: {
-            // 语义是「注入到我刚才在玩的那个游戏」，所以**固定用记住的那个进程**。
-            //
-            // 原来先看 GetForegroundWindow、不是自己就用它 —— 两个问题：
-            //   1) 点按钮时前台通常就是 NextPerf 自己（这正是最初报的 bug）；
-            //   2) 更糟的是，如果前台是别的程序（终端、资源管理器、浏览器），
-            //      我们会真的往那个进程里注入。测试里就撞上了：前台是终端，
-            //      于是钩子被塞进了终端而不是游戏。
-            // 跟踪线程已经把「上一个不是自己的前台窗口」记在 gApp.forePid 里，
-            // 用户切到游戏的那一刻它就被记下了，用它既准确又不会误伤。
-            DWORD pid = gApp.forePid;
-
-            if (!pid) {
-                SetNotice("还没有可注入的目标：先切到游戏窗口，或「添加游戏 exe」让程序自动盯住它",
-                          1);
-                break;
+        case ACT_OPEN_CSVDIR: {
+            wchar_t tmp[MAX_PATH]{};
+            if (!GetTempPathW(MAX_PATH, tmp)) wcscpy_s(tmp, L".");
+            ShellExecuteW(nullptr, L"open", tmp, nullptr, nullptr, SW_SHOWNORMAL);
+            SetNotice("已打开 CSV 输出目录", 0, 5000);
+            break;
+        }
+        case ACT_ELEVATE:
+            if (!gApp.isAdmin && AdminRelaunch()) {
+                SetNotice("正在以管理员权限重启…", 0, 3000);
+                PostMessageW(gMain, WM_COMMAND, NP_TRAY_EXIT, 0);
             }
-            if (!ProcessAlive(pid)) {
-                gApp.forePid = 0;
-                gApp.foreName.clear();
-                SetNotice("上一个前台进程已经退出了，请重新切换到游戏窗口", 1);
-                break;
+            break;
+        case ACT_QUIT:
+            PostMessageW(gMain, WM_COMMAND, NP_TRAY_EXIT, 0);
+            break;
+        default: break;
+    }
+    if (gMain) InvalidateRect(gMain, nullptr, FALSE);
+}
+
+static void HandleHitClick(HWND hwnd, const HitItem& hi, float lx) {
+    switch (hi.kind) {
+        case H_NAV_TAB:
+            gActiveTab = hi.arg;
+            gHoverIdx = -1;
+            break;
+        case H_ACTION:
+            DoAction(hi.arg);
+            break;
+        case H_GAME_ROW:
+            gSelGame = hi.arg;
+            break;
+        case H_GAME_INJ: {
+            DWORD pid = 0;
+            bool injected = false;
+            {
+                AppLock lk;
+                if (hi.arg >= 0 && hi.arg < (int)gApp.games.size()) {
+                    pid = gApp.games[hi.arg].pid;
+                    injected = gApp.games[hi.arg].injected;
+                }
             }
-            std::wstring nm = ProcessExeName(pid);
-            if (nm.empty()) nm = L"(未知进程)";
-            InjectInto(pid);   // 成功/失败都会自己 SetNotice 并写日志
+            if (injected && pid) {
+                RequestHookDetach(pid);
+                SetNotice("已向该游戏下发卸载钩子指令", 0, 5000);
+            } else if (pid) {
+                RequestInjectPidAsync(pid);
+            }
             break;
         }
-        default:
+        case H_GAME_REM:
+            if (hi.arg >= 0) {
+                ForgetGameAt(hi.arg);
+                gSelGame = -1;
+            }
             break;
+        case H_PRESET:
+            if (hi.arg == 4) {
+                NPDefaultConfig(&gApp.cfg);
+                gApp.cfg.pauseHook = gApp.monitoring ? 0u : 1u;
+            } else {
+                gApp.cfg.counters = hi.bit;
+            }
+            AppPublish();
+            break;
+        case H_GROUP_HDR:
+            if (hi.arg >= 0 && hi.arg < kGroupN) {
+                gGrpOpen[hi.arg] = !gGrpOpen[hi.arg];
+                RebuildCounterRows();
+            }
+            break;
+        case H_COUNTER:
+            gApp.cfg.counters ^= hi.bit;
+            AppPublish();
+            break;
+        case H_LAYOUT_MODE:
+            NPConfigSetHorizontal(&gApp.cfg, hi.arg == 1);
+            AppPublish();
+            break;
+        case H_THEME:
+            NPConfigSetTheme(&gApp.cfg, (uint32_t)hi.arg);
+            AppPublish();
+            break;
+        case H_CORNER:
+            NPConfigSetCorner(&gApp.cfg, (uint32_t)hi.arg);
+            AppPublish();
+            break;
+        case H_OPT_BIT:
+            if (hi.arg == 0) NPConfigSetShowRange(&gApp.cfg, !NPConfigShowRange(gApp.cfg));
+            else if (hi.arg == 1) NPConfigSetShowHeader(&gApp.cfg, !NPConfigShowHeader(gApp.cfg));
+            AppPublish();
+            break;
+        case H_SLIDER:
+            gDraggingSlider = hi.sliderIdx;
+            SetCapture(hwnd);
+            UpdateSliderValue(hi.sliderIdx, lx);
+            break;
+        case H_SYS_CYCLE:
+            if (hi.arg == 0) {
+                gApp.cfg.overlayMode = (gApp.cfg.overlayMode + 1) % 4;
+            } else if (hi.arg == 1) {
+                static const uint32_t kPolls[] = {100, 250, 500, 1000};
+                uint32_t cur = gApp.cfg.pollMs ? gApp.cfg.pollMs : 500u;
+                int next = 0;
+                for (int i = 0; i < 4; ++i)
+                    if (kPolls[i] == cur) { next = (i + 1) % 4; break; }
+                gApp.cfg.pollMs = kPolls[next];
+            } else if (hi.arg == 2) {
+                static const uint32_t kHz[] = {10, 20, 30, 60};
+                uint32_t cur = gApp.cfg.updateHz ? gApp.cfg.updateHz : 20u;
+                int next = 0;
+                for (int i = 0; i < 4; ++i)
+                    if (kHz[i] == cur) { next = (i + 1) % 4; break; }
+                gApp.cfg.updateHz = kHz[next];
+            }
+            AppPublish();
+            break;
+        case H_SYS_TOGGLE:
+            if (hi.arg == 0) gApp.cfg.autoInject = gApp.cfg.autoInject ? 0u : 1u;
+            else if (hi.arg == 1) gApp.cfg.learnedAutoHook = gApp.cfg.learnedAutoHook ? 0u : 1u;
+            else if (hi.arg == 2) gApp.cfg.deepEngineHook = gApp.cfg.deepEngineHook ? 0u : 1u;
+            else if (hi.arg == 3) gApp.cfg.vtableProbe = gApp.cfg.vtableProbe ? 0u : 1u;
+            else if (hi.arg == 4) gApp.cfg.simulate = gApp.cfg.simulate ? 0u : 1u;
+            AppPublish();
+            break;
+        default: break;
     }
-    InvalidateRect(gMain, nullptr, FALSE);
-}
-
-// ---------------------------------------------------------------- 绘制
-static void DrawCounterList(HDC mem) {
-    static const COLORREF kHairline = RGB(0x1A, 0x1E, 0x24);
-    int drawn = 0;
-    for (size_t i = 0; i < gW.size(); ++i) {
-        Widget& wd = gW[i];
-        if (wd.type != W_CHECK && wd.type != W_GROUP) continue;
-        RECT rc{};
-        if (!VisibleRect(wd, (int)i, &rc)) continue;
-        if (wd.type == W_GROUP) {
-            // 组标题：白色半粗，左侧留少量空白
-            Txt(mem, gFontHead, wd.text.c_str(), rc.left + S(4), rc.top, wd.w - S(16), gRowH,
-                kText);
-            ++drawn;
-            continue;
-        }
-        bool on = (gApp.cfg.counters & wd.bit) != 0;
-        if (wd.hover) FillR(mem, rc.left, rc.top, wd.w, gRowH - 2, kPanel2, 3);
-        int cbx = rc.left + S(18), cby = rc.top + (gRowH - S(13)) / 2;
-        FillR(mem, cbx, cby, S(13), S(13), on ? kText : kBorder, 3);
-        if (on) {
-            HPEN p = CreatePen(PS_SOLID, 2, kBack);
-            HGDIOBJ op = SelectObject(mem, p);
-            MoveToEx(mem, cbx + S(3), cby + S(7), nullptr);
-            LineTo(mem, cbx + S(6), cby + S(10));
-            LineTo(mem, cbx + S(11), cby + S(3));
-            SelectObject(mem, op);
-            DeleteObject(p);
-        }
-        Txt(mem, gFontBody, wd.text.c_str(), rc.left + S(38), rc.top, S(300), gRowH,
-            on ? kText : kDim);
-        // 细分隔线，让长列表有层次
-        if (++drawn < gVisibleRows && rc.top + gRowH < gListTop + gVisibleRows * gRowH) {
-            HPEN p = CreatePen(PS_SOLID, 1, kHairline);
-            HGDIOBJ op = SelectObject(mem, p);
-            MoveToEx(mem, rc.left + S(38), rc.top + gRowH - 1, nullptr);
-            LineTo(mem, rc.left + wd.w - S(12), rc.top + gRowH - 1);
-            SelectObject(mem, op);
-            DeleteObject(p);
-        }
-    }
-
-    // 迷你滚动条
-    int maxScroll = std::max(1, gTotalRows - gVisibleRows);
-    int trackX = S(20) + S(460) - S(6);
-    int trackY = gListTop, trackH = gVisibleRows * gRowH;
-    FillR(mem, trackX, trackY, S(3), trackH, kPanel2, 2);
-    int thumbH = std::max(S(20), (int)(trackH * gVisibleRows / (float)gTotalRows));
-    int thumbY = trackY + (int)((trackH - thumbH) * (gScroll / (float)maxScroll));
-    FillR(mem, trackX, thumbY, S(3), thumbH, kDim, 2);
-}
-
-static void DrawGameList(HDC mem, int gameTop) {
-    Txt(mem, gFontHead, L"游戏进程（选择 exe 后自动注入钩子）", S(20), gameTop - S(24), S(460), S(20),
-        kText);
-    for (auto& wd : gW) {
-        if (wd.type != W_GAMEROW) continue;
-        int slot = wd.index;
-        if (slot < 0 || slot >= (int)gApp.games.size()) continue;
-        const GameEntry& ge = gApp.games[slot];
-        // 学习来的条目**只有 name、没有 path**（商店应用的 exe 在 WindowsApps 下，
-        // 普通用户读不了），所以 path 为空时要回退到 name —— 否则列表里显示空白
-        // （用户实测的 bug：自动学习的程序在列表里没名字）。
-        std::wstring name = ge.path.empty() ? ge.name : ge.path;
-        size_t p = name.find_last_of(L"\\/");
-        std::wstring short_ = (p == std::wstring::npos) ? name : name.substr(p + 1);
-        bool sel = (gSelGame == slot);
-        FillR(mem, wd.x, wd.y, wd.w, wd.h, sel ? kPanel2 : kPanel, 4);
-        if (sel) StrokeR(mem, wd.x, wd.y, wd.w, wd.h, kDim, 4);
-        Txt(mem, gFontBody, short_.c_str(), wd.x + S(10), wd.y, wd.w - S(150), wd.h, kText);
-
-        // 右侧状态：让用户一眼看出「为什么没数据」，而不是只看到「待注入」
-        const wchar_t* st = L"待注入";
-        if (ge.pid) {
-            const NPTelemetry& t = gApp.telemetry;
-            bool mine = (gApp.telemetryPid == ge.pid);
-            // ★ 不要在这里比较 tickMs（跨进程时钟，会算出垃圾值）。
-            //   主循环已按「帧计数是否增长」算好并存在 telemetryLive 里（审计发现 G3）。
-            bool live = t.attached && mine && gApp.telemetryLive;
-            if (live) st = L"● 读取中";
-            else if (ge.injected) {
-                // 注入成功但拿不到帧：把 API 摆出来，Vulkan/OpenGL 是设计边界
-                if (mine && t.gfxApi == NP_API_VULKAN) st = L"● Vulkan · 无帧数据";
-                else if (mine && t.gfxApi == NP_API_OPENGL) st = L"● OpenGL · 无帧数据";
-                else st = L"● 已注入 · 未接管";
-            } else st = L"● 运行中 · 注入失败";
-        }
-        Txt(mem, gFontBody, st, wd.x + wd.w - S(150), wd.y, S(140), wd.h,
-            (ge.pid && ge.injected) ? kText : kDim);
-    }
-    if (gApp.games.empty())
-        Txt(mem, gFontBody, L"（尚未添加游戏，点下方按钮选择 exe）", S(30), gameTop + S(2), S(400),
-            S(24), kDim);
-}
-
-static void DrawPreview(HDC mem, int boxX, int boxY, int boxW, int boxH) {
-    FillR(mem, boxX, boxY, boxW, boxH, kPanel, 6);
-    if (!gPrevOk || !gPrevBmp.dc()) {
-        Txt(mem, gFontBody, L"预览不可用", boxX, boxY, boxW, boxH, kDim, DT_CENTER | DT_VCENTER);
-        return;
-    }
-    int bw = gPrevBmp.width(), bh = gPrevBmp.height();
-    float fitW = (boxW - S(24)) / (float)bw;
-    float fitH = (boxH - S(16)) / (float)bh;
-    float fit = std::min(fitW, fitH);
-    if (fit > 1.0f) fit = 1.0f;                 // 只缩小不放大，避免糊
-    int dw = (int)(bw * fit), dh = (int)(bh * fit);
-    if (dw < 1 || dh < 1) return;
-    BLENDFUNCTION bf{};
-    bf.BlendOp = AC_SRC_OVER;
-    bf.SourceConstantAlpha = 255;
-    bf.AlphaFormat = AC_SRC_ALPHA;
-    AlphaBlend(mem, boxX + (boxW - dw) / 2, boxY + (boxH - dh) / 2, dw, dh, gPrevBmp.dc(), 0, 0, bw,
-               bh, bf);
+    InvalidateRect(hwnd, nullptr, FALSE);
 }
 
 static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     switch (m) {
         case WM_CREATE:
-            MakeFonts();
-            SetTimer(h, 1, 250, nullptr);
+            gPreviewPanel.Init();
+            RebuildCounterRows();
+            SetTimer(h, 2, 250, nullptr);
             return 0;
 
+        case WM_NCCALCSIZE:
+            if (w) return 0;
+            break;
+
+        case WM_NCACTIVATE:
+            if (!IsIconic(h)) return TRUE;
+            break;
+
+        case WM_NCHITTEST: {
+            POINT pt{GET_X_LPARAM(l), GET_Y_LPARAM(l)};
+            ScreenToClient(h, &pt);
+            float s = CurrentClientScale(h);
+            float lx = (float)pt.x / s, ly = (float)pt.y / s;
+            if (ly >= 0.0f && ly < kHeaderH && HitTestLogical(lx, ly) < 0) return HTCAPTION;
+            return HTCLIENT;
+        }
+
         case WM_TIMER:
-            UiRefresh();
+            if (w == 2) InvalidateRect(h, nullptr, FALSE);
+            return 0;
+
+        case WM_USER + 101:
+            InvalidateRect(h, nullptr, FALSE);
             return 0;
 
         case WM_ERASEBKGND:
@@ -686,176 +1865,97 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             UINT dpi = HIWORD(w);
             if (dpi) {
                 gS = dpi / 96.0f;
-                MakeFonts();
-                Layout();
+                if (const RECT* prc = reinterpret_cast<const RECT*>(l)) {
+                    SetWindowPos(h, nullptr, prc->left, prc->top, prc->right - prc->left,
+                                 prc->bottom - prc->top, SWP_NOZORDER | SWP_NOACTIVATE);
+                }
+                gCanvas.ReleaseTarget();
                 InvalidateRect(h, nullptr, FALSE);
             }
             return 0;
         }
 
         case WM_MOUSEMOVE: {
-            int mx = GET_X_LPARAM(l), my = GET_Y_LPARAM(l);
-            bool changed = false;
-            for (size_t i = 0; i < gW.size(); ++i) {
-                Widget& wd = gW[i];
-                RECT rc{};
-                bool hov = VisibleRect(wd, (int)i, &rc) && mx >= rc.left && mx < rc.right &&
-                           my >= rc.top && my < rc.bottom;
-                if (hov != wd.hover) { wd.hover = hov; changed = true; }
+            if (!gTrackingLeave) {
+                TRACKMOUSEEVENT tme{};
+                tme.cbSize = sizeof(tme);
+                tme.dwFlags = TME_LEAVE;
+                tme.hwndTrack = h;
+                if (TrackMouseEvent(&tme)) gTrackingLeave = true;
             }
-            if (gDragging >= 0 && gDragging < (int)gW.size()) {
-                Widget& wd = gW[gDragging];
-                // ★ 这里的 120/130 必须和 WM_PAINT 里画轨道用的 sx = wd.x + S(120)、
-                //   sw = wd.w - S(130) 完全一致。原来拖拽用的是 130/140，
-                //   于是滑块永远比鼠标偏 10 像素（拖到最右边也到不了 100%）。
-                float t = (float)(mx - (wd.x + S(120))) / (float)(wd.w - S(130));
-                t = std::clamp(t, 0.0f, 1.0f);
-                if (wd.type == W_SLIDER_F && wd.pFloat)
-                    *wd.pFloat = wd.fmin + (wd.fmax - wd.fmin) * t;
-                else if (wd.type == W_SLIDER_I && wd.pInt)
-                    *wd.pInt = wd.imin + (int)((wd.imax - wd.imin) * t + 0.5f);
-                changed = true;
+            float s = CurrentClientScale(h);
+            float lx = (float)GET_X_LPARAM(l) / s;
+            float ly = (float)GET_Y_LPARAM(l) / s;
+            if (gDraggingSlider >= 0) {
+                UpdateSliderValue(gDraggingSlider, lx);
+                InvalidateRect(h, nullptr, FALSE);
+                return 0;
             }
-            if (changed) InvalidateRect(h, nullptr, FALSE);
+            int hov = HitTestLogical(lx, ly);
+            if (hov != gHoverIdx) {
+                gHoverIdx = hov;
+                InvalidateRect(h, nullptr, FALSE);
+            }
             return 0;
         }
 
+        case WM_MOUSELEAVE:
+            gTrackingLeave = false;
+            if (gHoverIdx >= 0) {
+                gHoverIdx = -1;
+                InvalidateRect(h, nullptr, FALSE);
+            }
+            return 0;
+
         case WM_LBUTTONDOWN: {
-            int mx = GET_X_LPARAM(l), my = GET_Y_LPARAM(l);
-            Widget* wd = Hit(mx, my);
-            if (!wd) return 0;
-            if (wd->type == W_CHECK) {
-                gApp.cfg.counters ^= wd->bit;
-                InvalidateRect(h, nullptr, FALSE);
-            } else if (wd->type == W_CYCLE && wd->pCycle) {
-                int n = (int)wd->opts.size();
-                if (n) {
-                    int cur = 0;
-                    for (int k = 0; k < n; ++k)
-                        if (wd->vals.empty() ? (k == *wd->pCycle) : (wd->vals[k] == *wd->pCycle))
-                            cur = k;
-                    int nxt = (cur + 1) % n;
-                    *wd->pCycle = wd->vals.empty() ? nxt : wd->vals[nxt];
-                }
-                InvalidateRect(h, nullptr, FALSE);
-            } else if (wd->type == W_SLIDER_F || wd->type == W_SLIDER_I) {
-                gDragging = (int)(wd - &gW[0]);
-                InvalidateRect(h, nullptr, FALSE);
-            } else if (wd->type == W_GAMEROW) {
-                gSelGame = wd->index;
-                InvalidateRect(h, nullptr, FALSE);
-            } else if (wd->type == W_BUTTON) {
-                DoAction(wd->action);
+            float s = CurrentClientScale(h);
+            float lx = (float)GET_X_LPARAM(l) / s;
+            float ly = (float)GET_Y_LPARAM(l) / s;
+            int idx = HitTestLogical(lx, ly);
+            if (idx >= 0 && idx < (int)gHits.size()) {
+                HandleHitClick(h, gHits[idx], lx);
             }
             return 0;
         }
 
         case WM_LBUTTONUP:
-            gDragging = -1;
+            if (gDraggingSlider >= 0) {
+                gDraggingSlider = -1;
+                ReleaseCapture();
+                InvalidateRect(h, nullptr, FALSE);
+            }
+            return 0;
+
+        case WM_CAPTURECHANGED:
+            gDraggingSlider = -1;
             return 0;
 
         case WM_MOUSEWHEEL: {
             int delta = GET_WHEEL_DELTA_WPARAM(w);
-            gScroll -= delta / (int)(60 * gS + 1);
-            int maxScroll = std::max(0, gTotalRows - gVisibleRows);
-            gScroll = std::clamp(gScroll, 0, maxScroll);
-            InvalidateRect(h, nullptr, FALSE);
+            int step = (delta > 0) ? -1 : 1;
+            if (gActiveTab == 0) {
+                size_t nGames = 0;
+                { AppLock lk; nGames = gApp.games.size(); }
+                int maxGs = std::max(0, (int)nGames - 6);
+                gGameScroll = std::clamp(gGameScroll + step, 0, maxGs);
+                InvalidateRect(h, nullptr, FALSE);
+            } else if (gActiveTab == 2) {
+                int maxCs = std::max(0, gCounterTotalRows - 11);
+                gCounterScroll = std::clamp(gCounterScroll + step, 0, maxCs);
+                InvalidateRect(h, nullptr, FALSE);
+            }
             return 0;
         }
 
         case WM_PAINT: {
             PAINTSTRUCT ps{};
             HDC hdc = BeginPaint(h, &ps);
-            RECT cr{};
-            GetClientRect(h, &cr);
-            HDC mem = CreateCompatibleDC(hdc);
-            HBITMAP dib = CreateCompatibleBitmap(hdc, cr.right, cr.bottom);
-            HGDIOBJ old = SelectObject(mem, dib);
-
-            HBRUSH back = CreateSolidBrush(kBack);
-            FillRect(mem, &cr, back);
-            DeleteObject(back);
-
-            const int LX = S(20);
-            const int RX = S(500), RW = S(480);
-            const int gameTop = gListTop + S(kListH) + S(16);
-
-            Txt(mem, gFontHead, L"显示项目", LX, S(14), S(200), S(20), kText);
-            Txt(mem, gFontSmall, L"滚轮滚动", LX + S(200), S(16), S(120), S(18), kDim);
-            DrawCounterList(mem);
-            DrawGameList(mem, gameTop);
-
-            Txt(mem, gFontHead, L"叠加预览", RX, S(14), S(200), S(20), kText);
-            DrawPreview(mem, RX, S(40), RW, S(200));
-
-            // 分区标题按控件实际位置算，避免和滑杆/下拉框重叠
-            int firstSliderY = 1 << 30, firstCycleY = 1 << 30;
-            for (auto& wd : gW) {
-                if (wd.type == W_SLIDER_F || wd.type == W_SLIDER_I)
-                    firstSliderY = std::min(firstSliderY, wd.y);
-                else if (wd.type == W_CYCLE)
-                    firstCycleY = std::min(firstCycleY, wd.y);
-            }
-            Txt(mem, gFontHead, L"外观", RX, firstSliderY - S(26), S(200), S(20), kText);
-            if (firstCycleY < (1 << 30))
-                Txt(mem, gFontHead, L"行为", RX, firstCycleY - S(26), S(200), S(20), kText);
-
-            for (auto& wd : gW) {
-                if (wd.type == W_CHECK || wd.type == W_GAMEROW) continue;
-                if (wd.type == W_BUTTON) {
-                    FillR(mem, wd.x, wd.y, wd.w, wd.h, wd.hover ? kPanel2 : kPanel, 5);
-                    StrokeR(mem, wd.x, wd.y, wd.w, wd.h, kBorder, 5);
-                    Txt(mem, gFontBody, wd.text.c_str(), wd.x, wd.y, wd.w, wd.h, kText, DT_CENTER);
-                } else if (wd.type == W_CYCLE) {
-                    FillR(mem, wd.x, wd.y, wd.w, wd.h, wd.hover ? kPanel2 : kPanel, 5);
-                    StrokeR(mem, wd.x, wd.y, wd.w, wd.h, kBorder, 5);
-                    int idx = 0;
-                    if (wd.pCycle) {
-                        int n = (int)wd.opts.size();
-                        for (int k = 0; k < n; ++k)
-                            if (wd.vals.empty() ? (k == *wd.pCycle) : (wd.vals[k] == *wd.pCycle))
-                                idx = k;
-                    }
-                    std::wstring v = (idx < (int)wd.opts.size()) ? wd.opts[idx] : L"-";
-                    std::wstring line = wd.text + L"  " + v;
-                    Txt(mem, gFontBody, line.c_str(), wd.x + S(10), wd.y, wd.w - S(20), wd.h,
-                        kText);
-                } else if (wd.type == W_SLIDER_F || wd.type == W_SLIDER_I) {
-                    int sx = wd.x + S(120), sw = wd.w - S(130);
-                    wchar_t val[32];
-                    float t = 0;
-                    if (wd.type == W_SLIDER_F && wd.pFloat) {
-                        t = (*wd.pFloat - wd.fmin) / (wd.fmax - wd.fmin);
-                        swprintf(val, 32, L"%.2f", *wd.pFloat);
-                    } else if (wd.type == W_SLIDER_I && wd.pInt) {
-                        t = (float)(*wd.pInt - wd.imin) / (float)(wd.imax - wd.imin);
-                        swprintf(val, 32, L"%d", *wd.pInt);
-                    }
-                    t = std::clamp(t, 0.0f, 1.0f);
-                    Txt(mem, gFontBody, wd.text.c_str(), wd.x, wd.y, S(115), wd.h, kDim);
-                    Txt(mem, gFontBody, val, wd.x + S(60), wd.y, S(56), wd.h, kText, DT_RIGHT);
-                    int sy = wd.y + wd.h / 2 - S(2);
-                    FillR(mem, sx, sy, sw, S(4), kBorder, 2);
-                    FillR(mem, sx, sy, (int)(sw * t), S(4), kText, 2);
-                    FillR(mem, sx + (int)(sw * t) - S(4), wd.y + wd.h / 2 - S(6), S(8), S(12),
-                          kText, 4);
-                }
-            }
-
-            std::wstring st = np::Utf8ToWide(gApp.statusText);
-            Txt(mem, gFontBody, st.c_str(), S(20), S(658), S(460), S(22), kDim);
-
-            BitBlt(hdc, 0, 0, cr.right, cr.bottom, mem, 0, 0, SRCCOPY);
-            SelectObject(mem, old);
-            DeleteObject(dib);
-            DeleteDC(mem);
+            RenderAll(h, hdc);
             EndPaint(h, &ps);
             return 0;
         }
 
         case WM_CLOSE:
-            // 托盘图标没注册成功时，「缩到托盘」就等于让用户再也找不到程序
-            // （用户反馈：退出只能进任务管理器）。那种情况下关闭 = 真退出。
             if (!TrayAvailable()) {
                 PostMessageW(h, WM_COMMAND, NP_TRAY_EXIT, 0);
                 return 0;
@@ -868,7 +1968,6 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             return 0;
 
         case WM_COMMAND:
-            // lParam==0 表示来自托盘菜单（TrackPopupMenu 模态循环直接派发到这里）
             if (l == 0) {
                 AppTrayCommand(LOWORD(w));
                 return 0;
@@ -876,19 +1975,24 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             break;
 
         case WM_DESTROY:
+            KillTimer(h, 2);
             PostQuitMessage(0);
             return 0;
     }
     return DefWindowProcW(h, m, w, l);
 }
 
+}  // namespace
+
 bool UiCreate(HINSTANCE inst, int cmdShow) {
     gInst = inst;
+    gActiveTab = 0;
+    gHoverIdx = -1;
+    gDraggingSlider = -1;
 
-    // DPI：不开启的话整张窗口会被系统拉伸，文字发虚
     HDC scr = GetDC(nullptr);
-    UINT dpi = (UINT)GetDeviceCaps(scr, LOGPIXELSX);
-    ReleaseDC(nullptr, scr);
+    UINT dpi = scr ? (UINT)GetDeviceCaps(scr, LOGPIXELSX) : 96u;
+    if (scr) ReleaseDC(nullptr, scr);
     gS = dpi / 96.0f;
     if (gS <= 0.0f) gS = 1.0f;
 
@@ -897,25 +2001,21 @@ bool UiCreate(HINSTANCE inst, int cmdShow) {
     wc.lpfnWndProc = MainProc;
     wc.hInstance = inst;
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    wc.hbrBackground = CreateSolidBrush(kBack);
+    wc.hbrBackground = CreateSolidBrush(RGB(0x14, 0x14, 0x16));
     wc.lpszClassName = L"NextPerfMainCls";
     RegisterClassExW(&wc);
 
     gMain = CreateWindowExW(0, L"NextPerfMainCls",
                             (L"NextPerf  [" + BuildStamp() + L"]").c_str(),
                             WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-                            CW_USEDEFAULT, CW_USEDEFAULT, S(kWinW), S(kWinH), nullptr, nullptr,
-                            inst, nullptr);
+                            CW_USEDEFAULT, CW_USEDEFAULT, S(kWinW), S(kWinH),
+                            nullptr, nullptr, inst, nullptr);
     if (!gMain) return false;
 
-    RECT cr{}, wr{};
-    GetClientRect(gMain, &cr);
-    GetWindowRect(gMain, &wr);
-    int fw = (wr.right - wr.left) - (cr.right - cr.left);
-    int fh = (wr.bottom - wr.top) - (cr.bottom - cr.top);
-    SetWindowPos(gMain, nullptr, 0, 0, S(kWinW) + fw, S(kWinH) + fh, SWP_NOMOVE | SWP_NOZORDER);
+    ApplyDarkFrame(gMain);
+    SetWindowPos(gMain, nullptr, 0, 0, S(kWinW), S(kWinH),
+                 SWP_NOMOVE | SWP_NOZORDER | SWP_FRAMECHANGED);
 
-    Layout();
     ShowWindow(gMain, cmdShow);
     UpdateWindow(gMain);
     return true;
@@ -924,17 +2024,19 @@ bool UiCreate(HINSTANCE inst, int cmdShow) {
 HWND UiWindow() { return gMain; }
 
 void UiDestroy() {
-    gPrevBmp.Release();
-    gPrevPanel.Shutdown();
-    ReleaseFonts();
+    if (gMain) {
+        DestroyWindow(gMain);
+        gMain = nullptr;
+    }
+    gPreviewPanel.Shutdown();
+    gCanvas.Shutdown();
 }
 
 void UiRefresh() {
     static uint64_t last = 0;
     uint64_t now = GetTickCount64();
-    if (now - last < 200) return;
+    if (now - last < 120) return;
     last = now;
-    RenderPreview();
     if (gMain) InvalidateRect(gMain, nullptr, FALSE);
 }
 

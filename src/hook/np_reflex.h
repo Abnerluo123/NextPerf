@@ -82,6 +82,15 @@ public:
 
     bool ok() const { return getLatency_ != nullptr; }
 
+    void Shutdown() {
+        getLatency_ = nullptr;
+        getSleepStatus_ = nullptr;
+        if (dll_) {
+            FreeLibrary(dll_);
+            dll_ = nullptr;
+        }
+    }
+
     // 取最近一帧的报告。dev 是 D3D 设备（ID3D11Device*/ID3D12Device*）。
     // 返回 false = 这次没拿到有效数据（游戏没用 Reflex / 调用失败）。
     bool Poll(void* dev, NVFrameReport* out) {

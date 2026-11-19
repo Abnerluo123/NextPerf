@@ -84,8 +84,11 @@ if errorlevel 1 (
 )
 
 del /Q "%HERE%*.pdb" "%HERE%*.lib" "%HERE%*.obj" >nul 2>&1
+if not exist "%ROOT%\dist" mkdir "%ROOT%\dist"
+copy /Y "%HERE%sim.exe" "%ROOT%\dist\NextPerfBench.exe" >nul
 echo.
 echo OK: %HERE%sim.exe
+echo OK: %ROOT%\dist\NextPerfBench.exe
 echo.
 echo try:
 echo   "%HERE%sim.exe" --help

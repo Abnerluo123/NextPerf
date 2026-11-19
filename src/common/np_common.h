@@ -94,6 +94,8 @@ enum NP_COUNTER : uint64_t {
     // 所以默认不显示（用户要求：保留但默认关）。想看得去界面上勾。
     NP_C_CPU_BUSY     = 1ull << 33,
     NP_C_CPU_WAIT     = 1ull << 34,
+    NP_C_BOTTLENECK   = 1ull << 35,  // 实时瓶颈诊断（GPU/CPU/帧率受限）
+    NP_C_CLOCK_TIME   = 1ull << 36,  // 系统当前时间 HH:MM:SS
 };
 
 #define NP_ALL_COUNTERS                                                        \
@@ -101,8 +103,17 @@ enum NP_COUNTER : uint64_t {
      NP_C_GPU_FRAME | NP_C_CPU_USAGE | NP_C_CPU_TEMP | NP_C_GPU_USAGE |        \
      NP_C_GPU_TEMP | NP_C_GPU_POWER | NP_C_GPU_CLOCK | NP_C_VRAM | NP_C_RAM |  \
      NP_C_RT | NP_C_TENSOR | NP_C_RESOLUTION | NP_C_API | NP_C_GRAPH |         \
-     NP_C_CHART_USAGE | NP_C_CHART_FPS | NP_C_CHART_LATENCY |               \
-     NP_C_CPU_CLOCK | NP_C_CPU_POWER)
+     NP_C_CPU_CLOCK | NP_C_CPU_POWER | NP_C_BOTTLENECK | NP_C_GPU_NAME)
+
+// 四档监控项目预设（落在 53 位 double 精确范围内，可安全 JSON 序列化）
+#define NP_PRESET_MINIMAL                                                      \
+    (NP_C_FPS | NP_C_FRAMETIME | NP_C_GPU_FRAME | NP_C_VRAM | NP_C_RAM |       \
+     NP_C_GRAPH | NP_C_RESOLUTION | NP_C_GPU_NAME)
+#define NP_PRESET_STANDARD NP_ALL_COUNTERS
+#define NP_PRESET_TUNING                                                       \
+    (NP_ALL_COUNTERS | NP_C_CPU_BUSY | NP_C_CPU_WAIT | NP_C_GPU_HOTSPOT |      \
+     NP_C_GPU_FB | NP_C_GPU_VID | NP_C_GPU_BUS | NP_C_DRAWS | NP_C_AI_MODULES)
+#define NP_PRESET_FULL ((1ull << 37) - 1ull)
 
 // ---------------------------------------------------------------- 图形 API
 enum NP_GFXAPI : uint32_t {
@@ -170,9 +181,9 @@ struct NPConfig {
 
     // 行为
     uint32_t graphHeight;
-    uint32_t overlayMode;   // 0=自动(优先游戏内) 1=强制游戏内 2=强制桌面叠加
-    uint32_t fpsCap;        // 参考帧率上限（图表 Y 轴），0=自动
-    uint32_t pollMs;        // 传感器轮询间隔
+    uint32_t overlayMode;   // 0=自动(优先游戏内) 1=强制游戏内 2=强制桌面叠加 3=隐藏全部叠加(运行时)
+    uint32_t fpsCap;        // 叠加外观位域：bits0..1=角落 bits2..3=主题(0Metal黑/1液态暗灰/2浅雾/3极简纯字) bit4=极值区间 bit5=顶栏 bit6=横向条
+    uint32_t pollMs;        // 传感器轮询间隔 (ms)
     uint32_t updateHz;      // 叠加刷新率限制
     uint32_t deepEngineHook;// 1=启用深度引擎钩子（命令列表级，实验性）
     uint32_t vtableProbe;   // 1=注入后自己造一条临时交换链去拿 Present 的 vtable
@@ -199,6 +210,9 @@ struct NPConfig {
     uint32_t detachPid;
     uint32_t reserved[4];
 };
+#ifdef __cplusplus
+static_assert(sizeof(NPConfig) == 136, "NPConfig size changed; update reserved[] and struct_check.py");
+#endif
 
 // ---------------------------------------------------------------------------
 // ETW 中继（2026-10-11）：主程序把**显示侧**的帧数据放进 NPConfig.reserved[]，
@@ -230,6 +244,38 @@ inline bool NPConfigGetEtwRelay(const NPConfig* c, uint32_t nowMs,
     *low01 = b.f;
     *frameMs = d.f;
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// NPConfig::fpsCap 零 ABI 扩展标志访问器（保持 sizeof(NPConfig) == 136 不变）
+//   bits 0..1 : 屏幕角落 (0=右上 1=左上 2=右下 3=左下)
+//   bits 2..3 : HUD 主题 (0=Metal黑 1=液态暗灰 2=浅雾透明 3=极简纯字)
+//   bit  4    : 是否显示 [min max] 区间列
+//   bit  5    : 是否显示 2 行设备顶栏
+//   bit  6    : 布局模式 (0=Metal 竖版面板 1=横向极简单行条)
+// ---------------------------------------------------------------------------
+inline uint32_t NPConfigCorner(const NPConfig& c) { return c.fpsCap & 3u; }
+inline void NPConfigSetCorner(NPConfig* c, uint32_t v) {
+    c->fpsCap = (c->fpsCap & ~3u) | (v & 3u);
+}
+inline uint32_t NPConfigTheme(const NPConfig& c) { return (c.fpsCap >> 2) & 3u; }
+inline void NPConfigSetTheme(NPConfig* c, uint32_t v) {
+    c->fpsCap = (c->fpsCap & ~(3u << 2)) | ((v & 3u) << 2);
+}
+inline bool NPConfigShowRange(const NPConfig& c) { return (c.fpsCap & (1u << 4)) != 0; }
+inline void NPConfigSetShowRange(NPConfig* c, bool v) {
+    if (v) c->fpsCap |= (1u << 4);
+    else c->fpsCap &= ~(1u << 4);
+}
+inline bool NPConfigShowHeader(const NPConfig& c) { return (c.fpsCap & (1u << 5)) != 0; }
+inline void NPConfigSetShowHeader(NPConfig* c, bool v) {
+    if (v) c->fpsCap |= (1u << 5);
+    else c->fpsCap &= ~(1u << 5);
+}
+inline bool NPConfigHorizontal(const NPConfig& c) { return (c.fpsCap & (1u << 6)) != 0; }
+inline void NPConfigSetHorizontal(NPConfig* c, bool v) {
+    if (v) c->fpsCap |= (1u << 6);
+    else c->fpsCap &= ~(1u << 6);
 }
 
 // 历史采样环形缓冲：图表曲线的数据源。
@@ -330,6 +376,9 @@ struct NPSensors {
     uint32_t sources;       // 实际生效的数据源（NP_SENSOR_SRC 位组合）
     char     sourceText[NP_NAME_LEN];  // 例如 "NVML+NVAPI | CPU:PDH | 温度:HWiNFO"
 };
+#ifdef __cplusplus
+static_assert(sizeof(NPSensors) == 448, "NPSensors size changed; update struct_check.py");
+#endif
 
 // ---------------------------------------------------------------- 遥测块
 struct NPTelemetry {
@@ -417,6 +466,9 @@ struct NPTelemetry {
     uint32_t hookFlags;     // 见 NP_HOOK_*
     char     lastError[NP_NAME_LEN];
 };
+#ifdef __cplusplus
+static_assert(sizeof(NPTelemetry) == 55736, "NPTelemetry size changed; update struct_check.py");
+#endif
 
 enum NP_HOOK_FLAG : uint32_t {
     NP_HOOK_PRESENT    = 1u << 0,
@@ -453,20 +505,24 @@ inline void NPDefaultConfig(NPConfig* c) {
     c->warnColor = 0xFFFF6B5Bu;
     c->scale = 1.0f;
     c->opacity = 1.0f;
-    c->bgOpacity = 0.72f;
+    c->bgOpacity = 0.82f;
     c->textOpacity = 1.0f;
     c->offsetX = 16;
     c->offsetY = 16;
-    c->fontHeight = 15;
-    c->graphHeight = 64;
+    c->fontHeight = 13;
+    c->graphHeight = 46;
     c->overlayMode = 0;
-    c->fpsCap = 0;
+    c->fpsCap = (1u << 4) | (1u << 5);   // 右上角 + Metal黑 + 显示[min max]区间 + 显示设备顶栏
     c->pollMs = 500;
     c->updateHz = 20;
     c->deepEngineHook = 1;
     c->vtableProbe = 1;
     c->quit = 0;
     c->simulate = 0;
+    c->autoInject = 0;
+    c->pauseHook = 0;
+    c->learnedAutoHook = 0;
+    c->detachPid = 0;
     // ★ 必须**跟着数组实际大小**清，不能写死数字。
     //   这里曾经是 `for (int i = 0; i < 8; ++i)`，而 reserved 已被逐步
     //   缩小到 [4]（为 autoInject / lowStrict / pauseHook / learnedAutoHook /

@@ -377,32 +377,22 @@ bool CpuFreqFromPowerInfo(double* mhzOut);    // :643
 3. 动态加载让"没有 powrprof.dll 的环境"（理论上不存在，但保持零外部依赖的项目风格）能优雅降级：
    `fn == nullptr` 就直接走 PDH 回退，不崩。
 
-**回退路径（`:709-714`）**
+**回退路径（`SensorHub::PollCpu`）**：
 
 ```cpp
-} else if (pdh_.SumWhere(L"Processor Information", L"_Total", &perfFreq) &&
-           cpuBaseMHz_ > 0 && perfFreq > 0) {
-    out.cpuClock = (float)(cpuBaseMHz_ * perfFreq / 100.0);
-    cpuFreqFromNt_ = false;
+// 注册表/PDH 动态标称频率：先读 \Processor Information(*)\Processor Frequency（pdhNominalMHz_），
+// 依次回退 cpuBaseMHz_ 与 2300.0，再乘 % Processor Performance 换算实际 MHz
+if (pdhNominalMHz_ <= 0.0) {
+    double nom = 0.0;
+    if (pdh_.MaxStarCounter(L"\\Processor Information(*)\\Processor Frequency", L"", L"", &nom) &&
+        nom > 100.0 && nom < 8000.0)
+        pdhNominalMHz_ = nom;
 }
+double nominalMHz = (pdhNominalMHz_ > 100.0) ? pdhNominalMHz_
+                                            : ((cpuBaseMHz_ > 100.0) ? cpuBaseMHz_ : 2300.0);
 ```
 
-**本机实测（本次核对）**
-
-* `CallNtPowerInformation(11)` 返回 **0（成功）**，24 个逻辑处理器 × 24 字节 = 576 字节缓冲区；
-  core 0 = 2700 MHz、core 2 = 2100 MHz（当时空闲）、最高核 2700 MHz、平均 2300 MHz。
-* 故意给 48 字节缓冲区 → 返回 **0xC0000023**，确认"失败时不是长度"。
-* 注册表 `~MHz` = **3072**；PDH `\Processor Information(_Total)\Processor Frequency` = **2300**；
-  `% Processor Performance`(`_Total`) = **154% ~ 165%**（两次采样）；`_Total` 实例存在（typeperf 原始路径确认）。
-
-> **口径不一致（本次核对发现）**：回退公式用的是 `cpuBaseMHz_`（注册表 **3072**），
-> 而 `% Processor Performance` 是相对 PDH 自己的标称频率（**2300**）算的百分比，
-> 两者不是同一个基准。于是 3072 × 1.65 ≈ **5070 MHz**，比同时刻 `CallNtPowerInformation`
-> 报的最高核 2700 MHz 高出一大截（约 1.34 倍的系统性偏高来自 3072/2300）。
-> 而 `np_sensors.h:153-155` 的注释写的是"回退到 PDH 路径时读数**可能系统性偏低**"——
-> **与本机实测方向相反**。另外 `np_sensors.cpp:625-626` 注释里的算式（2300 × 141% => 3259MHz）
-> 用的是 PDH 标称值，与代码实际用的注册表值也不是同一个数。
-> 结论：**主路径可用，回退路径口径存疑**；要么统一基准，要么干脆去掉回退（留 `-1`）。
+注：早期硬编码 `kNominalMHz = 2300.0` 及注册表中 `cpuBaseMHz_`（3072）与 PDH 标称值（2300）口径不一致的问题已由 `pdhNominalMHz_` 解决；同时已移除从未使用过的 `\Thermal Zone Information(*)\Temperature` 计数器注册。
 
 ### 3.2 CPU 功耗：PDH `Energy Meter`（EMI / Intel RAPL）
 
@@ -922,7 +912,7 @@ PresentMon / RTSS 这类成熟软件的做法是订阅 `Microsoft-Windows-DxgKrn
 
 | 位置 | 状态 |
 | --- | --- |
-| `\Thermal Zone Information(*)\Temperature`（`np_sensors.cpp:512`） | 注册进 PDH 查询，**全仓没有任何读取点** |
+| `\Thermal Zone Information(*)\Temperature` | ✅ **已从 `SensorHub::Init()` 移除**（全仓无读取点；改用 `\Processor Information(*)\Processor Frequency` 与 `pdhNominalMHz_` 供 CPU 频率换算） |
 | `PdhQuery::RefreshWildcard`（`:151`） | 实现完整，**无调用方**（已被星号计数器取代） |
 | `PdhQuery::SumWhere2`（`:230`）、`SumInstance`（`:247`）、`MaxWhere`（`:348`） | 实现完整，**无调用方** |
 | `SensorHub::SetOverride` / `overrideMask`（`np_sensors.h:115-116`） | 「手动指定优先数据源」**没接线**，`override_` 全程无人读 |
@@ -941,14 +931,24 @@ PresentMon / RTSS 这类成熟软件的做法是订阅 `Microsoft-Windows-DxgKrn
 | --- | --- |
 | `docs/ARCHITECTURE.md:205-208` | 还写着「**为什么不用 ETW**」的旧结论；实际 `src/etw/` 已落地并从 `main.cpp:982` 启动 |
 | `np_sensors.h:55` | 「本地展开出来的路径不带 `\\计算机名` 前缀」——**与实测相反**（`PdhExpandCounterPathW` 返回带 `\\MSI\` 前缀） |
-| `np_sensors.h:153-155` | 「回退到 PDH 路径读数可能**系统性偏低**」——本机实测是**偏高**（注册表 3072 vs PDH 标称 2300） |
-| `np_sensors.cpp:625-626` | 注释的算式用 PDH 标称 2300，而代码用的是注册表 `cpuBaseMHz_`(3072)，口径不一致 |
+| `pdhNominalMHz_` / PDH 标称频率 | 已改用 `\Processor Information(*)\Processor Frequency`（`pdhNominalMHz_`）配合 `% Processor Performance`，消除硬编码 `2300.0` |
 | `README.md:216` 与 `README.md:411` | 数据源优先级两处写法不同（`NVML → NVAPI → ADL → PDH → WMI → HWiNFO` vs `厂商 SDK > 共享内存 > PDH > WMI`），且都不是逐指标的精确顺序 → 以本文第 4 节为准 |
 | `README.md:403-409` | 没有列出 ETW 与 `CallNtPowerInformation` 两个源 |
 | `docs/CODE-REVIEW-2026-10-09.md:131` | VRAM 求和口径列为「未确认/未修」（见 P6/未确认清单），至今仍未定论 |
 | `docs/CATALOG.md` §3.4 | 那三个文件的行数曾是旧值（`~917 / 131`、`~294 / 216`、`~281 / 78`）—— ✅ **2026-10-11 已按 LF 真行数更正**（`1132 / 199`、`342 / 270`、`339 / 121`） |
 
 ---
+
+> **维护说明**：本文后续增量记录仅引用文件名与符号名（函数/类/结构体/字段名），不再引入易漂移的源码行号。
+
+### 最新修复与增强（传感器层 + ETW 层）
+
+| 模块 | 符号 | 修复 / 改进内容 |
+| --- | --- | --- |
+| NVAPI 厂商定义 (`src/sensors/np_vendor.h`, `np_vendor.cpp`) | `NP_MAKE_NVAPI_VERSION`、`NvAPI_QueryInterface_t`、`NV_GPU_DYNAMIC_PSTATES_INFO_EX`、`NvapiApi::Load` | 修正版本宏高低 16 位布局、`QueryInterface` 返回类型改为 `void*`；对齐 `NV_GPU_DYNAMIC_PSTATES_INFO_EX` 为 72 字节真实驱动布局（含 `flags` 与 `{ presentFlags, percentage }[8]`），并暴露 `loadErr` 诊断状态 |
+| HWiNFO 共享内存 (`src/sensors/np_vendor.h`, `np_vendor.cpp`) | `NpHwinfoHeader`、`HwinfoCtx::Open` / `RefreshUnsafe`、`NpSehHandler` | 结构体按 `#pragma pack(1)` 精确为 44 字节，放宽版本下限并钳位传感器/读数计数；`Open` 失败释放句柄；VEH 过滤仅兜住内存致命异常 |
+| 传感器采集 (`src/sensors/np_sensors.h`, `np_sensors.cpp`) | `SensorHub::Init` / `Poll` / `PollGameGpu` / `PollCpu` / `EnsureLhmPolled` / `EnsureAcpiPolled` | 移除每轮重复 `pdh_.Collect()`（`PollGameGpu` 限流 `>=80ms`）；WMI 查询（LHM 与 ACPI）改为 1s 刷新 / 30s 退避缓存；DXGI 优先选用非软件渲染且专用显存最大的适配器；防护 `PollCpu()` `uint64_t` 下溢，CPU 功耗改用时间自适应 EMA 成员变量；允许无 NVML 时回退 NVAPI 并回填 `domVid`；PDH 显存回退改用 `MaxStarCounter`；支持 HWiNFO 重连与实时 `UpdateSourceUsed`（含 `NP_SRC_LHM`） |
+| ETW 内核监听 (`src/etw/np_etw.cpp`) | `EtwMonitor::Start` / `Stop` / `ConsumeLoop` / `OnEvent` / `SetTargetPid` | `ERROR_ALREADY_EXISTS` 停掉旧会话后重填 `EVENT_TRACE_PROPERTIES` 再启；保留未过滤警告状态；`ConsumeLoop` 与 `Stop` 在锁内互斥摘出并关闭 `consumer_`；184->171 事件切换时重置基线；`SetTargetPid` 清零 `diagSeenN_` |
 
 ## 7. 给未来的自己 / 其他迭代者的叮嘱
 

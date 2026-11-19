@@ -112,6 +112,21 @@ def wait_for(needle, pid, timeout):
     return None
 
 
+def suspend_outside_present(h, tid, hpid, settle_sec=0.012):
+    """对齐到一帧 PresentCommon 完成之后再挂起，尽量落在宿主的 Sleep 间隙内。"""
+    base = read_telemetry(hpid)
+    base_ft = base.frameTotal if base else 0
+    t_wait = time.time()
+    while time.time() - t_wait < 2.0:
+        cur = read_telemetry(hpid)
+        if cur and cur.frameTotal > base_ft:
+            break
+        time.sleep(0.001)
+    time.sleep(settle_sec)
+    k32.SuspendThread(h)
+    SUSPENDED.append((tid, h))
+
+
 def main():
     atexit.register(cleanup)
 
@@ -160,11 +175,34 @@ def main():
         print("环境不满足：OpenThread(tid=%d) 失败（err=%d）" % (tid, ctypes.get_last_error()))
         return 2
     print("  渲染线程 tid=%d，SuspendThread（**不挂 worker**）" % tid)
-    k32.SuspendThread(h)
-    SUSPENDED.append((tid, h))
+    suspend_outside_present(h, tid, hpid, settle_sec=0.012)
 
     print("=== 4. 看门狗阈值是 5 秒，等 9 秒 ===")
-    line = wait_for("watchdog: 已有", hpid, 9.0)
+    seen_inside = 0
+    line = None
+    for attempt in range(3):
+        t0 = time.time()
+        inside_hit = False
+        while time.time() - t0 < 9.0:
+            lines = pid_lines(hpid)
+            for l in lines:
+                if "watchdog: 已有" in l:
+                    line = l
+                    break
+            if line:
+                break
+            inside_lines = [l for l in lines if "watchdog: PresentCommon 进入后" in l]
+            if len(inside_lines) > seen_inside:
+                seen_inside = len(inside_lines)
+                inside_hit = True
+                break
+            time.sleep(0.5)
+        if line or not inside_hit or attempt == 2:
+            break
+        k32.ResumeThread(h)
+        SUSPENDED.clear()
+        suspend_outside_present(h, tid, hpid, settle_sec=0.015)
+
     if line:
         print("  ✓ 报到了：" + line)
     else:

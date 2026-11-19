@@ -4,27 +4,8 @@
 >
 > 1. **每次改 `src/app` 下的任何代码，必须同步更新本文档（[`APP.md`](APP.md) 与
 >    [`APP-FUNCTIONS.md`](APP-FUNCTIONS.md)）以及总目录 [`CATALOG.md`](CATALOG.md)。**
->    文档写错了比没写更糟 —— 下一个人会按错的说明去改代码。
-> 2. 行号会漂移。本文档所有行号基于**当前工作区的文件内容**，各文件行数如下，
->    行数对不上就说明代码已经改过，请先把受影响的条目核对一遍再继续：
->
->    | 文件 | 文档撰写时的行数 |
->    | --- | --- |
->    | `src/app/main.cpp` | 1226 |
->    | `src/app/ui.cpp` | 939 |
->    | `src/app/injector.cpp` | 728 |
->    | `src/app/settings.cpp` | 184 |
->    | `src/app/overlay.cpp` | 135 |
->    | `src/app/np_app.h` | 177 |
->
->    （注意：任务书里给的 1000 / 813 / 587 / 158 / 111 行是**过期数字**，
->     实际是上表这些。以 `read` 工具看到的行号为准。）
-> 3. 拿不准的结论写「未确认」，**不要编造**。本文档里已经这样标注了几处。
-> 4. 本文档偶尔会引用**其它层**的行号（`src/hook`、`src/sensors`、`src/common`）。
->    那些文件不归本层维护、**会随别的改动漂移**（撰写期间 `src/hook/np_hook.cpp`
->    就正在被并行修改，行号已经变过一次）。对不上时以
->    `docs/HOOK.md`、`docs/SENSORS.md`、`docs/DATA-STRUCTS.md` 为准；
->    `src/app` 自己的行号才是本文档负责的范围。
+> 2. **不引用源码行号**：请按函数名 / 结构体名 / 变量名定位源码，避免每次重构引发大面积行号失效（`struct_check.py` 与 `vt_check.py` 用于校验 ABI 与 vtable 下标）。
+> 3. 本次重构后，`src/app/ui.cpp` 已重写并进一步收紧为 **Apple / macOS Dark 统一风格 Direct2D + DirectWrite 紧凑控制台（`900×580`）** 四页签界面（概览与游戏 / HUD 外观含 `PanelRenderer` `1:1` 实时预览 / 监控指标 / 系统与诊断含便携字节状态与快捷键表，工具栏「注入前台游戏」逻辑坐标 `(754, 168, 116, 28)` 对齐 `tests/verify_frontinject.py`）；`src/app/hook_embed.S` + `injector.cpp` 内嵌 64/32 位钩子 DLL（`ExtractEmbeddedHook` 按 FNV-1a 哈希释放至 `%TEMP%\NextPerf\hooks\<hash16>` 并授 AppContainer 只读执行权限），支持单文件 `NextPerf.exe` 拷入 U 盘即插即用；`main.cpp` 新增 5 组全局热键 (`Ctrl+Shift+O/B/P/R/L`)、基于 `frames[]` 实测百分位的 CSV 汇总与 `BenchmarkSummary`、剪贴板诊断导出 (`AppCopyDiagToClipboard`) 及 `pollMs`/`updateHz` 独立计时调度；`overlay.cpp` 接入每显示器 DPI 查询 (`Shcore.dll!GetDpiForMonitor`)；`settings.cpp` 升级至 `cfgVersion = 8`（默认收紧 Metal HUD 字号 `13px` / 波形 `46px` / 背景不透明度 `0.82`）并支持 `NextPerf.portable` / 同目录 `config.json` 便携保存。
 
 ---
 
@@ -585,8 +566,8 @@ AppLog("detach: 请求 pid=%lu 的钩子自卸载", pid);
 > **下次再注入这个游戏，钩子一看 `detachPid == 自己` 就立刻又自卸载。**
 > 2.5 秒足够钩子（200ms 一轮）完成 `SelfUnloadNow`。
 
-清理发生在 `InjectorScanNow` 锁内（`596-610`）：两种情况都清 ——
-① 目标 pid 已不在进程快照里（退出了）；② 请求发出超过 2.5 秒（`gDetachAt` 时间戳）。
+清理发生在 `ClearStaleDetachPidLocked()` / `ClearStaleDetachPidByAliveLocked()`（`InjectorScanNow` 与 `InjectorTick` 无条件调用，不再嵌套在 `for (auto& g : gApp.games)` 循环内，即便删除最后一条游戏或列表为空也能照常清零）；同时 `InjectorScanNow()` 仅在 `!gApp.monitoring` 时提前返回，`games.empty()` 时仍会继续认领外部 `--inject` 注入的进程。两种情况都清 ——
+① 目标 pid 已不在进程快照里或已退出；② 请求发出超过 2.5 秒（`gDetachAt` 时间戳）。
 顺带解决 **pid 复用**问题：清掉之后就不会误伤复用同一 pid 的新进程。
 
 `gDetachAt` 的赋值有 `GetTickCount() ? GetTickCount() : 1`（`injector.cpp:498`）——
@@ -855,54 +836,36 @@ ETW 那几行还会打出**实际匹配到的事件名**（最多 6 个，
 
 ### 11.1 为什么自绘
 
-`ui.cpp:1-4`：主界面是自绘深色 UI（黑白配色、无高亮描边、无 Logo）。
-布局全部按 DPI 缩放后**一次性算好**，列表滚动通过 `VisibleRect` 折算，
-不会再出现控件互相压叠的情况。绘制用 GDI（`FillR`/`StrokeR`/`Txt`，`ui.cpp:174-203`）
-+ 双缓冲 `WM_PAINT`（`ui.cpp:769-771`：`CreateCompatibleDC` + `CreateCompatibleBitmap`），
-只有**叠加预览**走 Direct2D（`npb::PanelBitmap`，与真实叠加用的是同一条渲染通路）。
+`ui.cpp` 主界面采用无系统白色标题栏的一体化深空碳黑自绘主题（纯中性灰阶底板 `R==G==B` + `kAccent` 银白主强调 + 仅状态使用的 `kGreen`/`kAmber`/`kDanger`，搭配 `gFontMono` 等宽数值字体）。
+顶部标题栏通过 `ApplyDarkFrame`（动态加载 `dwmapi.dll` 启用暗色/圆角/边框与 1px 客户区阴影扩展）+ `WM_NCCALCSIZE`（`if (w) return 0;`）+ `WM_NCHITTEST`（空白顶栏返回 `HTCAPTION` 支持拖拽）直接融入主窗体，并移除独立的「叠加预览」窗口、改用分组/手风琴折叠以保持界面紧凑。
+布局按 DPI 缩放后**一次性算好**，列表滚动通过 `VisibleRect` 折算，绘制完全走 GDI（`FillR`/`RBox`/`FillSolid`/`DrawDot`/`Txt`）+ 双缓冲 `WM_PAINT`。
 
 ### 11.2 控件模型
 
 ```cpp
-enum WType { W_CHECK, W_GROUP, W_BUTTON, W_SLIDER_F, W_SLIDER_I, W_CYCLE, W_GAMEROW };  // 109
+enum WType { W_CHECK, W_GROUP, W_SEC_HEAD, W_BUTTON, W_SLIDER_F, W_SLIDER_I, W_CYCLE, W_GAMEROW };
 struct Widget { WType type; int x,y,w,h; std::wstring text; uint64_t bit;
                 float* pFloat; float fmin,fmax; int* pInt; int imin,imax;
                 int* pCycle; std::vector<std::wstring> opts; std::vector<int> vals;
-                int action; int index; bool hover; };                                    // 116-131
-static std::vector<Widget> gW;                                                              // 133
+                int action; int index; int groupIdx; bool hover; };
+static std::vector<Widget> gW;
 ```
 
-* 控件**直接指向配置字段**（`pFloat`/`pInt`/`pCycle` 指向 `gApp.cfg.*`），
-  拖动/点击即改配置，没有中间状态需要同步。
-* `W_CYCLE`（循环选择）同时存 `opts`（显示文本）与 `vals`（真实值），
-  点击时按**值**找当前下标再取下一个（`ui.cpp:728-738`）：
-  `*pCycle = vals.empty() ? nxt : vals[nxt];`
-* `Add()`（`ui.cpp:206`）是通用注册入口（带重叠检测）；
-  `W_GROUP`/`W_CHECK` 在 `Layout()` 里**直接 `gW.push_back`**（`ui.cpp:248-268`），
-  所以它们**不参与重叠检测** —— 计数器列表的行是等距算出来的，不需要。
-* `Layout()`（`ui.cpp:235`）每次 `gW.clear()` 重建；`WM_DPICHANGED` 会重跑它（`ui.cpp:683-692`）。
+* 控件**直接指向配置字段**（`pFloat`/`pInt`/`pCycle` 指向 `gApp.cfg.*`），拖动/点击即改配置。
+* **折叠状态**：左栏 `gGrpOpen[kGroupN]` 控制各计数器分组展开/折叠（默认展开 帧率/CPU/GPU，折叠 系统/实时图表），展开组内按 2 列排布复选框；右栏采用 **6 行可滚动「游戏库」**（`gGameScroll` 滚轮翻页 + `[+ 添加游戏]`/`[扫描运行中]`/`[移除选中]`/`[注入前台游戏]`），外观区仅暴露 `整体缩放` 与 `背景透明度` 两枚滑杆，其余 5 枚滑杆、`叠加位置`（`cfg.fpsCap & 3u` 四角）、行为开关与维护按钮统一折叠在 `▸ 更多设置与维护工具`（`gMoreOpen`）。
 
-### 11.3 尺寸常量：**加一行控件必须同步改 `kWinH`**（`ui.cpp:29-38`）
+### 11.3 尺寸常量：**加一行控件必须同步改 `kWinH*`**
 
 ```cpp
-static const int kWinW = 1000;
-static const int kWinH = 730;   // 730 = 692 + 38：为「实验性自动注入」那一行腾出的高度
-static const int kListH = 400;  // 计数器列表高度（只在这里定义一次）
+static const int kWinW = 920;
+static const int kWinHCollapsed = 490; // 默认紧凑无边框客户区（顶栏 46px + 双栏至 444px + 状态栏 478px）
+static const int kWinHExpanded  = 776; // 展开「▸ 更多设置与维护工具」后的完整客户区高度
+static const int kHeaderH = 46;        // 自绘一体化顶栏高度
+static const int kListHCollapsed = 362;
+static const int kListHExpanded  = 648;
 ```
 
-源码注释原话：**「730 = 原来的 690 + 38：「自动注入 3D 窗口」那一行是后加的，
-当时忘了同步加高窗口，结果把「退出监视」等按钮挤到窗口外面去了（用户实测）。
-⚠ 上次加行忘了同步加高，把按钮挤出了窗口 —— 加行必须同时改这里。」**
-
-`kListH` 同理：**只在这里定义一次** —— 原来 `Layout()` 和 `WM_PAINT` 里各写了一遍
-`S(452)`，改一处漏一处就会让列表和游戏区对不上（`ui.cpp:35-37`）。
-
-当前布局的实测（用源码数字手算，未实机验证）：
-左列计数器列表 `42 ~ 442`；游戏区 `458 ~ 554`（3 行 × 32）；
-按钮第一行 `564 ~ 596`、第二行 `602 ~ 634`；状态栏固定在 `S(658)`（`ui.cpp:844`）。
-右列滑杆 7 条从 `288` 起每 30 一条 → 到 498；行为区 534/572/610/648 四行；
-按钮行 694~726。**右列按钮底边 726 距离窗口高 730 只剩 4 像素** ——
-再加任何一行都必须先改 `kWinH`。
+顶栏 `0 ~ 46`（左标题+构建戳；右 `[● 监控运行中]`/`[● 录制 CSV]`/`[保存配置]`/最小化/关闭）；右栏游戏库支持 6 行滚轮列表与 4 枚按钮（`tests/verify_frontinject.py` 按 `kWinW=920`、`RX=465`、`by=276` 对齐点击「注入前台游戏」）。另外主循环注册全局热键 `Ctrl+Shift+O`（一键开关 HUD）与 `Ctrl+Shift+B`（启停 UTF-8 BOM CSV Benchmark 录制至 `%TEMP%\NextPerf_Bench_*.csv`），`overlay.cpp` 与游戏内叠加均按 `cfg.fpsCap & 3u` 支持四角摆放并在无 `NP_HOOK_OVERLAY`（如 Vulkan 游戏）时自动启用桌面 HUD 兜底。
 
 ### 11.4 控件重叠检测（`ui.cpp:212-231`）
 
@@ -922,43 +885,31 @@ for (const auto& o : gW) {
   （父子的 y 相差十几像素、高度还不同），那不是 bug。真正会吃掉点击的是
   「两个同类型的开关叠在同一块矩形上」—— 用户实测撞到的就是这个。
 
-### 11.5 命中测试、滚动与预览
+### 11.5 命中测试与滚动
 
-* `VisibleRect`（`ui.cpp:402`）：`W_CHECK`/`W_GROUP` 用**逻辑行号 − gScroll** 折算成屏幕 y，
-  超出可见范围返回 false；其余控件直接用自身矩形。
-* `Hit`（`ui.cpp:420`）：**按注册顺序线性扫描，返回第一个命中的**
-  （`W_GROUP` 跳过，组标题不可点）—— 这就是「先注册的吃掉点击」的机制来源。
-* 滚动（`ui.cpp:755-762`）：`gScroll -= wheelDelta / (60 * gS + 1)` 再 clamp 到
-  `[0, gTotalRows - gVisibleRows]`；迷你滚动条在 `DrawCounterList` 末尾画（`ui.cpp:597-604`）。
-* 预览（`RenderPreview`，`ui.cpp:389`）：`BuildPanelData` → `Measure` → `npb::PanelBitmap::Render`，
-  由 `UiRefresh` 节流 200ms 触发一次；`DrawPreview`（`648`）用 `AlphaBlend`
-  **只缩小不放大**（`fit > 1.0f → 1.0f`，「避免糊」，`ui.cpp:658`）。
+* `VisibleRect`：`W_CHECK`/`W_GROUP` 按视觉行号 `index - gScroll` 折算到 `[0, gVisibleRows)`（展开分组内的复选框按 2 列共用同一视觉行号），超出返回 false；其余控件直接返回自身矩形。
+* `Hit`：按注册顺序线性扫描返回首个命中的控件；`W_GROUP`（切换分组折叠）与 `W_SEC_HEAD`（切换右栏手风琴）均响应左键点击。
+* 滚动：`gScroll -= wheelDelta / (60 * gS + 1)` 再 clamp 到 `[0, gTotalRows - gVisibleRows]`；仅当 `gTotalRows > gVisibleRows` 时在卡片右侧画迷你滚动条。
 
-### 11.6 动作枚举与分发（`ui.cpp:110-114` / `431-553`）
+### 11.6 动作枚举与分发
 
 ```cpp
-enum Act { A_NONE = 0, A_START, A_STOP, A_SAVE, A_DEFAULT, A_ADDGAME, A_REMGAME,
-           A_INJECTFRONT, A_FORGET, A_ELEVATE, A_LOGDIR, A_QUIT };
+enum Act { A_NONE = 0, A_START, A_STOP, A_TOGGLE_MON, A_SAVE, A_DEFAULT, A_ADDGAME,
+           A_REMGAME, A_INJECTFRONT, A_FORGET, A_ELEVATE, A_LOGDIR, A_QUIT,
+           A_WIN_MIN, A_WIN_CLOSE };
 ```
 
-| 动作 | 行为 | 行号 |
-| --- | --- | --- |
-| `A_START` | `monitoring = true` + `OverlaySetVisible(true)` + `InjectorScanNow()` | 433-438 |
-| `A_STOP` | `monitoring = false` + `OverlaySetVisible(false)` | 439-443 |
-| `A_SAVE` | `SettingsSave()` | 444-447 |
-| `A_DEFAULT` | `NPDefaultConfig(&gApp.cfg)`（**不会重置 `autoInject`/`learnedAutoHook`，见 §17**） | 448-451 |
-| `A_FORGET` | `ForgetLearned()` + `SetNotice("已清空学习名单（N 条，已卸载对应钩子）")` | 452-459 |
-| `A_ADDGAME` | `GetOpenFileNameW` → 填 `path` + **同步填小写 `name`** → `AppLock` 内 `push_back` → 提示 + 日志 + `SettingsSave` | 460-494 |
-| `A_REMGAME` | `ForgetGameAt(gSelGame)` 并清空选择 | 495-501 |
-| `A_INJECTFRONT` | 用 `gApp.forePid`（见 §9.3），不存在/已退出都给明确提示 | 521-548 |
-| `A_ELEVATE` | `AdminRelaunch()` 成功后给自己发 `NP_TRAY_EXIT` 退出 | 506-511 |
-| `A_LOGDIR` | `ShellExecuteW("open", 日志目录)` + 提示两个日志文件名 | 512-520 |
-| `A_QUIT` | `PostMessageW(gMain, WM_COMMAND, NP_TRAY_EXIT, 0)` | 502-505 |
-
-* `A_ADDGAME` 里**必须同步填 `name`**（`ui.cpp:473-482` 注释）：`InjectorScanNow` 现在按
-  `name` 匹配，不填的话手动添加的条目只能靠 path 回退，容易和自动学习的条目产生不一致。
-* 所有分支结束后统一 `InvalidateRect(gMain, nullptr, FALSE)`（`ui.cpp:552`）。
-* `A_ELEVATE` / `A_QUIT` 都绕道 `NP_TRAY_EXIT` 命令，**复用同一套退出流程**（`main.cpp:675-714`）。
+| 动作 | 行为 |
+| --- | --- |
+| `A_TOGGLE_MON` | 一键切换 `monitoring` 与桌面叠加显隐，启动时调 `InjectorScanNow()` |
+| `A_START` / `A_STOP` | 启/停监控并同步 `OverlaySetVisible` |
+| `A_SAVE` | `SettingsSave()` |
+| `A_DEFAULT` | `NPDefaultConfig(&gApp.cfg)` 后同步 `pauseHook = gApp.monitoring ? 0u : 1u` |
+| `A_FORGET` | `ForgetLearned()` + `SetNotice(...)` |
+| `A_ADDGAME` / `A_REMGAME` | 添加（`AppLock` 内填 `path` 与小写 `name` + `SettingsSave`）/ 移除游戏 |
+| `A_INJECTFRONT` | 注入 `gApp.forePid` |
+| `A_ELEVATE` / `A_LOGDIR` / `A_QUIT` | 提权重启 / 打开日志目录 / 发 `NP_TRAY_EXIT` 退出 |
+| `A_WIN_MIN` / `A_WIN_CLOSE` | 自绘顶栏最小化（`SW_MINIMIZE`）/ 触发 `WM_CLOSE` |
 
 ### 11.7 游戏列表的状态显示（`DrawGameList`，`ui.cpp:607`）
 
@@ -969,34 +920,32 @@ enum Act { A_NONE = 0, A_START, A_STOP, A_SAVE, A_DEFAULT, A_ADDGAME, A_REMGAME,
   `● OpenGL · 无帧数据` / `● 已注入 · 未接管` / `● 运行中 · 注入失败`。
   **目的（原话）：让用户一眼看出「为什么没数据」，而不是只看到「待注入」。**
   Vulkan/OpenGL 是**设计边界**（钩子只做 D3D），所以要专门说明，不能显示成故障。
-* ⚠ 存活判断用的是 `(GetTickCount64() - t.tickMs) < 2500`（`ui.cpp:631`），
-  **与主循环的帧计数判据不一致**，见 §8.4 与 §17。
+* 存活判断基于 `gApp.telemetryLive`（按帧计数是否增长判定）。
 
-### 11.8 窗口过程 `MainProc`（`ui.cpp:669`）
+### 11.8 窗口过程 `MainProc`
 
 | 消息 | 处理 |
 | --- | --- |
-| `WM_CREATE` | `MakeFonts()` + `SetTimer(h, 1, 250, nullptr)`（`671-674`） |
-| `WM_TIMER` | `UiRefresh()`（`676-678`） |
-| `WM_ERASEBKGND` | 返回 1（自绘，禁止系统擦背景，防闪烁，`680-681`） |
-| `WM_DPICHANGED` | 更新 `gS` → `MakeFonts()` → **`Layout()`** → 重绘（`683-692`） |
-| `WM_MOUSEMOVE` | 更新所有控件 `hover`；若正在拖滑杆则按鼠标位置写配置值（`694-719`） |
-| `WM_LBUTTONDOWN` | `Hit` → 按类型分发（`721-749`） |
-| `WM_LBUTTONUP` | `gDragging = -1`（`751-753`） |
-| `WM_MOUSEWHEEL` | 滚动计数器列表（`755-762`） |
-| `WM_PAINT` | 双缓冲整窗重绘（`764-852`） |
+| `WM_CREATE` | `MakeFonts()` + `SetTimer(h, 1, 250, nullptr)` |
+| `WM_NCCALCSIZE` | `w != 0` 时返回 0，去除系统非客户区白栏，使客户区等于全窗矩形 |
+| `WM_NCACTIVATE` | 非最小化时返回 `TRUE`，避免失焦时绘出默认白边 |
+| `WM_NCHITTEST` | 顶部 `kHeaderH` 内且 `!Hit(pt.x, pt.y)` 返回 `HTCAPTION` 支持拖拽，其余 `HTCLIENT` |
+| `WM_TIMER` | `UiRefresh()` |
+| `WM_ERASEBKGND` | 返回 1（自绘，禁止系统擦背景防闪烁） |
+| `WM_DPICHANGED` | 更新 `gS` → 按 `lParam` 建议矩形 `SetWindowPos` 重设窗口尺寸 → `MakeFonts()` → **`Layout()`** → 重绘 |
+| `WM_MOUSEMOVE` | 更新所有控件 `hover`；若正在拖滑杆则调用 `UpdateSliderFromX` 写配置值 |
+| `WM_LBUTTONDOWN` | `Hit` → 分发折叠/勾选/循环/滑杆/按钮 |
+| `WM_LBUTTONUP` | `gDragging = -1` |
+| `WM_MOUSEWHEEL` | 按视觉行滚动监控项目列表 |
+| `WM_PAINT` | 双缓冲整窗重绘（含一体化顶栏、2 列折叠列表、游戏列表、右侧手风琴与底部状态栏） |
 | `WM_CLOSE` | **托盘不可用时关闭 = 真退出**（见 §12.2） |
-| `NP_WM_TRAY` | `AppTrayNotify(LOWORD(l))`（`864-866`） |
+| `NP_WM_TRAY` | `AppTrayNotify(LOWORD(l))` |
 | `WM_COMMAND` | **`lParam == 0` 才处理**（托盘菜单派发，见 §12.4） |
 | `WM_DESTROY` | `PostQuitMessage(0)` |
 
-字体（`MakeFonts`，`ui.cpp:159`）：`Microsoft YaHei UI`，
-标题 19 / 小节 14 / 正文 13 / 小字 11（都过 `S()`），
-`ANTIALIASED_QUALITY` 灰阶抗锯齿 —— **深底上不会出现 ClearType 的彩色边缘**（`ui.cpp:161`）。
+字体（`MakeFonts`）：UI 字体采用 `Microsoft YaHei UI`（标题 16 / 小节 13 / 正文 12 / 小字 11），等宽数值字体 `gFontMono`（12）优先 `Cascadia Mono` 回退 `Consolas`，均过 `S()` 与 `ANTIALIASED_QUALITY` 灰阶抗锯齿。
 
-**滑杆坐标的坑**（`ui.cpp:706-709` 原话）：`WM_MOUSEMOVE` 里的 `120/130` 必须和
-`WM_PAINT` 里画轨道用的 `sx = wd.x + S(120)`、`sw = wd.w - S(130)` **完全一致**。
-原来拖拽用的是 130/140，于是**滑块永远比鼠标偏 10 像素**（拖到最右边也到不了 100%）。
+**滑杆坐标共用**：点击与拖拽统一走 `UpdateSliderFromX`，与 `WM_PAINT` 同用 `sx = wd.x + S(140)`、`sw = wd.w - S(154)`，保证点击与拖拽轨道零偏差。
 
 ---
 
@@ -1080,14 +1029,12 @@ gCleanedUp 幂等保护                       // 720-721
 
 ## 13. 配置存取（`settings.cpp`）
 
-* 路径：`%APPDATA%\NextPerf\config.json`（`SettingsPath`，`settings.cpp:12`），
-  目录不存在时 `CreateDirectoryW` 现建；`SHGetFolderPathW` 失败则退化为当前目录下的
-  `nextperf_config.json`（`19-21`）。
+* 路径：`SettingsPath()` 优先检测可执行文件同目录的 `NextPerf.portable` / `config.json`（存在时读写同目录 `config.json` 以支持 U 盘单文件便携），否则使用 `%APPDATA%\NextPerf\config.json`（目录不存在时 `CreateDirectoryW` 现建；退化回当前目录 `nextperf_config.json`）。
 * 格式：极简 JSON（`src/common/np_json.h`），**没有第三方依赖**。
-* `SettingsLoad`（`45`）：**先 `NPDefaultConfig(&gApp.cfg)`**（把默认值铺好），
-  再逐键覆盖；文件不存在 / 解析失败都**静默保留默认值**（`48`、`51`）。
-* `SettingsSave`（`138`）：每次**整体重写**，包含 `cfgVersion = 5`。
-  调用点：启动时（`main.cpp:950`）、退出时（`1224`）、`A_SAVE`、
+* `SettingsLoad`：**先 `NPDefaultConfig(&gApp.cfg)`**（把默认值铺好），
+  再逐键覆盖；文件不存在 / 解析失败都**静默保留默认值**。
+* `SettingsSave`：每次**整体重写**，包含 `cfgVersion = 8`。
+  调用点：`WinMain` 初始化、`CleanupAndExit`、`A_SAVE`、
   添加/移除游戏、学习成功、`ForgetGameAt` 末尾。
 
 ### 13.1 持久化的字段（`SettingsSave`，`settings.cpp:141-179`）
@@ -1118,17 +1065,18 @@ gCleanedUp 幂等保护                       // 720-721
 > → 用户勾选后重启就丢（`settings.cpp:92-93`）；`bgColor` 原来只有写回、**没有读取** →
 > 用户改了背景色重启就丢（`settings.cpp:73`，审计发现）。**加字段时读写两侧都要加。**
 
-### 13.3 旧配置升级（`settings.cpp:57-70`，按 `cfgVersion` 一次性补位）
+### 13.3 旧配置升级（`SettingsLoad` 按 `cfgVersion` 一次性补位）
 
 | 版本 | 动作 |
 | --- | --- |
 | `ver < 2` | 补勾 `NP_C_CHART_USAGE \| NP_C_CHART_FPS \| NP_C_CHART_LATENCY` |
 | `ver < 3` | 补勾 `NP_C_GRAPH \| NP_C_CHART_FPS \| NP_C_CHART_LATENCY` |
 | `ver < 4` | 补勾 `NP_C_CPU_CLOCK \| NP_C_CPU_POWER`（否则新开关对老用户是关的，会让人以为功能没做出来） |
-| `ver < 5` | **清掉** `NP_C_CPU_BUSY \| NP_C_CPU_WAIT`（高级项默认不显示，用户要求；显式清位而不是把复选框删掉，用户仍可手动勾选；且只在 ver<5 时执行一次，不会把用户的勾选反复抹掉） |
+| `ver < 5` | **清掉** `NP_C_CPU_BUSY \| NP_C_CPU_WAIT`（高级项默认不显示，用户要求；显式清位而不是把复选框删掉，用户仍可手动勾选；且只在 `ver < 5` 时执行一次，不会把用户的勾选反复抹掉） |
+| `ver < 6` / `ver < 7` | 迁入 Apple Metal HUD 2 行顶栏 + `[min max]` 区间显示（`fpsCap` 高位）、预设与背景主题默认值 |
+| `ver < 8` | 将未定制的旧版字号（`14`/`15` → `13`）、示波器波高（`52`/`64` → `46`）与背景不透明度（`0.72`/`0.78` → `0.82`）收紧为紧凑 Apple Metal HUD 默认参数，并确保主题 `0` 与顶栏/极值区间开启 |
 
-另外两处强制行为：`gApp.cfg.bgColor = 0xFF000000u;`（背景固定纯黑，用户明确要求，
-旧配置里的蓝黑色一律丢弃，`settings.cpp:71-72`）；`deepEngineHook` / `vtableProbe`
+另外两处强制行为：`SettingsLoad` 保留 `bgColor` 纯黑兜底与主题方案适配；`deepEngineHook` / `vtableProbe`
 **缺键时按 1（开）**、`simulate` / `learnedAutoHook` / `autoInject` 缺键时按 0（关）。
 
 ---
@@ -1356,8 +1304,8 @@ AppLog("notice[%d]: %s", level, text.c_str());
 | G1 | `np_common.h:438` vs `:200` | `NPDefaultConfig` 的循环写 `reserved[0..7]`，但数组只有 4 个元素 —— **越界写 16 字节** | 调用点全在本层：`SettingsLoad`（每次启动）、UI `A_DEFAULT`、`RunSelfTest`。按字段宽度推算 `sizeof(NPConfig) = 136` 且尾部无填充，`AppState` 里 `sensors` 正好从偏移 136 开始 → 越界写的正是 `gApp.sensors` 的 `magic`(136-139)、`version`(140-143)、`tickMs`(144-151)。后果：在下一轮 `NPClearSensors` 之前，发布出去的 Sensors 是 `magic = 0`（读方钩子按 `magic == NP_MAGIC` 判断，会忽略该帧）。**静默、无崩溃、但语义被破坏** | ✅ **已修**：`np_common.h:445` 改成 `sizeof(c->reserved)/sizeof(c->reserved[0])`，跟着数组大小走。属 common 层，两侧已回归；`sizeof(NPConfig)` 仍为 136 |
 | G2 | `main.cpp:1093-1107` | 学习成功的 `gApp.games.push_back` **没有 `AppLock`** | 与 `ui.cpp:483-488` 的规则自相矛盾；守护线程正在遍历 `games` 时会踩迭代器失效（崩主程序） | ✅ **已修**：`main.cpp:1120` 学习成功那段已加 `AppLock` |
 | G3 | `ui.cpp:631` | 游戏列表状态仍用 `(GetTickCount64() - t.tickMs) < 2500` **跨进程时钟比较** | 回到 §16.2 第 7 条那个 bug：状态可能永远显示不正确（32 位钩子 tickMs 落在「未来」） | ✅ **已修**：`ui.cpp:633` 改用主循环算好的 `gApp.telemetryLive` |
-| G4 | `main.cpp:66` | 打开遥测块时**只校验 `magic`，没校验 `version`** | 结构体布局不一致时（旧 DLL 残留）会读到错位字节，且不会被发现 —— 这正是 `version = sizeof` 想防的事 | ❌ **仍未改**：应加 `v->version == (uint32_t)sizeof(NPTelemetry)` 判断 |
-| G5 | `NPDefaultConfig`（`np_common.h:413-439`） | **没有设置** `autoInject` / `pauseHook` / `learnedAutoHook` / `detachPid` | 点「恢复默认」**不会**重置「实验性自动注入」等开关（保留了用户当前值） | 确认是「有意」还是漏了；若有意请在注释里写明（**未确认**） |
+| G4 | `TryOpenTelemetry` / `PickTelemetry` | 打开与挑选遥测块时**只校验 `magic`，没校验 `version`** | 结构体布局不一致时（旧 DLL 残留）会读到错位字节 | ✅ **已修**：两处均已加上 `v->version == sizeof(NPTelemetry)` 校验（主循环推送 `NPHistoryPush` 亦已改用 `frameMsAvg`、`cpuFrameMsAvg`、`gpuBusyMs` 平滑/有效值，`CleanupAndExit` 亦显式注销 `gFgHook`） |
+| G5 | `NPDefaultConfig`（`np_common.h`） | 原先没有初始化 `autoInject` / `pauseHook` / `learnedAutoHook` / `detachPid` | 点「恢复默认」不会重置开关、运行态依赖全局零初始化 | ✅ **已修**：`NPDefaultConfig()` 现显式清零上述四字段，`ui.cpp` `DoAction(A_DEFAULT)` 在调用后按 `gApp.monitoring` 重新同步 `pauseHook` |
 | G6 | `GameEntry::hooked`（`np_app.h:46`）、`AppState::overlayVisible/uiVisible/lastPoll/lastOverlay`（`np_app.h:60-61`、`101-102`） | **全代码库无任何读写**（死字段） | 无功能影响，但会误导后来者以为有状态机 | 清理或注明 |
 | G7 | `cfg.autoInject`（`np_common.h:185`） | 只在 settings 里读写，**没有任何行为**（`AppAutoInjectTick` 是空的） | 界面已无对应开关，配置里留着一个永远无效的键 | 未来做启发式自动注入时可复用；现在请当作无效字段 |
 | G8 | `NP_MUTEX_SENSORS`（`np_common.h:24`） | 定义了但**从未使用** | 写传感器无锁，靠「整块拷贝」约定 | 若将来要原子发布传感器，这是现成的名字 |

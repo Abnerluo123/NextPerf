@@ -28,6 +28,7 @@ class Overlay11 {
 public:
     bool Init(ID3D11Device* dev);
     void Release();
+    void OnResizeBuffers();
     // 把位图以 (x,y) 为左上角贴到后台缓冲上
     bool Draw(ID3D11Device* dev, ID3D11DeviceContext* ctx, ID3D11Texture2D* backbuffer,
               const unsigned char* px, int w, int h, int stride, float x, float y);
@@ -52,6 +53,9 @@ public:
     void Release();
     // 在给定的命令列表里录制「上传 + 过渡 + 画一个全屏三角形」。
     // bbStateBefore/Before：调用方告诉我们后台缓冲当前处于什么状态。
+    bool OnBackBuffer(ID3D12Device* dev, ID3D12Resource* backbuffer, UINT bbIdx,
+                      int bbW, int bbH, DXGI_FORMAT bbFormat);
+    void OnResizeBuffers();
     bool Record(ID3D12Device* dev, ID3D12GraphicsCommandList* list, ID3D12Resource* backbuffer,
                 D3D12_RESOURCE_STATES bbBefore, const unsigned char* px, int w, int h, int stride,
                 float x, float y, float bbW, float bbH);
@@ -92,7 +96,12 @@ private:
     // 绘制被跳过的帧数（供诊断：闪烁是不是因为我们没画上去）
     int     drawSkips_ = 0;
     UINT rtvHeapSize_ = 0;
+    UINT srvHeapSize_ = 0;
+    int  srvSlot_ = 0;
     int  texW_ = 0, texH_ = 0;
+    int  lastBbW_ = 0, lastBbH_ = 0;
+    DXGI_FORMAT lastBbFormat_ = DXGI_FORMAT_UNKNOWN;
+    ID3D12Resource* bbByIdx_[16]{};
 
     ID3D12Fence* fence_ = nullptr;
     UINT64       fenceValue_ = 0;

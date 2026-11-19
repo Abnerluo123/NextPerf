@@ -24,6 +24,7 @@ NextPerf 模拟游戏进程 —— 参考驱动脚本（同时也是集成自测
 """
 
 import argparse
+import ctypes
 import json
 import os
 import subprocess
@@ -132,6 +133,21 @@ def check(cond, msg):
     return bool(cond)
 
 
+def primary_refresh_hz():
+    try:
+        u32 = ctypes.windll.user32
+        g32 = ctypes.windll.gdi32
+        hdc = u32.GetDC(0)
+        if hdc:
+            hz = g32.GetDeviceCaps(hdc, 116)  # VREFRESH
+            u32.ReleaseDC(0, hdc)
+            if hz > 1:
+                return float(hz)
+    except Exception:
+        pass
+    return 60.0
+
+
 def run_case_dx(exe, api):
     """一个后端的基础用例：3 秒 + 每帧 JSON，检查自报字段是否齐全/自洽。"""
     print("== 用例 1：--api=%s --seconds=3 --json ==" % api)
@@ -149,8 +165,9 @@ def run_case_dx(exe, api):
                 "总帧数 %d" % summary["total_frames"])
     ok &= check(summary["exit_reason"] == "time_limit",
                 "退出原因 = %s" % summary["exit_reason"])
-    ok &= check(abs(summary["fps_avg"] - 60.0) < 12.0,
-                "平均帧率 %.2f（vsync on，应当在 60 附近）" % summary["fps_avg"])
+    refresh_hz = primary_refresh_hz()
+    ok &= check(abs(summary["fps_avg"] - refresh_hz) < max(12.0, refresh_hz * 0.15),
+                "平均帧率 %.2f（vsync on，显示器刷新率 %.0f Hz）" % (summary["fps_avg"], refresh_hz))
 
     # 分位数必须单调
     ok &= check(summary["frame_ms_p50"] <= summary["frame_ms_p99"] <= summary["frame_ms_p999"],

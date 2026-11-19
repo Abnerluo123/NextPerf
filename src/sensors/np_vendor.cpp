@@ -70,33 +70,40 @@ static const NvU32 kIdGpuGetAllClocks      = 0xDCB616C3u;   // GetAllClockFreque
 
 bool NvapiApi::Load() {
     if (loaded) return true;
+    loadErr = 0;
     dll = LoadLibraryW(L"nvapi64.dll");
     if (!dll) dll = LoadLibraryW(L"nvapi.dll");
-    if (!dll) return false;
+    if (!dll) {
+        loadErr = (int)GetLastError();
+        if (!loadErr) loadErr = -1;
+        return false;
+    }
 
     QueryInterface = reinterpret_cast<NvAPI_QueryInterface_t>(GetProcAddress(dll, "nvapi_QueryInterface"));
-    if (!QueryInterface) { FreeLibrary(dll); dll = nullptr; return false; }
+    if (!QueryInterface) {
+        loadErr = -2;
+        FreeLibrary(dll); dll = nullptr; return false;
+    }
 
-    void* fn = nullptr;
-    if (QueryInterface(kIdInitialize, &fn) == 0 && fn) Initialize = reinterpret_cast<decltype(Initialize)>(fn);
-    fn = nullptr;
-    if (QueryInterface(kIdUnload, &fn) == 0 && fn) NvAPI_UnloadFn = reinterpret_cast<decltype(NvAPI_UnloadFn)>(fn);
-    fn = nullptr;
-    if (QueryInterface(kIdEnumPhysicalGPUs, &fn) == 0 && fn) EnumPhysicalGPUs = reinterpret_cast<decltype(EnumPhysicalGPUs)>(fn);
-    fn = nullptr;
-    if (QueryInterface(kIdGpuGetFullName, &fn) == 0 && fn) GPU_GetFullName = reinterpret_cast<decltype(GPU_GetFullName)>(fn);
-    fn = nullptr;
-    if (QueryInterface(kIdGpuThermalSettings, &fn) == 0 && fn) GPU_GetThermalSettings = reinterpret_cast<decltype(GPU_GetThermalSettings)>(fn);
-    fn = nullptr;
-    if (QueryInterface(kIdGpuDynamicPstates, &fn) == 0 && fn) GPU_GetDynamicPstatesInfoEx = reinterpret_cast<decltype(GPU_GetDynamicPstatesInfoEx)>(fn);
-    fn = nullptr;
-    if (QueryInterface(kIdGpuGetUsages, &fn) == 0 && fn) GPU_GetUsages = reinterpret_cast<decltype(GPU_GetUsages)>(fn);
-    fn = nullptr;
-    if (QueryInterface(kIdGpuGetTachReading, &fn) == 0 && fn) GPU_GetTachReading = reinterpret_cast<decltype(GPU_GetTachReading)>(fn);
-    if (QueryInterface(kIdGpuGetAllClocks, &fn) == 0 && fn) GPU_GetAllClockFrequencies = reinterpret_cast<decltype(GPU_GetAllClockFrequencies)>(fn);
+    Initialize = reinterpret_cast<decltype(Initialize)>(QueryInterface(kIdInitialize));
+    NvAPI_UnloadFn = reinterpret_cast<decltype(NvAPI_UnloadFn)>(QueryInterface(kIdUnload));
+    EnumPhysicalGPUs = reinterpret_cast<decltype(EnumPhysicalGPUs)>(QueryInterface(kIdEnumPhysicalGPUs));
+    GPU_GetFullName = reinterpret_cast<decltype(GPU_GetFullName)>(QueryInterface(kIdGpuGetFullName));
+    GPU_GetThermalSettings = reinterpret_cast<decltype(GPU_GetThermalSettings)>(QueryInterface(kIdGpuThermalSettings));
+    GPU_GetDynamicPstatesInfoEx = reinterpret_cast<decltype(GPU_GetDynamicPstatesInfoEx)>(QueryInterface(kIdGpuDynamicPstates));
+    GPU_GetUsages = reinterpret_cast<decltype(GPU_GetUsages)>(QueryInterface(kIdGpuGetUsages));
+    GPU_GetTachReading = reinterpret_cast<decltype(GPU_GetTachReading)>(QueryInterface(kIdGpuGetTachReading));
+    GPU_GetAllClockFrequencies = reinterpret_cast<decltype(GPU_GetAllClockFrequencies)>(QueryInterface(kIdGpuGetAllClocks));
 
-    if (!Initialize || !EnumPhysicalGPUs) { FreeLibrary(dll); dll = nullptr; return false; }
-    if (Initialize() != 0) { FreeLibrary(dll); dll = nullptr; return false; }
+    if (!Initialize || !EnumPhysicalGPUs) {
+        loadErr = -3;
+        FreeLibrary(dll); dll = nullptr; return false;
+    }
+    NvAPI_Status st = Initialize();
+    if (st != 0) {
+        loadErr = (int)st;
+        FreeLibrary(dll); dll = nullptr; return false;
+    }
     inited = true;
 
     if (EnumPhysicalGPUs(gpus, &gpuCount) != 0) gpuCount = 0;
@@ -159,16 +166,21 @@ void AdlApi::Unload() {
 //   Reading element: u32 type, u32 sensorIndex, u32 readingId,
 //                    char labelOrig[128], char labelUser[128], char unit[16],
 //                    double value, valueMin, valueMax, valueAvg, ... (后面还有更多字段)
+#pragma pack(push, 1)
 struct NpHwinfoHeader {
     uint32_t signature;
     uint32_t version;
     uint32_t revision;
     int64_t  pollTime;
     uint32_t offSensor;
-    uint32_t offReading;
     uint32_t sizeSensor;
+    uint32_t numSensor;
+    uint32_t offReading;
     uint32_t sizeReading;
+    uint32_t numReading;
 };
+#pragma pack(pop)
+static_assert(sizeof(NpHwinfoHeader) == 44, "NpHwinfoHeader layout mismatch");
 
 bool HwinfoCtx::Open() {
     if (loaded) return true;
@@ -180,7 +192,11 @@ bool HwinfoCtx::Open() {
     view = MapViewOfFile(map, FILE_MAP_READ, 0, 0, 0);
     if (!view) { CloseHandle(map); map = nullptr; return false; }
     loaded = true;
-    return Refresh();
+    if (!Refresh()) {
+        Close();
+        return false;
+    }
+    return true;
 }
 
 void HwinfoCtx::Close() {
@@ -209,8 +225,15 @@ static std::wstring NpHwStr(const char* s, size_t maxLen) {
 namespace {
 thread_local std::jmp_buf gNpJmp;
 thread_local bool gNpJmpArmed = false;
-LONG CALLBACK NpSehHandler(PEXCEPTION_POINTERS) {
-    if (gNpJmpArmed) { gNpJmpArmed = false; std::longjmp(gNpJmp, 1); }
+LONG CALLBACK NpSehHandler(PEXCEPTION_POINTERS ei) {
+    if (!gNpJmpArmed || !ei || !ei->ExceptionRecord) return EXCEPTION_CONTINUE_SEARCH;
+    DWORD code = ei->ExceptionRecord->ExceptionCode;
+    if (code != EXCEPTION_ACCESS_VIOLATION && code != EXCEPTION_IN_PAGE_ERROR &&
+        code != EXCEPTION_DATATYPE_MISALIGNMENT) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    gNpJmpArmed = false;
+    std::longjmp(gNpJmp, 1);
     return EXCEPTION_CONTINUE_SEARCH;
 }
 bool NpSehInstall() {
@@ -237,27 +260,22 @@ bool HwinfoCtx::Refresh() {
 bool HwinfoCtx::RefreshUnsafe() {
     const NpHwinfoHeader* h = reinterpret_cast<const NpHwinfoHeader*>(view);
         if (h->signature != 0x53495748u) return false;  // 'HWiS' little-endian
-        if (h->version < 2) return false;
+        if (h->version < 1) return false;
         if (h->sizeSensor < 264 || h->sizeReading < 292) return false;
         if (h->offSensor == 0 || h->offReading == 0) return false;
 
-        // 读数数量由共享内存大小推算，最多取 4096 条防止越界
+        // 读数数量由共享内存大小与头部 numReading 联合约束，最多取 4096 条防止越界
         MEMORY_BASIC_INFORMATION mbi{};
         SIZE_T total = 0;
         if (VirtualQuery(view, &mbi, sizeof(mbi))) total = mbi.RegionSize;
         if (total == 0) total = 1 << 20;
-        // ★ offReading 是对方（HWiNFO 进程）写进来的值，不能信：
-        //   它一旦大于映射大小，(total - offReading) 会无符号下溢成天文数字，
-        //   下面的循环就会去读映射之外的地址（现在靠异常处理器兜住，但那是最后一道防线，
-        //   不该拿来当正常路径用）。
-        if (h->offReading >= total) return false;
+        if (h->offReading >= total || h->offSensor >= total) return false;
         uint32_t maxRead = (uint32_t)((total - h->offReading) / h->sizeReading);
+        if (h->numReading < maxRead) maxRead = h->numReading;
         if (maxRead > 4096) maxRead = 4096;
-        // 传感器分组元素同理，也要按映射大小算上界：
-        // 原来只判 `sensorIndex < 4096`，读数里给一个超大的 sensorIndex
-        // 就会越界读到映射外面去。
-        uint32_t maxSensor =
-            (h->offSensor < total) ? (uint32_t)((total - h->offSensor) / h->sizeSensor) : 0;
+        uint32_t maxSensor = (uint32_t)((total - h->offSensor) / h->sizeSensor);
+        if (h->numSensor < maxSensor) maxSensor = h->numSensor;
+        if (maxSensor > 4096) maxSensor = 4096;
 
         const char* base = reinterpret_cast<const char*>(view);
         readings.clear();

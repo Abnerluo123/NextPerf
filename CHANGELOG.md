@@ -14,6 +14,86 @@
 
 ---
 
+## 未发布（main）—— 第三轮 功能完善、RT/Tensor/Vulkan 支持、兼容加固与游戏库重构
+
+> ⚠️ **未经用户完整测试**，未打 tag、未发布。**当前发布版仍以已打 tag 版本为准。**
+
+### 2026-11-19 缺陷修复、功能扩展与控制台 Direct2D 重构（未经用户完整测试）
+* **传感器与 vendor 采样修复**：修正 `NP_MAKE_NVAPI_VERSION`、`NvAPI_QueryInterface_t` 与 `NV_GPU_DYNAMIC_PSTATES_INFO_EX`（`ver=1`、`72` 字节布局），恢复 NVIDIA GPU/FB/VID/BUS 域占用采样并在无 NVML 时回退 NVAPI；`PollCpu` 防止无符号整数下溢；`pdh_.Collect()` 单次采集去重并增加 WMI（LHM/ACPI）查询缓存与失败退避；DXGI 优先选择显存最大的非软件适配器；HWiNFO 共享内存头补齐 `#pragma pack(1)`（44 字节）与重连，`UpdateSourceUsed` 补充 `NP_SRC_LHM`。
+* **ETW 与 JSON 鲁棒性**：`np_etw.cpp` 修复 `ERROR_ALREADY_EXISTS` 停会话后重填 `EVENT_TRACE_PROPERTIES`、保留未过滤警告、加锁保护 `consumer_` 关闭、184/171 切换重置基准及 `SetTargetPid` 清零 `diagSeenN_`；`np_json.h` 补齐对象/数组/数字解析的越界与前向推进保护。
+* **共享协议、HUD 布局与新指标**：零 ABI 破坏扩展 `NPConfig::fpsCap` 位域与 `overlayMode == 3`（仅后台隐藏 HUD），保持 `NPConfig`/`NPSensors`/`NPTelemetry`（`136`/`448`/`55736` 字节）不变；新增 `NP_C_BOTTLENECK`（`NPComputeBottleneck`）、`NP_C_CLOCK_TIME`、`NP_C_CHART_USAGE`/`NP_C_CHART_FPS` 曲线行、`NP_PRESET_*` 4 套预设、`ThemeFor` 4 套配色主题、表头与 `[min max]` 极值区间开关、横向精简条布局（`LayoutHorizontalChips`）；修复 `PctV`/`Msv`、`latBusy` 对齐、`gapBefore * scale`、`rt->GetFactory()` D2D 曲线同源工厂及 `16 * rChW` 右对齐列宽截断问题。
+* **Hook 与多 API 安全加固**：补齐 `Overlay11::Draw` 状态保存/恢复、`Overlay12::OnFrameCompleted` / `BeforeSwapchainResize` 200ms Fence 等待与空指针检查、`NormalizeRtvFormat` 与视口裁剪夹紧、`PatchSafe` 递归防护（`PointsIntoOurDll`）、D3D12 命令列表卸载防护（`gUnloading` + `calledOrig`）、3 秒 `fpsLow01` 窗口、`pauseHook` 仅跳过渲染、`NP_HOOK_OVERLAY` 接入 D3D11，以及 Vulkan IAT 补齐（`p99`、ETW 中继、`graph*`、`gVkProcAddrHandedOut` 透传保护、5 次限流重试与 `vkIat=0` 自检）。
+* **单文件 U 盘便携化（`hook_embed.S`, `build.bat`, `injector.cpp`, `settings.cpp`）**：
+  * `build.bat` 调整为先编译 `NextPerfHook.dll`（64 位）与 `NextPerfHook32.dll`（32 位），再经 `src/app/hook_embed.S`（`.incbin`）将其直接打包进 `NextPerf.exe` 只读段；拷贝单个 `NextPerf.exe` 到任意目录或 U 盘即可完成 `--selftest` 与 64/32 位进程注入。
+  * 运行时按镜像内容 64 位 FNV-1a 哈希将所需钩子 DLL 原子释放至 `%TEMP%\NextPerf\hooks\<hash16>\`（自动清理旧版本并授予 `ALL APPLICATION PACKAGES` 只读执行权以兼容商店/UWP 游戏）；若在 exe 同目录放置 `NextPerf.portable` 或 `config.json`，配置亦跟随 U 盘保存。
+* **Apple Metal Performance HUD 高还原视觉与布局重构（`np_common.h`, `np_build.cpp`, `np_panel.cpp`）**：
+  * 采用与 Apple Metal HUD 一致的 2 行等宽设备顶栏（短显卡名 + `[渲染分辨率]`；缩放倍率 + `Direct` / 红色预警 `Composited` + `Hz`）、核心 4 行（`FPS:` 白 / `Pre:` Apple 蓝 `#2997FF` / `GPU:` Apple 绿 `#30D158` / `Mem:` 与右对齐绿色 `[VRAM]`，`[ min  max ]` 居最右列并统一 2 位小数竖向对齐）以及 10 格全宽双通道示波器图（游戏内叠加 Pre + GPU 延迟波形，桌面叠加 CPU% + GPU% 波形），默认移除每个指标下方冗余的散乱小框图。
+  * 更新 4 套 Apple 质感背景方案（`ThemeFor`：`0=Metal 黑` / `1=液态暗灰` / `2=浅雾透明` / `3=极简纯字`）与 4 档预设（`NP_PRESET_MINIMAL`/`STANDARD`/`TUNING`/`FULL`，默认收紧为 `fontHeight=13`、`graphHeight=46`、`bgOpacity=0.82f`，通过 `cfgVersion = 8` 自动迁入）。
+  * **HUD 与控制台进一步紧凑化（Apple Metal 高密度排版）**：在 `np_panel.h/.cpp` 的 `PanelRenderer::Grid` 中解耦核心 4 行（`coreLabelW` / `coreValW` / `coreRngW`）与下方扩展行宽（`extW`），移除旧 `248px` 过宽下限并将 `FPS:`/`Pre:`/`GPU:`/`Mem:` 数值紧贴左侧标签、`[min max]`/`[VRAM]` 贴齐面板右缘；`np_build.cpp` 将多开指标合并为高密度单行汇总（`Low: 1% · 0.1%`、`CPU` 占比/温度/功耗合流、`GPU` 占比/温度/功耗合流、`Draw/Disp` 合流），标准竖版桌面实测宽度收敛至约 `204~216 DIP`。
+* **控制台与 HUD 审美统一与紧凑排版（Apple / macOS Dark 风格 `ui.cpp`）**：
+  * 将主界面全面重写并进一步收紧为 `900×580` 紧凑工作区，与 Metal HUD 共用中性深色层级（`#141416` / `#19191B` / `#222225`）与 Apple 系统语义色：取消花哨霓虹描边与冗余留白，改用分组细线卡片、macOS 分段控制器、iOS 风格滑块开关、166px 精简矢量图标侧边栏、`300×486` 中性工作室 `1:1` 实时 HUD 预览及对齐 `tests/verify_frontinject.py`（`(754, 168, 116, 28)`）的主注入按钮。
+
+- **Hook 层核心能力、RT/Tensor 实测修复与兼容加固（`src/hook/np_hook.cpp`、`src/hook/np_draw.h/.cpp`、`src/common/np_build.cpp`）**
+  - **RT Core & Tensor/AI 负载**：修复 `NpDispatch` 原 `gAiSpanOpen` 每帧首条清零导致 `SubmitPendingResolve` 未采样 AI 时间戳的缺陷，改为 `TS_AI_BASE..TS_AI_BASE+15`（8 对槽位）与 `gAiDispatches` 追踪；`NpBuildAS` 新增 `TS_RT_BASE` 区间时间戳夹取；`SubmitPendingResolve` 对无 RT/AI 查询直接跳过并对有数据的槽位安全部分 `ResolveQueryData`；`np_build.cpp` 补充 `engOfa`（光流引擎）与 `aiModules + engCompute` 回退展示。
+  - **交换链重建（ResizeBuffers）与无感探测防闪屏**：正式挂钩并完整还原 `IDXGISwapChain::ResizeBuffers`（槽位 13）与 `IDXGISwapChain3::ResizeBuffers1`（槽位 39，带 `IDXGISwapChain3` QI 防护），在重建前经 `BeforeSwapchainResize()` 触发 `Overlay11::OnResizeBuffers()` / `Overlay12::OnResizeBuffers()` 释放后台缓冲引用、等待 GPU fence、轮转退役 RTV 堆并进入 `settle_ = 30` 静默帧；`ProbeSwapChainVtable()` 探测窗改为 `WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE` 与 `WS_POPUP | WS_DISABLED` 并置于 `(-32000, -32000)`；`tests/vt_check.py` 同步纳入槽位 13/39 校验并通过。
+  - **Vulkan 帧遥测挂钩与 4 角 HUD**：通过非侵入式 IAT 挂钩（`InstallVulkan()` / `PatchModuleVkIat()`）拦截宿主模块导入表中的 `vkQueuePresentKHR` / `vkCreateSwapchainKHR` / `vkGetDeviceProcAddr` / `vkGetInstanceProcAddr` 并发布 `NP_API_VULKAN` 遥测（经 `gVkPresentSeen` 防阻塞线程心跳覆写），卸载时完整还原 IAT；D3D11/D3D12 叠加面板与桌面叠加同步支持 `cfg.fpsCap & 3u` 四角定位（右上/左上/右下/左下）。
+- **主程序特性补全与可滚动游戏库 UI（`src/app/main.cpp`、`src/app/injector.cpp`、`src/app/overlay.cpp`、`src/app/ui.cpp`）**
+  - 新增全局热键 `Ctrl+Shift+O`（一键切换 HUD 显隐）与 `Ctrl+Shift+B`（随时启停 Benchmark），顶栏内置 `[● 录制 CSV]` / `[■ 停止录制]`，输出含 UTF-8 BOM 的逐帧基准 CSV 至 `%TEMP%\NextPerf_Bench_<时间戳>.csv`。
+  - 新增 `ScanRunningGames()` 一键扫描可见顶级图形进程（含 UWP 子进程解析与 D3D12/D3D11/Vulkan/D3D9 运行库检测）；主循环在目标无游戏内叠加（`NP_HOOK_OVERLAY == 0`，如 Vulkan）时自动保留桌面 HUD。
+  - 界面升级为 **6 行可滚动「游戏库」**（`gGameScroll`，`[+ 添加游戏]`/`[扫描运行中]`/`[移除选中]`/`[注入前台游戏]`），「外观设置」卡片默认仅暴露 `整体缩放` 与 `背景透明度`，其余滑杆、`叠加位置`、行为开关与维护工具收纳至 `▸ 更多设置与维护工具` 折叠抽屉（窗口动态切换 `920 × 490` / `920 × 776`），同步更新 `tests/verify_frontinject.py`。
+- **2D/3D 真值对照基准软件与自动化对比测试（`tests/sim/`、`tests/verify_ground_truth.py`）**
+  - `tests/sim/build_sim.bat` 编译后同步复制 `dist\NextPerfBench.exe`；`sim_main.cpp` 每 500ms 在标题栏实时显示最近 120 帧地面真值（`API/FPS/帧时间/1%Low/CPU/Wait/GPU`）；`sim_dx12.cpp` 增加轻量 `cs_5_0` Compute Dispatch Pass。
+  - 新增 `tests/verify_ground_truth.py` 对 DX11 与 DX12 后端执行端到端注入对照，实测验证通过。
+
+---
+
+## 未发布（main）—— 第二轮 UI 与 Metal HUD 视觉一致性美化
+
+> ⚠️ **未经用户完整测试**，未打 tag、未发布。**当前发布版仍以已打 tag 版本为准。**
+
+- **Metal HUD 叠加面板（`src/common/np_build.cpp`、`src/common/np_panel.cpp`）**
+  - `MakeFmtUI()` 将标签/标题字体优先顺序由 `NSimSun` 调整为 `Microsoft YaHei UI` → `Microsoft YaHei`，消除左侧衬线宋体与右侧等宽无衬线字体混排割裂及 `0. 1% Low` 点号间距异常。
+  - `Cv()` 温度单位由全角 `℃` 改为 `" \u00b0C"`（`°C`），与等宽数值字体对齐；`CPU` 分组去除冗余前缀（`CPU 频率` → `频率`、`CPU 功耗` → `功耗`），与 `GPU` 分组对称；`GPU` 分组全部常态指标（功耗、核心/显存、风扇转速、未超温热点/显存结温）统一使用 `PL_GPU` 绿色；`CPU`/`GPU`/`系统` 分组前间距统一为 `8.0f`。
+  - `PanelRenderer::Render()` 为圆角底板新增自适应透明度的 1px 玻璃内描边、柔化标签亮度对比（`0.84/0.88/0.93 @ 0.92`）、加粗高亮分组标题，并为行内折线图增加暗底提亮填充与水平中线。
+- **主设置窗口（`src/app/ui.cpp`）**
+  - 引入与 Metal HUD 一致的中性碳黑 / 石墨深色主题（去除蓝偏，中性银白 `kAccent` 主强调，保留 `kGreen`/`kAmber`/`kDanger` 仅作状态指示）及等宽数值字体 `gFontMono`（`Cascadia Mono` 回退 `Consolas`）。
+  - 去除顶部白色系统标题栏：通过 `WM_NCCALCSIZE`、`WM_NCACTIVATE`、`WM_NCHITTEST`（顶部空白区 `HTCAPTION` 拖拽）与动态 `dwmapi.dll`（暗色模式/圆角/1px 客户区阴影扩展）将 `NextPerf` 标题栏融入深色窗口本体，并在右上提供常驻 `[监控运行中]`、`[保存配置]`、最小化与关闭按钮。
+  - 移除独立预览窗精简信息密度，缩小窗口至 `920 × 556`；左侧 `监控项目` 改为分组可折叠 2 列栅格（默认收起「系统」「实时图表」）；右侧采用手风琴折叠区组织 `外观设置` 与默认收起的 `高级选项与工具`（含行为开关与维护操作），`UpdateSliderFromX` 统一滑杆点击与拖拽换算，`tests/verify_frontinject.py` 同步更新按钮定位坐标。
+
+---
+
+## 未发布（main）—— 第一轮 Bug 修复与稳定性迭代
+
+> ⚠️ **未经用户完整测试**，未打 tag、未发布。**当前发布版仍以已打 tag 版本为准。**
+
+### 本轮修复的真实 Bug（按模块）
+
+- **ETW 监控（`src/etw/np_etw.cpp`）**
+  - 修复 `EtwMonitor::Start()` 中按值定义 `NP_EVENT_FILTER_EVENT_ID filter{}` 后向 `Events[1..2]` 写入导致的 4 字节栈缓冲溢出，改用 `alignas(NP_EVENT_FILTER_EVENT_ID)` 的足额 `filterBuf` 缓冲区。
+  - 修复 `EtwMonitor::SetTargetPid()` 切换进程后未清零 `saw171_`、`evNameN_`、`diagId171_` / `diagId172_` / `diagId184_`、`lowCalcAt_` 的残留状态（以及先读 `targetPid_` 再加锁的竞态）。
+  - 为 `EtwMonitor::OnEvent()` 与 `diagText()` 对共享状态与诊断数组的访问加上 `lock_` 同步保护（将 TDH 事件名查询保留在锁外）。
+- **公共结构体与渲染（`src/common/`）**
+  - `NPDefaultConfig()` 补全初始化 `autoInject`、`pauseHook`、`learnedAutoHook`、`detachPid` 为 `0`，并增加 `#ifdef __cplusplus static_assert` 锁定 `NPConfig`（136）、`NPSensors`（448）、`NPTelemetry`（55736）尺寸。
+  - `PanelRenderer::Measure()` 修复首帧未先调用 `EnsureFormats()` 导致直接返回 `240 x 110` 兜底尺寸的问题，同时增加 `!dwrite_` 保护并在 `c.counters` 变化时重置 `latchedW_` 允许面板收窄。
+  - `src/common/np_bitmap.cpp` 的 `GfxInit()` 从 `D2D1_FACTORY_TYPE_SINGLE_THREADED` 统一为 `D2D1_FACTORY_TYPE_MULTI_THREADED`。
+- **钩子层（`src/hook/`）**
+  - 修复 `DllMain(DLL_PROCESS_DETACH)` 进程终止分支（`lpReserved != nullptr`）仍在 OS Loader Lock 内执行还原钩子 / 等待 `gWorker` / 删除临界区导致潜在死锁的问题（现透传 `processTerminating` 参数直退）。
+  - 修复 `PresentCommon` 中 `NPHistoryPush` 实参顺序错乱导致 CPU/GPU 占用与帧时间曲线串列的问题。
+  - 完善 `PresentCommon` `setjmp(gJmp)` 异常恢复：同步复位 `gDbgInPresent` 与 `gNpCountingOverlayDraws`，并在持锁异常时置位 `gD12Broken` 且解锁 `gD12Lock`。
+  - 修复 `SelfUnloadNow()` 泄漏 `gReflexDev`、`nvapi` 模块句柄（新增 `ReflexReader::Shutdown()`）与静态局部 `sIq`（改为模块全局 `gInfoQueue12` 等并在卸载时释放复位）。
+  - `Cfg()` 与 `Sens()` 补充 `size == sizeof(NPConfig)` / `version == sizeof(NPSensors)` 布局自检。
+  - 修复 `Overlay12::Record()` 先把 `tex_` 转入 `PIXEL_SHADER_RESOURCE` 再分配/换堆 RTV 导致 RTV 失败后资源状态错位的问题，确保 `texW_`/`texH_` 仅在纹理创建成功后赋值，并在 `Overlay12::Release()` 复位所有状态与缓存字段；新增 `Overlay12::OnBackBuffer()` 在 `BeginList()` 前检测交换链分辨率/格式或同下标后备缓冲变化并提前换堆 + `settle_ = 30`，同时将 `srvHeap_` 改为 8 槽环、`uploadRing_` 按 ≥4MB 预分配，在 `PresentCommon` 用 `gPresentTempBb` 兜住 `longjmp` 时的后备缓冲引用释放（`tests/sim_stress.py --api=dx12` 12 步无 SEH 通过）。
+  - 调整 `UpdateTelemetryCommon()` 计算次序，确保 `SELFCHECK fpsLowLeAvg` 校验当帧刚算出的 `fpsLow1`/`fpsAvg`，并在 `gStats.lowPercentileFps` 路径对短期窗口造成的 `fpsLow1 > fpsAvg` 反转作收敛限幅。
+- **主程序、注入与界面（`src/app/`）**
+  - 将 `detachPid` 超时与退出清理逻辑提炼为 `ClearStaleDetachPidLocked()` / `ClearStaleDetachPidByAliveLocked()`，从 `gApp.games` 循环内移出并在 `InjectorScanNow()` 与 `InjectorTick()` 无条件执行；`InjectorScanNow()` 不再因 `gApp.games.empty()` 提前返回，外部 `--inject` 目标即使名单为空也可被正常认领。
+  - `TryOpenTelemetry()` 与 `PickTelemetry()` 增加 `version == sizeof(NPTelemetry)` 校验；主循环 `NPHistoryPush` 改用平滑/有效口径；`CleanupAndExit()` 与 `RunUiSmoke()` 退出时注销 `gFgHook`。
+  - `DoAction(A_DEFAULT)` 在恢复默认配置后立即按 `gApp.monitoring` 重新同步 `pauseHook`；`WM_DPICHANGED` 按系统建议矩形调用 `SetWindowPos` 同步调整窗口尺寸。
+- **传感器与模拟测试（`src/sensors/`、`tests/`）**
+  - `SensorHub::Init()` 移除未读取的 `\Thermal Zone Information(*)\Temperature`，注册并读取 `\Processor Information(*)\Processor Frequency`（`pdhNominalMHz_`），`PollCpu()` 改为依次从 PDH 标称频率、`cpuBaseMHz_` 与 `2300.0` 兜底换算，移除硬编码 `2300.0`。
+  - 修复 `tests/verify_quit_noinject.py` 错误引用 `settings.json` 的缺陷（改为 `config.json`）；在 `tests/verify_inject.py` 补全 `NPConfig` / `NPSensors` 镜像并更新 `tests/struct_check.py` 按 C++ 对齐规则检查三个结构体的全部成员偏移与总大小；`tests/vt_check.py` 增加 `NP_ZIG` / `PATH` / `ziglang` 自动发现；`tests/sim/sim_drive.py` 改按本机显示器刷新率校验 vsync；`tests/verify_watchdog.py` 增加帧间同步后再挂起渲染线程（并在误挂于 `PresentCommon` 内时自动重试）以消除随机时序竞争；`tests/sim/sim_dx12.cpp` 重构 `Resize()` 为排空队列后仅重建 backbuffer RTV，避免重建中销毁仍在使用的命令分配器与查询堆。
+
+---
+
 ## 未发布（main，2026-10-11 深夜 · 第二段）—— ③「以显示帧为准」：帧不再按 Present 间隔算
 
 > ⚠️ **未经用户完整测试**，未打 tag、未发布。**当前发布版是 v1.6.6。**

@@ -24,7 +24,7 @@
 
 ## 0. 30 秒认识这个项目
 
-**NextPerf** 是一个 Windows 游戏性能计数器（C++20，无 MSVC，用 **zig 0.16.0**
+**NextPerf** 是一个 Windows 游戏性能计数器（C++20，无 MSVC，用 **zig 0.16+** / `0.17.1`
 交叉编译）。它做两件事：
 
 1. **不注入**：用 NVML / NVAPI / PDH / WMI 等读硬件指标（CPU/GPU 占用、温度、
@@ -46,8 +46,8 @@
                                     │ CreateRemoteThread + LoadLibraryW
                     ┌───────────────┴─────────────────────────┐
                     │  NextPerfHook.dll（注入游戏，src/hook）   │
-                    │  钩 Present · 采集 · 画面板               │
-                    │  ⚠ **ResizeBuffers 目前没有挂钩**         │
+                    │  钩 Present/ResizeBuffers/Vulkan IAT    │
+                    │  采集 · 游戏内/桌面 HUD                 │
                     └─────────────────────────────────────────┘
 ```
 
@@ -88,10 +88,11 @@
 
 | 功能 | 文件 | 关键函数 |
 |---|---|---|
-| 64 位注入 | `src/app/injector.cpp` | `InjectInto`、`IsInjected` |
+| 64 位与便携单文件释放 | `src/app/injector.cpp`、`src/app/hook_embed.S` | `ExeDir`、`DllPath`、`DllPath32`、`HookEmbedInfo`、`ExtractEmbeddedHook`、`InjectInto`、`IsInjected` |
 | **32 位游戏注入（WoW64）** | `src/app/injector.cpp` | `NpExportAddr32`、`NpResolve32LoadLibraryW`、`NpReadRemote` |
 | 自动注入已添加的游戏 | `src/app/injector.cpp` | `InjectorScanNow`（**按 exe 名匹配**） |
-| 请求钩子自卸载 | `src/app/injector.cpp` | `RequestHookDetach`、`ForgetGameAt`、`ForgetLearned` |
+| 请求钩子自卸载 | `src/app/injector.cpp`、`src/app/main.cpp` | `RequestHookDetach`、`QueueHookDetach`（`gDetachQueue`）、`RemoveGameLocked`、`ForgetLearned` |
+| 便携配置读写 | `src/app/settings.cpp` | `SettingsPath`（支持 `NextPerf.portable` / 同目录 `config.json`）、`SettingsLoad`、`SettingsSave` |
 | 注入的钩子入口 | `src/hook/dllmain.cpp`、`src/hook/np_hook.cpp` | `DllMain`、worker 线程 |
 | 命令行注入 | `src/app/main.cpp` | `RunInjectCli`（`--inject <pid>`） |
 
@@ -101,11 +102,11 @@
 |---|---|---|
 | 交换链 vtable 探测 | `src/hook/np_hook.cpp` | `ProbeSwapChainVtable`（自造临时交换链 + SEH 保护 + `gProbePoisoned`） |
 | DXGI 工厂钩子 | `src/hook/np_hook.cpp` | `InstallDxgi`（`CreateSwapChain` / `ForCreateSwapChainForHwnd` / `ForComposition`） |
-| 交换链 vtable 钩子 | `src/hook/np_hook.cpp` | `PatchSwapChainVtable`、`Patch`、`SwapVtFor` |
-| Present / Present1 | `src/hook/np_hook.cpp` | `PresentCommon`（**核心**） |
-| ~~ResizeBuffers~~ | — | ❌ **未挂钩**（全仓 grep 证实只出现在注释里）—— 见 `HOOK.md` §11 与 `TODO.md` 的 **F1** |
-| D3D12 命令队列/命令列表 | `src/hook/np_hook.cpp` | `EnsureD3D12Hooks`（注意函数实现在 **`D3D12Core.dll`**） |
-| ~~ResizeBuffers（重复行，已合并到上面）~~ | — | 见上一行的 ❌ 未挂钩说明 |
+| 交换链 vtable 钩子 | `src/hook/np_hook.cpp` | `PatchSwapChainVtable`、`PatchSafe`（含 `PointsIntoOurDll` 防递归）、`SwapVtFor` |
+| Present / Present1 | `src/hook/np_hook.cpp` | `PresentCommon`（**核心**，含 4 角定位 `cfg.fpsCap & 3u`、`fpsLow01` 3 秒窗、`pauseHook` 跳过渲染保留收尾） |
+| `ResizeBuffers` / `ResizeBuffers1` | `src/hook/np_hook.cpp`、`src/hook/np_draw.cpp` | `NpResizeBuffers`、`NpResizeBuffers1`、`BeforeSwapchainResize`、`Overlay11/12::OnResizeBuffers`（含 200ms fence 等待） |
+| Vulkan 帧遥测（非侵入 IAT） | `src/hook/np_hook.cpp` | `InstallVulkan`、`PatchModuleVkIat`、`NpVkQueuePresentKHR`、`NpVkCreateSwapchainKHR`、`gVkProcAddrHandedOut`（含 `p99`/ETW/曲线/`vkIat=0` 自检） |
+| D3D12 命令队列/命令列表 | `src/hook/np_hook.cpp` | `EnsureD3D12Hooks`、`NpDispatchRays`/`NpBuildAS`(`TS_RT_BASE`)、`NpDispatch`(`TS_AI_BASE` 多槽)、`gUnloading`+`calledOrig` |
 | **还原所有补丁（幂等）** | `src/hook/np_hook.cpp` | `RestoreAllHooks`（**两条卸载路径都必须调**） |
 | 干净卸载 | `src/hook/np_hook.cpp` | `SelfUnloadNow`、`NpHookDetach`、`detachPid` 机制 |
 
@@ -125,18 +126,18 @@
 
 | 功能 | 文件 | 关键函数 |
 |---|---|---|
-| 游戏内叠加（D3D11） | `src/hook/np_draw.cpp` | `Overlay11::Draw`（**RTV 每帧新建、本帧释放**） |
-| 游戏内叠加（D3D12） | `src/hook/np_draw.cpp` | `Overlay12::Record`（**描述符堆"换堆"+ fence 延迟回收**） |
-| 面板渲染（共用） | `src/common/np_panel.cpp` | `PanelRenderer`（字号/缩放/列宽锁定） |
-| 面板行组装 | `src/common/np_build.cpp` | 分组、指标、颜色、开关 |
-| 桌面叠加窗口 | `src/app/overlay.cpp` | `OverlaySetVisible`、`OverlayUpdate`（分层窗口 + 鼠标穿透） |
+| 游戏内叠加（D3D11） | `src/hook/np_draw.cpp` | `Overlay11::Draw`（状态保存/恢复 + RTV 每帧新建本帧释放 + `NormalizeRtvFormat` + 视口裁剪） |
+| 游戏内叠加（D3D12） | `src/hook/np_draw.cpp` | `Overlay12::Record` / `OnFrameCompleted`（描述符堆"换堆" + 200ms fence 回收） |
+| 面板渲染（共用） | `src/common/np_panel.cpp` | `PanelRenderer`（Apple Metal HUD 2 行顶栏、核心 4 行 `[min max]`/`[VRAM]`、10 格双通道示波器、`ThemeFor` 4 套 Apple 材质、`LayoutHorizontalChips`） |
+| 面板行组装 | `src/common/np_build.cpp` | `BuildPanelData`、`ShortGpuName`、`NPComputeBottleneck`、`NP_PRESET_*`、Apple Metal 核心/扩展排版 |
+| 桌面叠加窗口 | `src/app/overlay.cpp` | `OverlaySetVisible`、`OverlayUpdate`（每显示器 DPI `Shcore!GetDpiForMonitor` + `overlayMode == 3` 仅后台） |
 
 ### 2.5 主程序与界面
 
 | 功能 | 文件 | 关键函数 |
 |---|---|---|
-| 主循环 / 托盘 | `src/app/main.cpp` | 窗口过程、`NP_TRAY_*` 消息 |
-| 自绘界面 | `src/app/ui.cpp` | `Add`、`Layout`、`W_CYCLE`、`A_*` 动作分发、**控件重叠检测** |
+| 主循环 / 托盘 | `src/app/main.cpp` | 窗口过程、`NP_TRAY_*` 消息（含 `NP_TRAY_LAYOUT`）、`pollMs`/`updateHz` 独立计时 |
+| 控制台界面（Direct2D） | `src/app/ui.cpp` | Apple / macOS Dark 统一风格四标签页控制台（Direct2D + DirectWrite）、`UiCanvas`、实时 Metal HUD 预览、异步扫描/注入线程 |
 | 前台窗口跟踪 | `src/app/main.cpp` | `AppTrackForeground`、`ForegroundWinEvent`、`ResolveForegroundPid`（UWP 剥壳） |
 | **可信名单自动学习** | `src/app/main.cpp` | 三条验证：`NP_HOOK_PRESENT` + `gfxApi != UNKNOWN` + `frameTotal` 增长 |
 | **陈旧遥测回收** | `src/app/main.cpp` | 帧数 2.5 秒不增长 → 判定钩子已死 → 清空遥测 |
@@ -158,48 +159,46 @@
 
 ### 3.1 主程序（`src/app/`）
 
-| 文件 | 行数 | 职责 |
-|---|---|---|
-| `main.cpp` | 1265 | 主循环、托盘、命令分发、前台跟踪、自动学习、陈旧遥测回收 |
-| `ui.cpp` | 941 | 自绘 D2D 界面、控件系统、动作分发 |
-| `injector.cpp` | 772 | 注入（含 WoW64 32 位）、看护扫描、HookControl |
-| `settings.cpp` | 184 | 配置 JSON 存取 |
-| `overlay.cpp` | 135 | 桌面分层叠加窗口 |
-| `np_app.h` | 187 | `AppState` / `GameEntry` 等 |
+| 文件 | 职责 |
+|---|---|
+| `main.cpp` | 主循环、托盘（含 `NP_TRAY_LAYOUT`）、全局热键 `Ctrl+Shift+O/B/P/R/L`、CSV 实时分位数 `# SUMMARY`、诊断剪贴板、前台跟踪、`telSlots` 回收 |
+| `ui.cpp` | Apple / macOS Dark 统一风格 Direct2D + DirectWrite 紧凑四标签页控制台（`900×580`）、实时 `1:1` Metal HUD 预览、异步扫描/注入线程 |
+| `injector.cpp` | 内嵌 64/32 位钩子 DLL 哈希释放（`%TEMP%\NextPerf\hooks\<hash>` + AppContainer ACL）、WoW64 32 位注入、看护扫描、多 PID `gDetachQueue` |
+| `hook_embed.S` | `.incbin` 将 `NextPerfHook.dll` 与 `NextPerfHook32.dll` 内嵌至 `NextPerf.exe` 只读段，支持单 EXE U 盘便携使用 |
+| `settings.cpp` | 配置 JSON 存取（`cfgVersion = 8` 紧凑 Metal HUD 迁移 + 便携模式同目录配置 + 无锁快照落盘） |
+| `overlay.cpp` | 桌面分层叠加窗口（4 角定位 + 每显示器 DPI + 仅后台模式） |
+| `np_app.h` | `AppState` / `GameEntry` / `BenchmarkSummary` / 便携内嵌查询接口 |
 
 ### 3.2 钩子（`src/hook/`）
 
-| 文件 | 行数 | 职责 |
-|---|---|---|
-| `np_hook.cpp` | 2971 | **钩子主体**：探测、挂钩、采集、遥测、卸载 |
-| `np_draw.cpp` / `.h` | 625 / 119 | 游戏内叠加绘制（D3D11 / D3D12 两套） |
-| `np_reflex.h` | 128 | NVAPI Reflex / 低延迟状态 |
-| `dllmain.cpp` | 26 | DLL 入口 |
-| `np_hook.h` | 7 | 导出声明 |
+| 文件 | 职责 |
+|---|---|
+| `np_hook.cpp` | **钩子主体**：探测、`PatchSafe`、DXGI/D3D12/Vulkan IAT 挂钩、采集、遥测、`gUnloading` 安全卸载 |
+| `np_draw.cpp` / `.h` | 游戏内叠加绘制（D3D11 状态保存恢复 + D3D12 200ms fence 等待与 `OnResizeBuffers`） |
+| `np_reflex.h` | NVAPI Reflex / 低延迟状态 |
+| `dllmain.cpp` | DLL 入口 |
+| `np_hook.h` | 导出声明 |
 
-> ⚠ **行数只作量级参考，引用代码一律用函数名**（`np_hook.cpp` 尤其不稳，正在被频繁修改）。
-> 上面的数字是 **2026-10-11 按 LF 字节数**出来的真行数 ——
-> **不要用 `Get-Content | Measure-Object -Line`**：它会把 LF-only 文件数少一截
-> （这张表上一版就是这么错的：写 ~1000，真值 1265）。
+> ⚠ 按 §6「不再写行号」约定，本表仅维护模块职责，不记录易漂移的物理行数。
 
 ### 3.3 公共（`src/common/`）
 
-| 文件 | 行数 | 职责 |
-|---|---|---|
-| `np_common.h` | 506 | **数据契约**：NPConfig / NPSensors / NPTelemetry / 宏 |
-| `np_stats.h` | 269 | `FrameStats` 环形缓冲、百分位、Low 帧 |
-| `np_panel.cpp` / `.h` | 545 / 130 | 面板渲染器 |
-| `np_build.cpp` / `.h` | 492 / 13 | 面板行组装 |
-| `np_json.h` | ~205 | 极简 JSON |
-| `np_bitmap.cpp` / `.h` | 102 / 52 | 位图工具 |
+| 文件 | 职责 |
+|---|---|
+| `np_common.h` | **数据契约**：`NPConfig` / `NPSensors` / `NPTelemetry` / 位域辅助与预设常量 |
+| `np_stats.h` | `FrameStats` 环形缓冲、百分位、Low 帧 |
+| `np_panel.cpp` / `.h` | Direct2D 面板渲染器（4 套主题、面积折线填充、横向精简条布局） |
+| `np_build.cpp` / `.h` | 面板行组装、`NPComputeBottleneck`、Preset 与新指标 |
+| `np_json.h` | 极简 JSON 解析（含越界与推进保护） |
+| `np_bitmap.cpp` / `.h` | 位图工具 |
 
 ### 3.4 传感器与 ETW
 
-| 文件 | 行数 | 职责 |
-|---|---|---|
-| `src/sensors/np_sensors.cpp` / `.h` | 1132 / 199 | NVML/PDH/WMI/HWiNFO 等采集与优选 |
-| `src/sensors/np_vendor.cpp` / `.h` | 342 / 270 | NVAPI / ADL 动态加载与结构定义 |
-| `src/etw/np_etw.cpp` / `.h` | 339 / 121 | ETW 会话（DxgKrnl Present） |
+| 文件 | 职责 |
+|---|---|
+| `src/sensors/np_sensors.cpp` / `.h` | NVML/NVAPI/PDH/WMI/HWiNFO 等采集与优选（含去重、缓存退避、DXGI 优选与 HWiNFO 重连） |
+| `src/sensors/np_vendor.cpp` / `.h` | NVAPI / ADL 动态加载与结构定义（含 72 字节 `NV_GPU_DYNAMIC_PSTATES_INFO_EX`） |
+| `src/etw/np_etw.cpp` / `.h` | ETW 会话（DxgKrnl Present、锁安全关闭、`184/171` 基准重置与诊断保留） |
 
 ### 3.5 测试（`tests/`）
 
@@ -220,7 +219,8 @@
 | `_exitprobe.py` | **复现「钩子开着时关窗口，进程退不掉」**（发 WM_CLOSE 给测试宿主，再看进程是否退出 + 抓 DETACH 日志）。只结束自己启动的进程，**不会** taskkill 用户的 NextPerf |
 | `_bisect.py` / `_readmecrash.py` / `_adddebuglayer.py` | D3D12 闪退的二分定位 / README 用崩溃复现 / 装调试层（`_` 前缀 = 内部探针） |
 | `host_run.cpp` | **旧的**简易测试宿主（将被 `sim/` 取代） |
-| `sim/` | **新的模拟游戏**（DX11/DX12，见 `SIMULATOR.md`） |
+| `verify_ground_truth.py` | **真值对照验证**（对比 `sim.exe` DX11/DX12 真值与 `NPTelemetry` 及 Compute Dispatch） |
+| `sim/` | **2D/3D 模拟基准程序**（DX11/DX12，同步导出为 `dist\NextPerfBench.exe`，窗口标题实时显示真值） |
 | `simvk/` | **新的 Vulkan 模拟游戏**（见 `SIMULATOR.md`） |
 
 ### 3.6 仓库根
@@ -288,11 +288,11 @@ python tests\struct_check.py                  # 结构体镜像一致性
    没有区别。主流工具（RTSS/Steam/Game Bar/Playnite）**清一色靠数据库**。
    本项目因此**移除了**靠特征猜的自动注入，只认**可信名单**。
 10. **改显示口径要三思。** Low 帧曾因擅自换成"68 秒窗口平均"而"卡顿后钉住
-    70 秒"。**当前实际用的是「窗口平均」口径（1000ms 窗口 / 回看约 10 秒，
-    `np_hook.cpp::UpdateTelemetryCommon` 里的 `lowWindowed`）**；严格百分位
-    （对 FPS 取 P1 ≡ `1000/P99(帧时间)`）只在窗口数不足 4 个时兜底。
-    ⚠ 本文件曾把口径写成"最终采用严格百分位"，与代码不符 —— **改口径前先读代码**，
-    并同步 `COMMON.md` §3.4 与 README 的「已知问题」。
+    70 秒"。**当前实际用的是 Intel PresentMon 动态查询的「滑动窗口百分位」口径**
+    （`np_hook.cpp::UpdateTelemetryCommon` 调用 `lowPercentileFps(99.0/99.9, n1s)`，
+    线性插值 + 倒数指标排名反转；管理员运行时由 ETW 经 `NPConfig.reserved[]` 中继 1s/3s 窗口值）；
+    `lowWindowed` **已退休**，只留在 `np_stats.h` 作历史对照。
+    **改口径前先读代码**，并同步 `COMMON.md`、`DATA-STRUCTS.md` 与 `README.md`。
 
 11. **★★ 「先加诊断再改行为」—— 一行日志推翻了我推演三轮的解释（2026-10-11）**
 

@@ -4,4 +4,4 @@
 #include <windows.h>
 
 void NpHookAttach(HMODULE self);
-void NpHookDetach();
+void NpHookDetach(bool processTerminating = false);

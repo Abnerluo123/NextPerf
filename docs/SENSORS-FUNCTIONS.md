@@ -147,7 +147,7 @@
 | `NpProcessorPowerInfo` | `np_sensors.cpp:632-639` | 按 MSDN 补齐的结构体（MinGW 头文件里没有） | `CpuFreqFromPowerInfo` | 字段顺序 `Number/MaxMhz/CurrentMhz/MhzLimit/MaxIdleState/CurrentIdleState` 不能错 |
 | `kNpProcessorInformation = 11` | `np_sensors.cpp:641` | `POWER_INFORMATION_LEVEL` 里的 `ProcessorInformation` | 同上 | 写错数字会拿到别的信息类 |
 | ★ `CpuFreqFromPowerInfo(mhzOut)` | `np_sensors.cpp:643` | 运行时 `LoadLibraryW("powrprof.dll")` + `GetProcAddress("CallNtPowerInformation")`；缓冲区按逻辑处理器数自算；取**最高核** MHz | `PollCpu`（`:706`） | ⚠ **不能链接 `-lpowrprof`**（`build.bat:71` 里没有），因为 MinGW 头文件缺声明（`:628-629`）；⚠ 失败时返回的是 **NTSTATUS**（`0xC0000023`）**不是所需长度**（`:660-662`，本机实测确认）；成功时 `buf[i].MaxMhz` 在本机等于当前频率，**别拿它当真实最大值** |
-| `cpuBaseMHz_` | `np_sensors.h:156` | 注册表 `~MHz`（CPU 标称频率），PDH 回退用 | `PollCpu`（`:712`） | 本机实测 = 3072；与 PDH 自己的标称 2300 不一致 → 回退口径存疑（SENSORS.md 3.1） |
+| `cpuBaseMHz_` / `pdhNominalMHz_` | `np_sensors.h` | 注册表 `~MHz`（兜底）与 PDH `\Processor Information(*)\Processor Frequency` 标称频率 | `Init`、`PollCpu` | `PollCpu` 优先取 `pdhNominalMHz_`，依次回退 `cpuBaseMHz_` 与 `2300.0`，不再硬编码 2300 |
 | `cpuFreqFromNt_` | `np_sensors.h:155` | 标记本次频率是否来自 Nt 路径 | 仅内部写 | 没有消费者；注释说 false 时"可能系统性偏低"，本机实测方向相反 |
 
 ---
@@ -175,15 +175,13 @@
 | `~EtwMonitor()` | `np_etw.cpp:34` | `Stop()` + `DeleteCriticalSection` | 进程退出 | |
 | `SetStatus(const char*)` | `np_etw.cpp:39` | 加锁写 `status_` | `Start`（`:233`、`:245`、`:257`、`:261`）、`ConsumeLoop`（`:275`） | ⚠ 消费者线程也写它 → 必须加锁 |
 | `status()` | `np_etw.cpp:45` | 加锁读并**返回拷贝** | `main.cpp:173`、`main.cpp:984/986` | ⚠★ 返回引用会让主线程与消费者线程读写同一个 `std::string`（UB） |
-| ★ `Start()` | `np_etw.cpp:200` | 建实时会话（`ClientContext=1` QPC、`EVENT_TRACE_REAL_TIME_MODE`、`FlushTimer=1`）→ `EnableTraceEx2(DxgKrnl, INFORMATION, kKwPresent)` → 起消费者线程 | `main.cpp:983`（WinMain，启动时一次） | ⚠ **需要管理员**；`ERROR_ACCESS_DENIED` → 状态文案"创建 ETW 会话被拒"，返回 false，**不阻塞程序**；⚠ 反作弊也会让它 ACCESS_DENIED —— **不要尝试绕过**；⚠ 同会话残留先 STOP 再建（`:222-225`） |
+| ★ `Start()` | `np_etw.cpp` | 建实时会话（`ClientContext=1` QPC、`EVENT_TRACE_REAL_TIME_MODE`、`FlushTimer=1`）→ 用对齐缓冲区 `filterBuf` 配事件 ID 过滤（171/172/184）并 `EnableTraceEx2` → 起消费者线程 | `WinMain` | 已修复原 `NP_EVENT_FILTER_EVENT_ID` 栈越界写；**需要管理员**；反作弊/无权限时返回 false 不阻塞 |
 | `Stop()` | `np_etw.cpp:285` | `stop_=true` → `CloseTrace` → 等消费者线程最多 2s → `ControlTraceW(STOP)` | `~EtwMonitor`、`main.cpp:724`（`CleanupAndExit`） | ⚠ 不显式停会留同名会话（`main.cpp:722-723` 的原话）；`:246`、`:258` 在失败路径上也会调 |
 | `ConsumeLoop()` | `np_etw.cpp:265` | 消费者线程：`OpenTraceW`（REAL_TIME + EVENT_RECORD）→ `ProcessTrace`（阻塞）→ `CloseTrace` | `Start` 起的线程（`:252-255`） | 失败时 `SetStatus("OpenTrace 失败")` 并 `active_=false` |
 | `OnBuffer(lf)` | `np_etw.cpp:145` | 返回 `stop_ ? FALSE : TRUE` 结束 `ProcessTrace` | ETW 运行时回调 | `__stdcall` |
 | ★ `ClassifyEvent(ev, opOut, nameOut, nameCap)`（static） | `np_etw.cpp:64` | 用 TDH 动态取事件名（`TaskNameOffset` → `OpcodeNameOffset` 兜底），判定是否一次 present | `OnEvent`（`:117`） | ⚠★ **名字必须拷进调用方缓冲**（TDH 的名字指向局部 vector，返回即析构 → use-after-free）；⚠ `TRACE_EVENT_INFO` 里**没有** `EventNameOffset`；⚠ 判定 = 名字是 `Present` 或以 `Present_` 开头（**不能用 `wcsstr` 子串**）+ `opcode==1`（P14） |
-| ★ `OnEvent(ev)` | `np_etw.cpp:97` | 过滤 `targetPid_` → 查 `{Id,Version,Opcode}` 缓存 → 未命中则 `ClassifyEvent` → 记录事件名（去重，最多 6）→ `OnPresent(TimeStamp)` | ETW 运行时回调 | ⚠★ **`targetPid_ == 0` 时一条都不算**（否则全系统 present 污染 Low 帧，P12）；命中缓存时不重新取名，所以事件名只在首次记录 |
-| `OnPresent(qpc100ns)` | `np_etw.cpp:147` | 累计 `presentN_`；算帧间隔（`0.02 < ms < 1000` 才入环形缓冲）；1 秒窗口计数算 `fps_` | `OnEvent`（`:142`） | 全程持锁；时间戳单位 100ns（`/10000` → ms） |
-| `RecalcLow()` | `np_etw.cpp:173` | 对环形缓冲排序，取最慢 1% / 0.1% 的平均帧时间 → 换算 FPS | `Snapshot`（`:329`） | ⚠ 样本 < 32 直接返回；⚠★ **限流 200ms（5Hz）**：它是在持锁状态下全排序 2048 个样本，会拖住消费者线程（P16） |
-| `SetTargetPid(pid)` | `np_etw.cpp:307` | 切换跟踪目标；**重建全部基线**（`lastQpc_/winStart_/winN_/ringN_/frameMs_/fps_/low*/presentN_`） | `main.cpp:119`（`AppPollSensors`，每轮） | pid 未变时直接返回；不重建基线会把两个进程的间隔算成一帧 |
+| ★ `OnEvent(ev)` / `diagText()` | `np_etw.cpp` | 持 `lock_` 同步过滤 `targetPid_`、`saw171_` 优先级、事件名去重与直方图诊断（TDH 查找在锁外）→ `OnPresent(TimeStamp)` | ETW 运行时回调 / 诊断读取 | `targetPid_ == 0` 时不计；`diagText()` 与 `OnEvent()` 共享字段均受 `lock_` 保护 |
+| `SetTargetPid(pid)` | `np_etw.cpp` | 持 `lock_` 切换跟踪目标并完整重置基线与状态（`saw171_`、`evNameN_`、`diagId171_/172_/184_`、`lowCalcAt_` 等） | `AppPollSensors` | 防止跨目标切换时 `saw171_` 或事件名/直方图残留 |
 | `Snapshot(Result*)` | `np_etw.cpp:321` | 加锁取一份快照（`frameMs/fps/presentN/inWindow/low1Fps/low01Fps/evNames`），内部会调 `RecalcLow` | `main.cpp:136`（覆盖 Low 帧）、`main.cpp:152`（取帧计数）、`main.cpp:172`（诊断日志） | 返回 `presentN > 0` 表示"有数据"；⚠ 主线程 120ms 内会调 3 次（`:179`） |
 | `EtwMonitor::Result` | `np_etw.h:50-63` | 快照结构（含 `evNames[6][96]` 诊断事件名） | `main.cpp:132`、`:151`、`:171` | `evNames` 是用来定位"帧率翻倍"的，别删 |
 | `EvKey` / `cachedKey_` / `cachedVal_` | `np_etw.h:84-87`、`np_etw.cpp:109-123` | 事件判定缓存（最多 8 项） | `OnEvent` | 避免每条事件都走 TDH |

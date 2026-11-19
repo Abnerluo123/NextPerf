@@ -1,6 +1,7 @@
 #include "np_app.h"
 
 #include <shlobj.h>
+#include <cmath>
 #include <cstdio>
 
 #include "common/np_json.h"
@@ -11,6 +12,15 @@ static std::wstring gPath;
 
 std::wstring SettingsPath() {
     if (!gPath.empty()) return gPath;
+    // 便携模式：exe 同目录已放有 config.json 或 NextPerf.portable 时，配置跟随 U 盘保存
+    std::wstring ed = ExeDir();
+    std::wstring localCfg = ed + L"\\config.json";
+    std::wstring portFlag = ed + L"\\NextPerf.portable";
+    if (GetFileAttributesW(localCfg.c_str()) != INVALID_FILE_ATTRIBUTES ||
+        GetFileAttributesW(portFlag.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        gPath = localCfg;
+        return gPath;
+    }
     wchar_t appData[MAX_PATH]{};
     if (SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_APPDATA, nullptr, 0, appData))) {
         std::wstring dir = std::wstring(appData) + L"\\NextPerf";
@@ -67,7 +77,14 @@ bool SettingsLoad() {
         // 这里显式清位而不是把它们踢出复选框 —— 用户仍可手动勾选启用；
         // 清位只在 ver<5 时执行一次，不会把用户的勾选反复抹掉。
         if (ver < 5) gApp.cfg.counters &= ~(NP_C_CPU_BUSY | NP_C_CPU_WAIT);
+        // v7：Apple Metal HUD 默认配置 —— 去掉冗余行内小图，默认开启 2 行顶栏与 [min max] 区间
+        if (ver < 7) {
+            gApp.cfg.counters &= ~(NP_C_CHART_USAGE | NP_C_CHART_FPS | NP_C_CHART_LATENCY);
+            gApp.cfg.counters |= NP_C_GRAPH | NP_C_GPU_NAME;
+        }
     }
+    int cfgVer = 1;
+    if (auto* p = get("cfgVersion")) cfgVer = (int)p->numOr(1);
     // 背景固定纯黑（用户明确要求），旧配置里的蓝黑色一律丢弃
     gApp.cfg.bgColor = 0xFF000000u;
     // ⚠ bgColor 原来只有写回、没有读取 —— 用户改了背景色，重启就丢（审计发现的）
@@ -84,6 +101,16 @@ bool SettingsLoad() {
     if (auto* p = get("graphHeight")) gApp.cfg.graphHeight = (uint32_t)p->numOr(gApp.cfg.graphHeight);
     if (auto* p = get("overlayMode")) gApp.cfg.overlayMode = (uint32_t)p->numOr(gApp.cfg.overlayMode);
     if (auto* p = get("fpsCap")) gApp.cfg.fpsCap = (uint32_t)p->numOr(gApp.cfg.fpsCap);
+    if (cfgVer < 8) {
+        NPConfigSetTheme(&gApp.cfg, 0);
+        NPConfigSetShowRange(&gApp.cfg, true);
+        NPConfigSetShowHeader(&gApp.cfg, true);
+        if (gApp.cfg.fontHeight == 14 || gApp.cfg.fontHeight == 15) gApp.cfg.fontHeight = 13;
+        if (gApp.cfg.graphHeight == 52 || gApp.cfg.graphHeight == 64) gApp.cfg.graphHeight = 46;
+        if (fabsf(gApp.cfg.bgOpacity - 0.72f) < 0.01f ||
+            fabsf(gApp.cfg.bgOpacity - 0.78f) < 0.01f)
+            gApp.cfg.bgOpacity = 0.82f;
+    }
     if (auto* p = get("pollMs")) gApp.cfg.pollMs = (uint32_t)p->numOr(gApp.cfg.pollMs);
     if (auto* p = get("updateHz")) gApp.cfg.updateHz = (uint32_t)p->numOr(gApp.cfg.updateHz);
     if (auto* p = get("deepEngineHook")) gApp.cfg.deepEngineHook = (uint32_t)p->numOr(1);
@@ -138,7 +165,7 @@ bool SettingsLoad() {
 void SettingsSave() {
     using np::Json;
     Json::Value root = Json::mkObj();
-    root.obj["cfgVersion"] = Json::mkNum(5);
+    root.obj["cfgVersion"] = Json::mkNum(8);
     root.obj["counters"] = Json::mkNum((double)gApp.cfg.counters);
     root.obj["autoInject"] = Json::mkNum((double)gApp.cfg.autoInject);
     root.obj["bgColor"] = Json::mkNum(gApp.cfg.bgColor);
@@ -161,9 +188,15 @@ void SettingsSave() {
     root.obj["simulate"] = Json::mkNum(gApp.cfg.simulate);
     root.obj["learnedAutoHook"] = Json::mkNum(gApp.cfg.learnedAutoHook);
 
+    std::vector<GameEntry> gamesSnap;
+    {
+        AppLock lk;
+        gamesSnap = gApp.games;
+    }
+
     Json::Value games = Json::mkArr();
     // games 仍然只存**手动添加**的路径（保持老格式，零迁移风险）
-    for (auto& g : gApp.games) {
+    for (auto& g : gamesSnap) {
         if (g.learned) continue;
         games.arr.push_back(Json::mkStr(np::WideToUtf8(g.path)));
     }
@@ -172,7 +205,7 @@ void SettingsSave() {
     // 「学习来的」条目单独存 exe 名 —— 商店应用的路径读不到，只能按名字认
     {
         auto learned = Json::mkArr();   // mkArr 返回的是 Value，不是 Json
-        for (auto& g : gApp.games) {
+        for (auto& g : gamesSnap) {
             if (g.learned && !g.name.empty()) learned.arr.push_back(Json::mkStr(np::WideToUtf8(g.name)));
         }
         root.obj["learned"] = learned;

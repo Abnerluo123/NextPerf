@@ -17,6 +17,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <vector>
 
 #include "common/np_bitmap.h"
 #include "common/np_build.h"
@@ -33,6 +34,196 @@ static bool gTrayOk = false;       // 托盘图标是否真的注册成功（失
 static bool gOverlayOff = false;   // 托盘里的「快速关闭叠加」开关
 static bool gWantQuit = false;     // TrackPopupMenu 的模态循环会吃掉 WM_QUIT，菜单关闭后需补发
 static NOTIFYICONDATAW gNid{};
+
+#define NP_HK_OVERLAY 101
+#define NP_HK_BENCH   102
+#define NP_HK_PAUSE   103
+#define NP_HK_RESET   104
+#define NP_HK_LAYOUT  105
+
+static FILE*              gBenchFile = nullptr;
+static std::string        gBenchPathUtf8;
+static std::wstring       gBenchWPath;
+static uint64_t           gBenchT0 = 0;
+static uint64_t           gBenchSamples = 0;
+static uint64_t           gBenchLastFrameTotal = 0;
+static uint32_t           gBenchFpsSamples = 0;
+static double             gBenchFpsSum = 0.0;
+static double             gBenchLow1Sum = 0.0;
+static float              gBenchFpsMin = 0.0f;
+static float              gBenchFpsMax = 0.0f;
+static std::string        gBenchProcess;
+static std::vector<float> gBenchFrameMs;
+
+bool BenchmarkActive() { return gBenchFile != nullptr; }
+
+static std::string CsvQuote(const char* s) {
+    if (!s || !s[0]) return "\"-\"";
+    std::string out = "\"";
+    for (const char* p = s; *p; ++p) {
+        if (*p == '"') out += "\"\"";
+        else out += *p;
+    }
+    out += '"';
+    return out;
+}
+
+static void BenchmarkStopInternal(bool silent) {
+    if (!gBenchFile) return;
+
+    BenchmarkSummary sum{};
+    sum.valid = true;
+    sum.durationSec = std::max(0.1f, (float)(GetTickCount64() - gBenchT0) / 1000.0f);
+    sum.processName = gBenchProcess.empty() ? "-" : gBenchProcess;
+    sum.csvPath = gBenchWPath;
+
+    if (!gBenchFrameMs.empty()) {
+        double totalMs = 0.0;
+        float minMs = 1e9f, maxMs = 0.0f;
+        for (float fm : gBenchFrameMs) {
+            totalMs += fm;
+            if (fm < minMs) minMs = fm;
+            if (fm > maxMs) maxMs = fm;
+        }
+        std::vector<float> sorted = gBenchFrameMs;
+        std::sort(sorted.begin(), sorted.end());
+        size_t n = sorted.size();
+        size_t i99 = (size_t)std::clamp<size_t>((size_t)((n - 1) * 99 / 100), 0, n - 1);
+        size_t i999 = (size_t)std::clamp<size_t>((size_t)((n - 1) * 999 / 1000), 0, n - 1);
+        sum.samples = (uint32_t)n;
+        sum.avgFps = totalMs > 0.01 ? (float)(1000.0 * (double)n / totalMs) : 0.0f;
+        sum.minFps = (maxMs > 0.01f) ? (1000.0f / maxMs) : 0.0f;
+        sum.maxFps = (minMs > 0.01f) ? (1000.0f / minMs) : 0.0f;
+        sum.low1Fps = (sorted[i99] > 0.01f) ? (1000.0f / sorted[i99]) : 0.0f;
+        sum.low01Fps = (sorted[i999] > 0.01f) ? (1000.0f / sorted[i999]) : 0.0f;
+        if (sum.low1Fps > sum.avgFps) sum.low1Fps = sum.avgFps;
+        if (sum.low01Fps > sum.low1Fps) sum.low01Fps = sum.low1Fps;
+    } else {
+        sum.samples = (uint32_t)gBenchSamples;
+        sum.avgFps = gBenchFpsSamples ? (float)(gBenchFpsSum / (double)gBenchFpsSamples) : 0.0f;
+        sum.minFps = gBenchFpsMin;
+        sum.maxFps = gBenchFpsMax;
+        sum.low1Fps = gBenchFpsSamples ? (float)(gBenchLow1Sum / (double)gBenchFpsSamples) : 0.0f;
+        sum.low01Fps = sum.low1Fps;
+    }
+
+    fprintf(gBenchFile,
+            "# SUMMARY,Samples=%u,DurationSec=%.2f,AvgFps=%.2f,MinFps=%.2f,MaxFps=%.2f,"
+            "Low1Fps=%.2f,Low01Fps=%.2f,Process=%s\n",
+            sum.samples, (double)sum.durationSec, (double)sum.avgFps, (double)sum.minFps,
+            (double)sum.maxFps, (double)sum.low1Fps, (double)sum.low01Fps,
+            sum.processName.c_str());
+    fclose(gBenchFile);
+    gBenchFile = nullptr;
+    gApp.lastBench = sum;
+
+    if (!silent) {
+        char msg[512];
+        snprintf(msg, sizeof(msg),
+                 "CSV 录制已停止（%u 帧 · %.1fs · 均 %.1f / 最小 %.1f / 1%%Low %.1f / 0.1%%Low %.1f）：%s",
+                 sum.samples, (double)sum.durationSec, (double)sum.avgFps, (double)sum.minFps,
+                 (double)sum.low1Fps, (double)sum.low01Fps, gBenchPathUtf8.c_str());
+        SetNotice(msg, 0, 14000);
+        AppLog("bench: stopped samples=%u dur=%.2fs avg=%.2f min=%.2f max=%.2f low1=%.2f low01=%.2f file=%s",
+               sum.samples, (double)sum.durationSec, (double)sum.avgFps, (double)sum.minFps,
+               (double)sum.maxFps, (double)sum.low1Fps, (double)sum.low01Fps,
+               gBenchPathUtf8.c_str());
+    }
+    gBenchFrameMs.clear();
+}
+
+void BenchmarkToggle() {
+    if (gBenchFile) {
+        BenchmarkStopInternal(false);
+        return;
+    }
+    wchar_t tmp[MAX_PATH]{};
+    DWORD n = GetTempPathW(MAX_PATH, tmp);
+    if (!n || n >= MAX_PATH) wcscpy_s(tmp, L".\\");
+    SYSTEMTIME st{};
+    GetLocalTime(&st);
+    wchar_t wpath[MAX_PATH]{};
+    swprintf(wpath, MAX_PATH, L"%lsNextPerf_Bench_%04d%02d%02d_%02d%02d%02d.csv", tmp,
+             (int)st.wYear, (int)st.wMonth, (int)st.wDay, (int)st.wHour, (int)st.wMinute,
+             (int)st.wSecond);
+    gBenchFile = _wfopen(wpath, L"wb");
+    if (!gBenchFile) {
+        SetNotice("无法创建性能 CSV 录制文件", 1, 6000);
+        return;
+    }
+    static const unsigned char kBom[3] = {0xEF, 0xBB, 0xBF};
+    fwrite(kBom, 1, 3, gBenchFile);
+    fprintf(gBenchFile,
+            "TimeMs,Process,API,FPS,FrameTimeMs,Low1Fps,Low01Fps,CpuBusyMs,CpuWaitMs,"
+            "GpuFrameMs,CpuUsagePct,CpuClockMHz,CpuPowerW,GpuUsagePct,GpuTempC,"
+            "GpuPowerW,GpuClockMHz,VramUsedGB,RamUsedGB,RtLoadPct,TensorLoadPct\n");
+    fflush(gBenchFile);
+    gBenchWPath = wpath;
+    gBenchPathUtf8 = np::WideToUtf8(wpath);
+    gBenchT0 = GetTickCount64();
+    gBenchSamples = 0;
+    gBenchLastFrameTotal = gApp.telemetry.frameTotal;
+    gBenchFpsSamples = 0;
+    gBenchFpsSum = 0.0;
+    gBenchLow1Sum = 0.0;
+    gBenchFpsMin = 0.0f;
+    gBenchFpsMax = 0.0f;
+    gBenchProcess = gApp.telemetry.processName[0] ? gApp.telemetry.processName : "";
+    gBenchFrameMs.clear();
+    gBenchFrameMs.reserve(4096);
+    SetNotice("开始录制性能 CSV（Ctrl+Shift+B 停止）：" + gBenchPathUtf8, 0, 8000);
+    AppLog("bench: started file=%s", gBenchPathUtf8.c_str());
+}
+
+static void BenchmarkTick(uint64_t nowMs) {
+    if (!gBenchFile) return;
+    const NPTelemetry& t = gApp.telemetry;
+    const NPSensors& s = gApp.sensors;
+    const char* api = "None";
+    if (t.gfxApi == NP_API_D3D11) api = "D3D11";
+    else if (t.gfxApi == NP_API_D3D12) api = "D3D12";
+    else if (t.gfxApi == NP_API_D3D9) api = "D3D9";
+    else if (t.gfxApi == NP_API_VULKAN) api = "Vulkan";
+    else if (t.gfxApi == NP_API_OPENGL) api = "OpenGL";
+
+    if (t.processName[0]) gBenchProcess = t.processName;
+
+    // 采集真实逐帧时间样本（上限 200,000 帧），供停止时计算严格百分位统计
+    if (t.attached && t.frameTotal > gBenchLastFrameTotal && gBenchFrameMs.size() < 200000) {
+        uint64_t delta = t.frameTotal - gBenchLastFrameTotal;
+        uint32_t take = (uint32_t)std::min<uint64_t>({
+            delta, (uint64_t)NP_FRAME_CAP, (uint64_t)(200000 - gBenchFrameMs.size())
+        });
+        uint32_t baseIdx = (t.frameWrite + NP_FRAME_CAP - take) % NP_FRAME_CAP;
+        for (uint32_t i = 0; i < take; ++i) {
+            float fm = t.frames[(baseIdx + i) % NP_FRAME_CAP];
+            if (fm > 0.02f && fm < 1000.0f) gBenchFrameMs.push_back(fm);
+        }
+        gBenchLastFrameTotal = t.frameTotal;
+    }
+
+    float gpuMs = (s.gpuBusyMs >= 0.0f) ? s.gpuBusyMs : t.gpuFrameMs;
+    float ftMs = t.frameMsAvg > 0.0001f ? t.frameMsAvg : t.frameMs;
+    std::string procCell = CsvQuote(t.processName);
+    fprintf(gBenchFile,
+            "%llu,%s,%s,%.2f,%.3f,%.2f,%.2f,%.3f,%.3f,%.3f,%.1f,%.0f,%.1f,%.1f,%.1f,%.1f,%.0f,"
+            "%.2f,%.2f,%.2f,%.2f\n",
+            (unsigned long long)(nowMs - gBenchT0), procCell.c_str(), api,
+            (double)t.fps, (double)ftMs, (double)t.fpsLow1, (double)t.fpsLow01,
+            (double)t.cpuBusyAvg, (double)t.cpuWaitAvg, (double)gpuMs, (double)s.cpuUsage,
+            (double)s.cpuClock, (double)s.cpuPower, (double)s.gpuUsage, (double)s.gpuTemp,
+            (double)s.gpuPower, (double)s.gpuClock, (double)s.vramUsedGB, (double)s.ramUsedGB,
+            (double)t.rtLoad, (double)t.tensorLoad);
+    ++gBenchSamples;
+    if (t.fps > 0.1f) {
+        ++gBenchFpsSamples;
+        gBenchFpsSum += t.fps;
+        gBenchLow1Sum += t.fpsLow1;
+        if (gBenchFpsMin <= 0.0f || t.fps < gBenchFpsMin) gBenchFpsMin = t.fps;
+        if (t.fps > gBenchFpsMax) gBenchFpsMax = t.fps;
+    }
+    if ((gBenchSamples & 15u) == 0) fflush(gBenchFile);
+}
 
 // ---------------------------------------------------------------- 共享内存
 static bool CreateShm() {
@@ -63,7 +254,7 @@ static void TryOpenTelemetry() {
         HANDLE m = OpenFileMappingW(FILE_MAP_READ, FALSE, name);
         if (!m) continue;
         NPTelemetry* v = (NPTelemetry*)MapViewOfFile(m, FILE_MAP_READ, 0, 0, sizeof(NPTelemetry));
-        if (!v || v->magic != NP_MAGIC) {
+        if (!v || v->magic != NP_MAGIC || v->version != sizeof(NPTelemetry)) {
             if (v) UnmapViewOfFile(v);
             CloseHandle(m);
             continue;
@@ -81,7 +272,7 @@ static void TryOpenTelemetry() {
 static void PickTelemetry() {
     AppState::TelSlot* best = nullptr;
     for (auto& s : gApp.telSlots) {
-        if (!s.view || s.view->magic != NP_MAGIC) continue;
+        if (!s.view || s.view->magic != NP_MAGIC || s.view->version != sizeof(NPTelemetry)) continue;
         s.lastTick = s.view->tickMs;
         if (!best || s.lastTick > best->lastTick) best = &s;
     }
@@ -135,7 +326,10 @@ void AppPollSensors() {
             if (er.low1Fps > 0.1f) gApp.telemetry.fpsLow1 = er.low1Fps;
             if (er.low01Fps > 0.1f) gApp.telemetry.fpsLow01 = er.low01Fps;
             // 帧率 / 帧时间：显示侧、无亚帧抖动 → 一并覆盖（实测比钩子准）
-            if (er.frameMs > 0.02f && er.frameMs < 1000.0f) gApp.telemetry.frameMs = er.frameMs;
+            if (er.frameMs > 0.02f && er.frameMs < 1000.0f) {
+                gApp.telemetry.frameMs = er.frameMs;
+                gApp.telemetry.frameMsAvg = er.frameMs;
+            }
             if (er.fps > 1.0f) gApp.telemetry.fps = er.fps;
             // ★ 回传给钩子（游戏内面板用的是钩子自己的数，不回传就会出现
             //   "桌面 59 / 游戏内 39" 的双份数据）。见 NPConfigSetEtwRelay 的说明。
@@ -376,7 +570,7 @@ static const wchar_t* kAntiCheatKw[] = {
     L"fairfight", L"equ8", L"anticheat", L"anti-cheat",
 };
 
-static bool NameIsAntiCheat(const std::wstring& raw) {
+bool IsAntiCheatExeName(const std::wstring& raw) {
     std::wstring nm = raw;
     for (auto& c : nm) c = (wchar_t)towlower(c);
     for (auto* k : kAntiCheatKw) {
@@ -399,7 +593,7 @@ static bool AnyAntiCheatRunning() {
     pe.dwSize = sizeof(pe);
     if (Process32FirstW(snap, &pe)) {
         do {
-            if (NameIsAntiCheat(pe.szExeFile)) { sCached = true; break; }
+            if (IsAntiCheatExeName(pe.szExeFile)) { sCached = true; break; }
         } while (Process32NextW(snap, &pe));
     }
     CloseHandle(snap);
@@ -523,11 +717,11 @@ void AppTrackForeground() {
 
 void AppPublish() {
     // ★ 「退出监视」要连**游戏内的钩子**一起停：钩子据 pauseHook 跳过叠加绘制与
-    //   遥测更新（= 停止读取）。原来只关了桌面 HUD，游戏内面板照旧在画、
-    //   数据照旧在读 —— 用户点退出监视后还能看到它在更新。
+    //   遥测更新（= 停止读取）。
     gApp.cfg.pauseHook = gApp.monitoring ? 0u : 1u;
     if (gApp.shmCfg) {
         NPConfig c = gApp.cfg;
+        if (gOverlayOff) c.overlayMode = 3;
         memcpy(gApp.shmCfg, &c, sizeof(NPConfig));
     }
     if (gApp.shmSens) memcpy(gApp.shmSens, &gApp.sensors, sizeof(NPSensors));
@@ -537,6 +731,93 @@ void AppPublish() {
     AppLock lk;
     TryOpenTelemetry();
     PickTelemetry();
+}
+
+bool AppOverlayVisible() {
+    return !gOverlayOff;
+}
+
+void AppSetOverlayOff(bool off) {
+    gOverlayOff = off;
+    if (off) OverlaySetVisible(false);
+    AppPublish();
+    UiRefresh();
+}
+
+void AppResetHistory() {
+    gApp.hist = NPHistory{};
+    SetNotice("已重置监控历史曲线与分布", 0, 4000);
+    UiRefresh();
+}
+
+bool AppCopyDiagToClipboard() {
+    const NPSensors& s = gApp.sensors;
+    const NPTelemetry& t = gApp.telemetry;
+    std::wstring wb;
+    int bLevel = 0;
+    np::NPComputeBottleneck(s, t, &wb, &bLevel);
+
+    std::string report;
+    char line[512];
+    snprintf(line, sizeof(line), "=== NextPerf Diagnostic Snapshot ===\r\n");
+    report += line;
+    snprintf(line, sizeof(line), "Build: %s | Admin: %s | ETW: %s (%s)\r\n",
+             np::WideToUtf8(BuildStamp()).c_str(), gApp.isAdmin ? "yes" : "no",
+             np::Etw().active() ? "active" : "inactive", np::Etw().status().c_str());
+    report += line;
+    snprintf(line, sizeof(line), "Sensors Summary: %s\r\n", gApp.hub.Describe().c_str());
+    report += line;
+    for (const auto& src : gApp.hub.sources()) {
+        snprintf(line, sizeof(line), "  - Source %-8s present=%d used=%d (%s)\r\n",
+                 src.name.c_str(), src.present ? 1 : 0, src.used ? 1 : 0, src.note.c_str());
+        report += line;
+    }
+    snprintf(line, sizeof(line),
+             "Hardware: CPU=%.1f%% %.0fMHz %.1fC %.1fW | GPU=%s %.1f%% %.0fMHz %.1fC %.1fW\r\n",
+             (double)s.cpuUsage, (double)s.cpuClock, (double)s.cpuTemp, (double)s.cpuPower,
+             s.gpuName[0] ? s.gpuName : "Unknown", (double)s.gpuUsage, (double)s.gpuClock,
+             (double)s.gpuTemp, (double)s.gpuPower);
+    report += line;
+    snprintf(line, sizeof(line),
+             "Memory: RAM %.2f/%.2f GB | VRAM %.2f/%.2f GB | Display %ux%u @%uHz\r\n",
+             (double)s.ramUsedGB, (double)s.ramTotalGB, (double)s.vramUsedGB,
+             (double)s.vramTotalGB, s.screenW, s.screenH, s.refreshHz);
+    report += line;
+    snprintf(line, sizeof(line),
+             "Telemetry: live=%d attached=%u pid=%lu proc=%s api=%u fps=%.1f low1=%.1f low01=%.1f\r\n",
+             gApp.telemetryLive ? 1 : 0, t.attached, (unsigned long)gApp.telemetryPid,
+             t.processName[0] ? t.processName : "-", t.gfxApi, (double)t.fps,
+             (double)t.fpsLow1, (double)t.fpsLow01);
+    report += line;
+    snprintf(line, sizeof(line),
+             "Bottleneck: %s | HookFlags: 0x%X | LastError: %s\r\n",
+             wb.empty() ? "-" : np::WideToUtf8(wb).c_str(), t.hookFlags,
+             t.lastError[0] ? t.lastError : "none");
+    report += line;
+    snprintf(line, sizeof(line), "Log: %s\r\n", np::WideToUtf8(AppLogPath()).c_str());
+    report += line;
+
+    std::wstring wreport = np::Utf8ToWide(report);
+    if (!OpenClipboard(UiWindow())) {
+        SetNotice("无法打开剪贴板", 1, 4000);
+        return false;
+    }
+    EmptyClipboard();
+    size_t bytes = (wreport.size() + 1) * sizeof(wchar_t);
+    HGLOBAL hg = GlobalAlloc(GMEM_MOVEABLE, bytes);
+    if (hg) {
+        void* p = GlobalLock(hg);
+        if (p) {
+            memcpy(p, wreport.c_str(), bytes);
+            GlobalUnlock(hg);
+            SetClipboardData(CF_UNICODETEXT, hg);
+        } else {
+            GlobalFree(hg);
+        }
+    }
+    CloseClipboard();
+    SetNotice("已复制系统与传感器诊断报告到剪贴板", 0, 5000);
+    return true;
 }
 
 static const char* ApiName(uint32_t api) {
@@ -561,20 +842,11 @@ static std::string HookHint(uint32_t flags) {
 static void UpdateStatus() {
     char buf[768];
     const NPTelemetry& t = gApp.telemetry;
-    // ⚠ 原来这里是 `(GetTickCount64() - t.tickMs) < 2500` —— **跨进程比时钟**，
-    //   和 overlay mode 那个 bug 同源（钩子写的时间戳可能落在"未来"或早已陈旧，
-    //   算出来是垃圾）。现在统一用「帧数是否在增长」判存活，与 overlay mode 一致。
-    static uint64_t sStFt = 0;
-    static uint64_t sStGrow = 0;
-    if (t.frameTotal != sStFt) {
-        sStFt = t.frameTotal;
-        sStGrow = GetTickCount64();
-    }
-    bool live = t.attached && sStGrow != 0 && (GetTickCount64() - sStGrow) < 2500;
+    bool live = gApp.monitoring && gApp.telemetryLive && t.attached;
 
     // 「上一次操作/失败原因」优先显示，并且有存活时间 —— 不能被 120ms 的
-    // 常规刷新冲掉，否则用户永远看不到注入失败的原因（这是原来最大的问题）。
-    // ★ 加锁：守护线程（注入看护）注入失败时也会 SetNotice，读写必须互斥。
+    // 常规刷新冲掉，否则用户永远看不到注入失败的原因。
+    size_t injectedN = 0;
     {
         AppLock lk;
         if (!gApp.notice.empty() && GetTickCount64() < gApp.noticeUntil) {
@@ -584,6 +856,7 @@ static void UpdateStatus() {
             return;
         }
         gApp.notice.clear();
+        injectedN = gApp.injected.size();
     }
 
     if (live) {
@@ -592,17 +865,17 @@ static void UpdateStatus() {
                  gApp.monitoring ? "监控中" : "已停止",
                  t.processName[0] ? t.processName : "?", (unsigned long)gApp.telemetryPid,
                  ApiName(t.gfxApi), t.fps, gApp.sensors.cpuUsage, gApp.sensors.gpuUsage);
-    } else if (!gApp.injected.empty()) {
+    } else if (injectedN > 0) {
         // 钩子即使挂不上 Present 也会回报「为什么」，优先把它摆出来
         if (t.lastError[0]) {
             snprintf(buf, sizeof(buf),
                      "状态：%s | 已注入 %zu 个进程 · %s | CPU %.0f%% | GPU %.0f%%",
-                     gApp.monitoring ? "监控中" : "已停止", gApp.injected.size(), t.lastError,
+                     gApp.monitoring ? "监控中" : "已停止", injectedN, t.lastError,
                      gApp.sensors.cpuUsage, gApp.sensors.gpuUsage);
         } else {
             snprintf(buf, sizeof(buf),
                      "状态：%s | 已注入 %zu 个进程但未接管画面（%s）| CPU %.0f%% | GPU %.0f%%",
-                     gApp.monitoring ? "监控中" : "已停止", gApp.injected.size(),
+                     gApp.monitoring ? "监控中" : "已停止", injectedN,
                      HookHint(t.hookFlags).c_str(), gApp.sensors.cpuUsage, gApp.sensors.gpuUsage);
         }
     } else {
@@ -641,6 +914,8 @@ static void ShowTrayMenu(HWND hwnd) {
                 IsWindowVisible(hwnd) ? L"隐藏主窗口" : L"显示主窗口");
     AppendMenuW(m, MF_STRING | (gOverlayOff ? MF_UNCHECKED : MF_CHECKED), NP_TRAY_OVERLAY,
                 L"叠加面板");
+    AppendMenuW(m, MF_STRING | (NPConfigHorizontal(gApp.cfg) ? MF_CHECKED : MF_UNCHECKED),
+                NP_TRAY_LAYOUT, L"顶部横条 HUD 模式");
     AppendMenuW(m, MF_STRING | (gApp.monitoring ? MF_CHECKED : MF_UNCHECKED), NP_TRAY_MONITOR,
                 gApp.monitoring ? L"监控中（点击暂停）" : L"已暂停（点击恢复）");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
@@ -674,8 +949,7 @@ void AppTrayNotify(UINT notifyMsg) {
             break;
         case WM_LBUTTONUP:
             // 单击图标 = 快速开关叠加
-            gOverlayOff = !gOverlayOff;
-            if (gOverlayOff) OverlaySetVisible(false);
+            AppSetOverlayOff(!gOverlayOff);
             break;
         case WM_LBUTTONDBLCLK:
             ShowWindow(hwnd, IsWindowVisible(hwnd) ? SW_HIDE : SW_SHOW);
@@ -692,13 +966,23 @@ void AppTrayCommand(int id) {
             ShowWindow(hwnd, IsWindowVisible(hwnd) ? SW_HIDE : SW_SHOW);
             break;
         case NP_TRAY_OVERLAY:
-            gOverlayOff = !gOverlayOff;
-            if (gOverlayOff) OverlaySetVisible(false);
+            AppSetOverlayOff(!gOverlayOff);
             break;
+        case NP_TRAY_LAYOUT: {
+            bool h = !NPConfigHorizontal(gApp.cfg);
+            NPConfigSetHorizontal(&gApp.cfg, h);
+            AppPublish();
+            SettingsSave();
+            SetNotice(h ? "HUD 已切换为顶部横条模式" : "HUD 已切换为竖版面板模式", 0, 4000);
+            UiRefresh();
+            break;
+        }
         case NP_TRAY_MONITOR:
             gApp.monitoring = !gApp.monitoring;
             if (gApp.monitoring) InjectorScanNow();
             else OverlaySetVisible(false);
+            AppPublish();
+            UiRefresh();
             break;
         case NP_TRAY_ELEVATE:
             if (AdminRelaunch()) {
@@ -751,12 +1035,22 @@ static void CleanupAndExit() {
     AppPublish();
     Sleep(900);   // 等钩子完成自卸载（含 100ms 排空中窗）
 
-    // 2) 托盘图标
+    // 2) 托盘图标 / 热键 / 录制句柄
+    BenchmarkStopInternal(true);
+    if (HWND hw = UiWindow()) {
+        KillTimer(hw, 1);
+        UnregisterHotKey(hw, NP_HK_OVERLAY);
+        UnregisterHotKey(hw, NP_HK_BENCH);
+        UnregisterHotKey(hw, NP_HK_PAUSE);
+        UnregisterHotKey(hw, NP_HK_RESET);
+        UnregisterHotKey(hw, NP_HK_LAYOUT);
+    }
     if (gTrayAdded) { Shell_NotifyIconW(NIM_DELETE, &gNid); gTrayAdded = false; }
 
     // 3) 各子系统（InjectorShutdown 已在最前面调用过；它是幂等的，不必重复调）
     OverlayShutdown();
     UiDestroy();
+    if (gFgHook) { UnhookWinEvent(gFgHook); gFgHook = nullptr; }
 
     // 4) 共享内存：解除映射并关闭句柄，对象本体随最后一个句柄关闭而销毁
     TelemetryCloseAll();
@@ -781,8 +1075,14 @@ static int RunSelfTest() {
     // 注意不能写成 DllPath() + "\\..\\selftest.txt" —— DllPath() 是
     // "...\NextPerfHook.dll"，那是把 dll 当目录再退一级，路径非法，
     // _wfopen 一直失败，报告只进了 stderr（踩过）。
-    DllPath();
-    FILE* f = _wfopen((gApp.exeDir + L"\\..\\selftest.txt").c_str(), L"wb");
+    std::wstring ed = ExeDir();
+    std::wstring stPath = ed + L"\\selftest.txt";
+    if (ed.size() >= 5) {
+        std::wstring tail = ed.substr(ed.size() - 5);
+        for (auto& c : tail) c = (wchar_t)towlower(c);
+        if (tail == L"\\dist" || tail == L"/dist") stPath = ed + L"\\..\\selftest.txt";
+    }
+    FILE* f = _wfopen(stPath.c_str(), L"wb");
     auto log = [&](const char* fmt, ...) {
         char buf[512];
         va_list ap;
@@ -808,6 +1108,10 @@ static int RunSelfTest() {
         Sleep(220);
     }
     log("数据源: %s", gApp.hub.Describe().c_str());
+    for (const auto& sinfo : gApp.hub.sources()) {
+        log("  - %s: present=%d used=%d (%s)", sinfo.name.c_str(), sinfo.present ? 1 : 0,
+            sinfo.used ? 1 : 0, sinfo.note.c_str());
+    }
     log("显卡: %s", gApp.sensors.gpuName[0] ? gApp.sensors.gpuName : "(未知)");
     // 哨兵值（-273 表示传感器没读到）要显示成 --，不能把绝对值原样打出来。
     // 面板那边早就是这么做的（见 np_build.cpp 的 Cv），这里漏了。
@@ -864,15 +1168,28 @@ static int RunSelfTest() {
         }
     }
 
-    // 共享内存
+    // 共享内存与内嵌单文件钩子
     if (!CreateShm()) { log("[FAIL] 共享内存创建失败"); ++fails; }
     else log("[ OK ] 共享内存 Config / Sensors 创建成功");
-    log("钩子 DLL: %ls", DllPath().c_str());
-    if (GetFileAttributesW(DllPath().c_str()) == INVALID_FILE_ATTRIBUTES) {
+    size_t b64 = 0, b32 = 0;
+    bool embedOk = HookEmbedInfo(&b64, &b32);
+    log("内嵌钩子 DLL: %s (64-bit=%.1f KB, 32-bit=%.1f KB)",
+        embedOk ? "是" : "否", b64 / 1024.0, b32 / 1024.0);
+    std::wstring p64 = DllPath();
+    std::wstring p32 = DllPath32();
+    log("钩子 DLL(64): %ls", p64.c_str());
+    log("钩子 DLL(32): %ls", p32.c_str());
+    if (GetFileAttributesW(p64.c_str()) == INVALID_FILE_ATTRIBUTES) {
         log("[FAIL] 找不到 NextPerfHook.dll");
         ++fails;
     } else {
         log("[ OK ] NextPerfHook.dll 存在");
+    }
+    if (GetFileAttributesW(p32.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        log("[FAIL] 找不到 NextPerfHook32.dll");
+        ++fails;
+    } else {
+        log("[ OK ] NextPerfHook32.dll 存在");
     }
 
     log("=================");
@@ -912,6 +1229,7 @@ static int RunUiSmoke(HINSTANCE inst) {
     OverlaySetVisible(false);
     OverlayShutdown();
     UiDestroy();
+    if (gFgHook) { UnhookWinEvent(gFgHook); gFgHook = nullptr; }
     npb::GfxShutdown();
     gApp.hub.Shutdown();
     // 见 RunSelfTest 的说明：这条路径必须硬退出，否则会留残留进程
@@ -990,6 +1308,9 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdLine, int cmdShow) {
         wchar_t exe[MAX_PATH]{};
         GetModuleFileNameW(nullptr, exe, MAX_PATH);
         std::wstring dll = DllPath();
+        std::wstring dll32 = DllPath32();
+        size_t b64 = 0, b32 = 0;
+        HookEmbedInfo(&b64, &b32);
         BOOL admin = FALSE;
         PSID admins = nullptr;
         SID_IDENTIFIER_AUTHORITY nt = SECURITY_NT_AUTHORITY;
@@ -1002,8 +1323,11 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdLine, int cmdShow) {
         AppLog("---- NextPerf 启动 ----");
         AppLog("build    : %ls", BuildStamp().c_str());
         AppLog("exe      : %ls", exe);
+        AppLog("embed    : 64-bit=%.1f KB, 32-bit=%.1f KB", b64 / 1024.0, b32 / 1024.0);
         AppLog("hook dll : %ls (%s)", dll.c_str(),
                GetFileAttributesW(dll.c_str()) == INVALID_FILE_ATTRIBUTES ? "不存在!" : "存在");
+        AppLog("hook 32  : %ls (%s)", dll32.c_str(),
+               GetFileAttributesW(dll32.c_str()) == INVALID_FILE_ATTRIBUTES ? "不存在!" : "存在");
         AppLog("admin    : %s", gApp.isAdmin ? "yes" : "no");
         AppLog("log      : %ls", AppLogPath().c_str());
         AppLog("游戏列表 : %zu 项", gApp.games.size());
@@ -1034,41 +1358,65 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdLine, int cmdShow) {
     InjectorScanNow();
 
     HWND hwnd = UiWindow();
+    if (hwnd) {
+        RegisterHotKey(hwnd, NP_HK_OVERLAY, MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT, 'O');
+        RegisterHotKey(hwnd, NP_HK_BENCH, MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT, 'B');
+        RegisterHotKey(hwnd, NP_HK_PAUSE, MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT, 'P');
+        RegisterHotKey(hwnd, NP_HK_RESET, MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT, 'R');
+        RegisterHotKey(hwnd, NP_HK_LAYOUT, MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT, 'L');
+        SetTimer(hwnd, 1, 33, nullptr);
+    }
     MSG msg{};
-    uint64_t lastTick = 0;
+    uint64_t lastCoreMs = 0;
+    uint64_t lastHistMs = 0;
+    uint64_t lastUiMs = 0;
+    AppPollSensors();
+    gApp.lastPoll = GetTickCount64();
 
     while (GetMessageW(&msg, nullptr, 0, 0)) {
         if (msg.message == WM_QUIT) break;
+        if (msg.message == WM_HOTKEY) {
+            if (msg.wParam == NP_HK_OVERLAY) {
+                AppSetOverlayOff(!gOverlayOff);
+                SetNotice(gOverlayOff ? "已隐藏叠加面板 (Ctrl+Shift+O 恢复)"
+                                      : "已恢复叠加面板 (Ctrl+Shift+O 隐藏)",
+                          0, 4000);
+            } else if (msg.wParam == NP_HK_BENCH) {
+                BenchmarkToggle();
+            } else if (msg.wParam == NP_HK_PAUSE) {
+                gApp.monitoring = !gApp.monitoring;
+                if (gApp.monitoring) InjectorScanNow();
+                else OverlaySetVisible(false);
+                AppPublish();
+                SetNotice(gApp.monitoring ? "已恢复性能监控 (Ctrl+Shift+P)"
+                                          : "已暂停性能监控 (Ctrl+Shift+P)",
+                          0, 4000);
+            } else if (msg.wParam == NP_HK_RESET) {
+                AppResetHistory();
+            } else if (msg.wParam == NP_HK_LAYOUT) {
+                bool h = !NPConfigHorizontal(gApp.cfg);
+                NPConfigSetHorizontal(&gApp.cfg, h);
+                AppPublish();
+                SettingsSave();
+                SetNotice(h ? "HUD 已切换为顶部横条模式 (Ctrl+Shift+L)"
+                            : "HUD 已切换为竖版面板模式 (Ctrl+Shift+L)",
+                          0, 4000);
+            }
+            UpdateStatus();
+            UiRefresh();
+            continue;
+        }
 
-        // 托盘消息与菜单命令统一在主窗口过程（MainProc）里处理：
-        // TrackPopupMenu 的模态循环会把 WM_COMMAND 直接派发给窗口过程，
-        // 在这里拦截反而收不到菜单点击（这就是之前"右键菜单点了没反应"的根因）。
+        // 托盘消息与菜单命令统一在主窗口过程（MainProc）里处理。
 
         uint64_t now = GetTickCount64();
-        if (now - lastTick >= 120) {
-            lastTick = now;
+        if (now - lastCoreMs >= 100) {
+            lastCoreMs = now;
             AppTrackForeground();
-            AppAutoInjectTick();   // 3D 窗口自动注入（默认关闭，见 cfg.autoInject）
-            // ★ 每个 tick 都同步一次配置（含 cfg.pauseHook）。
-            //
-            // 为什么加在这里而不是 monitoring 块里：原来 AppPublish() 只在
-            // monitoring 为真时调用，于是用户点「退出监视」后配置**再也不发布**，
-            // 钩子永远收不到 pauseHook —— 游戏内面板照旧在画、数据照旧在读，
-            // 只有桌面 HUD 被关掉了（用户报的第三个问题）。
-            // AppPublish 是幂等的、开销极小（几十字节的 memcpy），无条件调用最稳。
+            AppAutoInjectTick();
             AppPublish();
-            // ------------------------------------------------------------------
-            // v1.6 学习：用户手动注入后，**验证真的读到数据**才把该 exe 记入可信名单。
-            //
-            // 为什么必须验证（用户明确要求）：
-            //   「记住这个用户 hook 也可能 hook 错，所以要看 hook 之后是否有可读取
-            //     数据出来，以及 d3d 之类的能不能出来」
-            //
-            // 三条件全部满足、并持续 3 秒，才记：
-            //   ① NP_HOOK_PRESENT —— Present 真的挂上（不是只注入成功）
-            //   ② gfxApi != UNKNOWN —— 认出了 D3D
-            //   ③ frameTotal 在这 3 秒里确实增长了 —— 帧数据真的在流动
-            // ------------------------------------------------------------------
+
+            // v1.6 学习：用户手动注入后，验证真的读到数据才把该 exe 记入可信名单。
             {
                 static DWORD    sLearnPid = 0;
                 static uint32_t sLearnSince = 0;
@@ -1087,8 +1435,6 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdLine, int cmdShow) {
                         bool flowing = lt.frameTotal > sLearnFt;
                         sLearnSince = 0;   // 同一个 pid 只判一次
                         if (flowing) {
-                            // 取进程名（PROCESS_QUERY_LIMITED_INFORMATION ->
-                            // **商店/UWP 进程也能查**，不像 VM_READ 那样打不开）
                             std::wstring nm;
                             HANDLE hp = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, lt.pid);
                             if (hp) {
@@ -1102,12 +1448,6 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdLine, int cmdShow) {
                                 }
                                 CloseHandle(hp);
                             }
-                            // ★ 兜底：QueryFullProcessImageNameW 失败时（对商店/UWP 或
-                            //   保护更严的进程有可能），改用系统级进程快照取名字 ——
-                            //   CreateToolhelp32Snapshot **不需要打开目标进程**，
-                            //   所以一定有名字。拿不到路径无所谓，学习只需要名字
-                            //   （商店应用的路径本来也读不了）。
-                            //   不加这个兜底的话，失败会得到空名字 -> 静默跳过学习，很隐蔽。
                             if (nm.empty()) {
                                 HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
                                 if (snap != INVALID_HANDLE_VALUE) {
@@ -1125,23 +1465,22 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdLine, int cmdShow) {
                                     CloseHandle(snap);
                                 }
                             }
-                            bool known = nm.empty();
-                            for (auto& g : gApp.games) {
-                                if (g.name == nm) { known = true; break; }
-                            }
-                            bool self = (nm == L"nextperf.exe");
-                            if (!nm.empty() && !known && !self) {
-                                GameEntry g;
-                                g.name = nm;
-                                g.learned = true;
-                                {
-                                    // ★ 必须加锁：守护线程每 800ms 遍历 gApp.games，
-                                    //   push_back 触发扩容会让它的迭代器变成野指针（会崩）。
-                                    //   ui.cpp 的「添加游戏 exe」为此专门加了 AppLock，
-                                    //   学习这条路径原来漏了（审计发现 G2）。
-                                    AppLock lk;
-                                    gApp.games.push_back(g);
+                            bool addedLearned = false;
+                            if (!nm.empty() && nm != L"nextperf.exe") {
+                                AppLock lk;
+                                bool known = false;
+                                for (const auto& g : gApp.games) {
+                                    if (g.name == nm) { known = true; break; }
                                 }
+                                if (!known) {
+                                    GameEntry g;
+                                    g.name = nm;
+                                    g.learned = true;
+                                    gApp.games.push_back(g);
+                                    addedLearned = true;
+                                }
+                            }
+                            if (addedLearned) {
                                 SettingsSave();
                                 AppLog("learn: 注入后验证通过（Present 挂上 + 认出 D3D + 帧在流动）"
                                        "-> 把 %ls 记入可信名单（实验性自动钩子见设置）",
@@ -1154,55 +1493,65 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdLine, int cmdShow) {
                     sLearnSince = 0;
                 }
             }
+
             if (gApp.monitoring) {
-                AppPollSensors();
-                AppPublish();
-                if (gApp.cfg.simulate) {
-                    // 模拟数据（开发预览用，正式版删除）：叠加起伏的正弦 + 噪声
-                    float ph = (float)(now % 200000) * 0.001f;
-                    float fps = 97.0f + 26.0f * sinf(ph / 6.3f) + 11.0f * sinf(ph / 1.31f) +
-                                5.0f * sinf(ph * 1.73f);
-                    if (fps < 20) fps = 20;
-                    float ft = 1000.0f / fps;
-                    float avg = fps * (0.965f + 0.02f * sinf(ph / 17.0f));
-                    float low1 = fps * (0.86f + 0.05f * sinf(ph / 9.0f));
-                    float low01 = fps * (0.71f + 0.07f * sinf(ph / 5.2f));
-                    float cpu = 42.0f + 30.0f * sinf(ph / 8.1f) + 8.0f * sinf(ph * 2.9f);
-                    float gpu = 78.0f + 18.0f * sinf(ph / 7.3f) + 5.0f * sinf(ph * 3.7f);
-                    cpu = std::clamp(cpu, 2.0f, 99.0f);
-                    gpu = std::clamp(gpu, 2.0f, 99.0f);
-                    NPTelemetry& tm = gApp.telemetry;
-                    tm.fps = fps; tm.fpsAvg = avg; tm.fpsLow1 = low1; tm.fpsLow01 = low01;
-                    tm.frameMs = ft;
-                    tm.cpuFrameMs = ft * (0.52f + 0.10f * sinf(ph / 4.4f));
-                    tm.gpuFrameMs = ft * (0.82f + 0.08f * sinf(ph / 3.1f));
-                    gApp.hist.sampleMs = 125;
-                    // 演示模式：CPUBusy/CPUWait 也造出合理数值，否则这两条曲线恒为 0
-                    tm.cpuBusyMs = tm.frameMs * (0.30f + 0.06f * sinf(ph / 5.2f));
-                    tm.cpuWaitMs = tm.frameMs - tm.cpuBusyMs;
-                    NPHistoryPush(&gApp.hist, fps, avg, low1, low01, cpu, gpu, tm.frameMs,
-                                  tm.cpuFrameMs, tm.gpuFrameMs,
-                                  tm.cpuBusyMs, tm.cpuWaitMs);
-                } else {
-                    NPHistoryPush(&gApp.hist, gApp.telemetry.fps, gApp.telemetry.fpsAvg,
-                                  gApp.telemetry.fpsLow1, gApp.telemetry.fpsLow01,
-                                  gApp.sensors.cpuUsage, gApp.sensors.gpuUsage,
-                                  gApp.telemetry.frameMs, gApp.telemetry.cpuFrameMs,
-                                  gApp.telemetry.gpuFrameMs,
-                                  gApp.telemetry.cpuBusyMs, gApp.telemetry.cpuWaitMs);
+                uint32_t pollMs = std::clamp(gApp.cfg.pollMs ? gApp.cfg.pollMs : 500u, 100u, 2000u);
+                if (now - gApp.lastPoll >= pollMs) {
+                    gApp.lastPoll = now;
+                    AppPollSensors();
+                    AppPublish();
                 }
+
+                if (now - lastHistMs >= 120) {
+                    lastHistMs = now;
+                    if (gApp.cfg.simulate) {
+                        // 模拟数据：叠加起伏的正弦 + 噪声
+                        float ph = (float)(now % 200000) * 0.001f;
+                        float fps = 97.0f + 26.0f * sinf(ph / 6.3f) + 11.0f * sinf(ph / 1.31f) +
+                                    5.0f * sinf(ph * 1.73f);
+                        if (fps < 20) fps = 20;
+                        float ft = 1000.0f / fps;
+                        float avg = fps * (0.965f + 0.02f * sinf(ph / 17.0f));
+                        float low1 = fps * (0.86f + 0.05f * sinf(ph / 9.0f));
+                        float low01 = fps * (0.71f + 0.07f * sinf(ph / 5.2f));
+                        float cpu = 42.0f + 30.0f * sinf(ph / 8.1f) + 8.0f * sinf(ph * 2.9f);
+                        float gpu = 78.0f + 18.0f * sinf(ph / 7.3f) + 5.0f * sinf(ph * 3.7f);
+                        cpu = std::clamp(cpu, 2.0f, 99.0f);
+                        gpu = std::clamp(gpu, 2.0f, 99.0f);
+                        gApp.sensors.cpuUsage = cpu;
+                        gApp.sensors.gpuUsage = gpu;
+                        NPTelemetry& tm = gApp.telemetry;
+                        tm.attached = 0;
+                        tm.fps = fps; tm.fpsAvg = avg; tm.fpsLow1 = low1; tm.fpsLow01 = low01;
+                        tm.frameMs = ft;
+                        tm.frameMsAvg = ft;
+                        tm.cpuFrameMs = ft * (0.52f + 0.10f * sinf(ph / 4.4f));
+                        tm.cpuFrameMsAvg = tm.cpuFrameMs;
+                        tm.gpuFrameMs = ft * (0.82f + 0.08f * sinf(ph / 3.1f));
+                        gApp.hist.sampleMs = 125;
+                        tm.cpuBusyMs = tm.frameMs * (0.30f + 0.06f * sinf(ph / 5.2f));
+                        tm.cpuBusyAvg = tm.cpuBusyMs;
+                        tm.cpuWaitMs = tm.frameMs - tm.cpuBusyMs;
+                        tm.cpuWaitAvg = tm.cpuWaitMs;
+                        NPHistoryPush(&gApp.hist, fps, avg, low1, low01, cpu, gpu, tm.frameMs,
+                                      tm.cpuFrameMs, tm.gpuFrameMs,
+                                      tm.cpuBusyMs, tm.cpuWaitMs);
+                    } else {
+                        float gpuSeries = (gApp.sensors.gpuBusyMs >= 0.0f)
+                                              ? gApp.sensors.gpuBusyMs
+                                              : gApp.telemetry.gpuFrameMs;
+                        NPHistoryPush(&gApp.hist, gApp.telemetry.fps, gApp.telemetry.fpsAvg,
+                                      gApp.telemetry.fpsLow1, gApp.telemetry.fpsLow01,
+                                      gApp.sensors.cpuUsage, gApp.sensors.gpuUsage,
+                                      gApp.telemetry.frameMsAvg, gApp.telemetry.cpuFrameMsAvg,
+                                      gpuSeries,
+                                      gApp.telemetry.cpuBusyAvg, gApp.telemetry.cpuWaitAvg);
+                    }
+                    BenchmarkTick(now);
+                }
+
                 InjectorTick();
 
-                // ★ 「钩子是否接管」不要用**跨进程的时钟差**来判断。
-                //   实测诊断日志：age=4294967265ms（32 位下的 -31，即 tickMs 落在"未来"）
-                //   -> `age < 2500` 永远为假 -> attached 永远为假
-                //   -> **桌面 HUD 永不关闭**（用户报的那个 bug）。
-                //   时钟跨进程比较本来就不该作为依据：旧钩子实例残留、时钟回绕、
-                //   共享内存里的历史值，任何一样都会让它变成垃圾。
-                //
-                //   改成看**帧计数是否在增长**：与时钟无关，而且是「钩子活着并且真的
-                //   在计数」的直证。守护线程停摆、Present 没挂上、
-                //   监控已暂停（不再更新遥测），都会让它自然变假。
                 static uint64_t sLastFt = 0;
                 static uint64_t sLastGrowMs = 0;
                 uint64_t ft = gApp.telemetry.frameTotal;
@@ -1211,11 +1560,6 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdLine, int cmdShow) {
                     sLastFt = ft;
                     sLastGrowMs = now;
                 }
-                // ★ 陈旧遥测回收：钩子卸载后（无论走哪条路），主程序可能还持有那个
-                //   共享内存句柄，于是对象不销毁、每 tick 继续读到**冻结的旧数据**
-                //   （实测日志 tele=1 ft=5023 growAge=86469ms）。
-                //   判据：遥测连着但帧数超过 2.5 秒不再增长 -> 该钩子已死 -> 清掉。
-                //   这样状态栏、面板、图表都不会再念旧数据，而且不依赖跨进程时钟。
                 if (gApp.telemetry.attached && telPid != 0 && sLastGrowMs &&
                     (now - sLastGrowMs) > 2500) {
                     AppLog("telemetry: pid=%lu 帧数停增 %.1f 秒 -> 判定钩子已死，清空遥测",
@@ -1228,23 +1572,25 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdLine, int cmdShow) {
                         for (size_t i = gApp.injected.size(); i-- > 0;) {
                             if (gApp.injected[i] == dead) gApp.injected.erase(gApp.injected.begin() + i);
                         }
+                        for (size_t i = gApp.telSlots.size(); i-- > 0;) {
+                            if (gApp.telSlots[i].pid == dead) {
+                                if (gApp.telSlots[i].view) UnmapViewOfFile(gApp.telSlots[i].view);
+                                if (gApp.telSlots[i].map) CloseHandle(gApp.telSlots[i].map);
+                                gApp.telSlots.erase(gApp.telSlots.begin() + i);
+                            }
+                        }
+                        if (gApp.telemetryPid == dead) gApp.telemetryPid = 0;
                     }
-                    // ★ 只清计时器，**绝不要把 sLastFt 清成 0**。
-                    //   清 0 之后下一次读到的"冻结帧数"（比如 888）与 0 不相等，会被当成
-                    //   "帧数又增长了" -> 立刻重新判活 -> 2.5 秒后再判死，于是状态栏在
-                    //   「钩上 / 没钩上」之间**每 2.5 秒翻一次**（用户 2026-10-11 实测：
-                    //   20:52:07 判死、20:52:09 再判死、20:52:11 又 attached=1）。
-                    //   保留冻结值：只有帧数真的变化（含新钩子实例从 0 重新计数）才会复活。
                     sLastGrowMs = 0;
                 }
                 bool attached = gApp.telemetry.attached && sLastGrowMs != 0 &&
                                 (now - sLastGrowMs) < 2500;
-                // 供界面等处统一使用（见 np_app.h 里 telemetryLive 的说明）
                 gApp.telemetryLive = attached;
+                bool hasInGameOverlay =
+                    attached && ((gApp.telemetry.hookFlags & NP_HOOK_OVERLAY) != 0);
                 bool wantDesktop = !gOverlayOff && gApp.monitoring &&
                                    (gApp.cfg.overlayMode == 2 ||
-                                    (!attached && gApp.cfg.overlayMode != 1));
-                // 诊断：每 5 秒一条，把判定依据全部打出来（帧计数版）
+                                    (!hasInGameOverlay && gApp.cfg.overlayMode != 1));
                 {
                     static uint32_t sLastOvLog = 0;
                     uint32_t tk = GetTickCount();
@@ -1261,8 +1607,23 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdLine, int cmdShow) {
                     }
                 }
                 OverlaySetVisible(wantDesktop);
+            } else {
+                OverlaySetVisible(false);
+            }
+
+            UpdateStatus();
+            if (now - lastUiMs >= 250) {
+                lastUiMs = now;
+                UiRefresh();
+            }
+        }
+
+        if (gApp.monitoring) {
+            uint32_t hz = std::clamp(gApp.cfg.updateHz ? gApp.cfg.updateHz : 20u, 5u, 60u);
+            uint32_t ovMs = 1000u / hz;
+            if (now - gApp.lastOverlay >= ovMs) {
+                gApp.lastOverlay = now;
                 OverlayUpdate();
-                UpdateStatus();
             }
         }
 
